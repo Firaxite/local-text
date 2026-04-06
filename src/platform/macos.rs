@@ -69,9 +69,9 @@ pub struct Renderer {
     layer:      Retained<CALayer>,
     root_layer: Retained<CALayer>,
     surface:    IOSurfaceRef,  // null when not yet allocated
-    ping:       IOSurfaceRef,  // persistent 1×1 sentinel; see render_frame
     width:      u32,
     height:     u32,
+    parity:     bool,          // toggles zPosition by 1 ULP each frame; see render_frame
 }
 
 // SAFETY: IOSurfaceRef is a CF object that is thread-safe for retain/release.
@@ -81,7 +81,6 @@ unsafe impl Send for Renderer {}
 impl Drop for Renderer {
     fn drop(&mut self) {
         if !self.surface.is_null() { unsafe { CFRelease(self.surface.cast()) }; }
-        if !self.ping.is_null()    { unsafe { CFRelease(self.ping.cast()) }; }
     }
 }
 
@@ -117,11 +116,7 @@ impl Renderer {
         root_layer.addSublayer(&layer);
         layer.setFrame(root_layer.bounds());
 
-        // 1×1 sentinel surface — used to force CA to notice content updates.
-        // Its pixel data is never rendered; it's just a distinct pointer.
-        let ping = create_surface(1, 1);
-
-        Renderer { layer, root_layer, surface: ptr::null_mut(), ping, width: 0, height: 0 }
+        Renderer { layer, root_layer, surface: ptr::null_mut(), width: 0, height: 0, parity: false }
     }
 
     /// Call whenever `WindowEvent::Resized` fires (physical pixel dimensions).
@@ -168,32 +163,32 @@ impl Renderer {
             IOSurfaceUnlock(self.surface, 0, ptr::null_mut());
         }
 
+        // CA only re-composites when it sees a model property change.  A bare
+        // setContents with the same pointer is a no-op; the pixel data update
+        // isn't enough on its own.  We need to change *something* in every
+        // transaction to trigger a composite pass.
+        //
+        // The old approach (ping-pong with a 1×1 sentinel) sent two separate
+        // CATransaction commits per frame.  If they straddled a vsync boundary
+        // — common during live resize when the compositor is under load — the
+        // 1×1 sentinel surface was displayed for a full frame, appearing blank.
+        //
+        // Fix: single transaction per frame.  We toggle zPosition by 1 ULP
+        // (0.0 ↔ 5e-324) on alternating frames.  CA always sees a property
+        // change and schedules a composite, but the visual difference is
+        // sub-atomic (< 1e-18 of a pixel at any real display size).
+        CATransaction::begin();
+        CATransaction::setDisableActions(true);
         if surface_is_new {
-            // The surface pointer changed, so CA will detect it as a new value
-            // without needing a ping-pong.  Commit the layer frame *and* the new
-            // surface contents atomically so there is no intermediate state where
-            // the layer has the resized frame but still shows the old surface.
-            CATransaction::begin();
-            CATransaction::setDisableActions(true);
+            // Also sync the layer frame atomically with the new surface so the
+            // layer never shows the new (larger/smaller) frame with stale content.
             self.layer.setFrame(self.root_layer.bounds());
-            set_layer_contents(&self.layer, self.surface);
-            CATransaction::commit();
-        } else {
-            // Same IOSurface pointer reused: CA treats a repeated setContents as a
-            // no-op (no pointer change → no texture re-upload).  Use a ping-pong
-            // with the 1×1 sentinel to force a genuine pointer change.
-            // At steady-state both commits land within the same vsync window so
-            // the sentinel is never actually rendered.
-            CATransaction::begin();
-            CATransaction::setDisableActions(true);
-            set_layer_contents(&self.layer, self.ping);
-            CATransaction::commit();
-
-            CATransaction::begin();
-            CATransaction::setDisableActions(true);
-            set_layer_contents(&self.layer, self.surface);
-            CATransaction::commit();
         }
+        let z = if self.parity { 0.0_f64 } else { f64::from_bits(1) };
+        self.layer.setZPosition(z);
+        self.parity = !self.parity;
+        set_layer_contents(&self.layer, self.surface);
+        CATransaction::commit();
     }
 }
 
