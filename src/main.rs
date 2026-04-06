@@ -358,7 +358,7 @@ impl ApplicationHandler for App {
                 s.w = sz.width;
                 s.h = sz.height;
                 s.renderer.resize(sz.width, sz.height);
-                s.win.request_redraw();
+                render(s);
             }
 
             WindowEvent::ModifiersChanged(m) => {
@@ -381,6 +381,8 @@ impl ApplicationHandler for App {
                 if (ctrl || cmd) && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "s") {
                     s.save();
                     render(s);
+                } else if cmd && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "w") {
+                    el.exit();
                 } else if ctrl && matches!(&event.logical_key, Key::Character(_)) {
                     // other Ctrl+letter combos: ignore
                 } else {

@@ -130,9 +130,13 @@ impl Renderer {
         self.width  = width;
         self.height = height;
         // Sync sublayer frame to the new root-layer bounds (in points).
-        // Without this the surface gets resized but the layer frame stays stale,
-        // causing CA to stretch/squish the surface to fill the old frame.
+        // Wrap in a disabled-actions transaction so CA applies the frame change
+        // immediately instead of deferring it into an implicit transaction that
+        // could race with the render_frame commit and cause a blank flash.
+        CATransaction::begin();
+        CATransaction::setDisableActions(true);
         self.layer.setFrame(self.root_layer.bounds());
+        CATransaction::commit();
         // Drop old surface; a fresh one is created on the next render_frame.
         if !self.surface.is_null() {
             unsafe { CFRelease(self.surface.cast()) };
