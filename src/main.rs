@@ -221,6 +221,12 @@ impl State {
             self.cursor = start;
             self.dirty = true;
             self.ensure_visible();
+        } else if start > 0 {
+            // Already at line start — eat the preceding newline (join with previous line)
+            self.text.remove(start - 1..start);
+            self.cursor = start - 1;
+            self.dirty = true;
+            self.ensure_visible();
         }
     }
 
@@ -243,6 +249,10 @@ impl State {
         let line_end = self.text.line_to_char(line) + Self::line_len(&self.text, line);
         if line_end > start {
             self.text.remove(start..line_end);
+            self.dirty = true;
+        } else if start < len {
+            // Already at line end — eat the following newline (join with next line)
+            self.text.remove(start..start + 1);
             self.dirty = true;
         }
     }
