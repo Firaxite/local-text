@@ -129,15 +129,9 @@ impl Renderer {
         if width == self.width && height == self.height { return; }
         self.width  = width;
         self.height = height;
-        // Sync sublayer frame to the new root-layer bounds (in points).
-        // Wrap in a disabled-actions transaction so CA applies the frame change
-        // immediately instead of deferring it into an implicit transaction that
-        // could race with the render_frame commit and cause a blank flash.
-        CATransaction::begin();
-        CATransaction::setDisableActions(true);
-        self.layer.setFrame(self.root_layer.bounds());
-        CATransaction::commit();
-        // Drop old surface; a fresh one is created on the next render_frame.
+        // Drop old surface.  The layer frame *and* new surface are committed
+        // together inside render_frame so there is never a moment where the
+        // layer has the new frame but still displays the old (wrong-size) surface.
         if !self.surface.is_null() {
             unsafe { CFRelease(self.surface.cast()) };
             self.surface = ptr::null_mut();
@@ -154,7 +148,8 @@ impl Renderer {
         if w == 0 || h == 0 { return; }
 
         // (Re-)create the IOSurface on first call or after a resize.
-        if self.surface.is_null() {
+        let surface_is_new = self.surface.is_null();
+        if surface_is_new {
             self.surface = create_surface(w, h);
         }
 
@@ -173,23 +168,32 @@ impl Renderer {
             IOSurfaceUnlock(self.surface, 0, ptr::null_mut());
         }
 
-        // Setting the same IOSurface pointer every frame is a CA no-op — the
-        // compositor sees no pointer change and skips the re-upload.  setNeedsDisplay
-        // is also wrong here: with no delegate, display() replaces contents with a
-        // blank backing store.
-        //
-        // Fix: commit two back-to-back transactions (ping → surface).  CA sees a
-        // genuine pointer change each time and re-composites.  Both commits arrive
-        // before the next vsync so the 1×1 ping surface never actually renders.
-        CATransaction::begin();
-        CATransaction::setDisableActions(true);
-        set_layer_contents(&self.layer, self.ping);
-        CATransaction::commit();
+        if surface_is_new {
+            // The surface pointer changed, so CA will detect it as a new value
+            // without needing a ping-pong.  Commit the layer frame *and* the new
+            // surface contents atomically so there is no intermediate state where
+            // the layer has the resized frame but still shows the old surface.
+            CATransaction::begin();
+            CATransaction::setDisableActions(true);
+            self.layer.setFrame(self.root_layer.bounds());
+            set_layer_contents(&self.layer, self.surface);
+            CATransaction::commit();
+        } else {
+            // Same IOSurface pointer reused: CA treats a repeated setContents as a
+            // no-op (no pointer change → no texture re-upload).  Use a ping-pong
+            // with the 1×1 sentinel to force a genuine pointer change.
+            // At steady-state both commits land within the same vsync window so
+            // the sentinel is never actually rendered.
+            CATransaction::begin();
+            CATransaction::setDisableActions(true);
+            set_layer_contents(&self.layer, self.ping);
+            CATransaction::commit();
 
-        CATransaction::begin();
-        CATransaction::setDisableActions(true);
-        set_layer_contents(&self.layer, self.surface);
-        CATransaction::commit();
+            CATransaction::begin();
+            CATransaction::setDisableActions(true);
+            set_layer_contents(&self.layer, self.surface);
+            CATransaction::commit();
+        }
     }
 }
 
