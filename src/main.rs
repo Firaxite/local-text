@@ -7,7 +7,8 @@ use std::sync::Arc;
 use fontdue::{Font, FontSettings, Metrics};
 use ropey::Rope;
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
+use std::time::{Duration, Instant};
+use winit::event::{ElementState, MouseScrollDelta, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowAttributes};
@@ -65,7 +66,9 @@ struct State {
     text:   Rope,
     path:   Option<PathBuf>,
     dirty:  bool,
-    cursor: usize,
+    cursor:         usize,
+    cursor_visible: bool,
+    cursor_blink:   Instant,
     scroll: usize,
     mods:   ModifiersState,
     glyphs: Glyphs,
@@ -169,6 +172,81 @@ impl State {
         self.ensure_visible();
     }
 
+    fn reset_blink(&mut self) {
+        self.cursor_visible = true;
+        self.cursor_blink = Instant::now() + Duration::from_millis(500);
+    }
+
+    fn is_word_char(c: char) -> bool { c.is_alphanumeric() || c == '_' }
+
+    fn move_word_left(&mut self) {
+        let mut pos = self.cursor.min(self.text.len_chars());
+        while pos > 0 && !Self::is_word_char(self.text.char(pos - 1)) { pos -= 1; }
+        while pos > 0 &&  Self::is_word_char(self.text.char(pos - 1)) { pos -= 1; }
+        self.cursor = pos;
+        self.ensure_visible();
+    }
+
+    fn move_word_right(&mut self) {
+        let len = self.text.len_chars();
+        let mut pos = self.cursor.min(len);
+        while pos < len && !Self::is_word_char(self.text.char(pos)) { pos += 1; }
+        while pos < len &&  Self::is_word_char(self.text.char(pos)) { pos += 1; }
+        self.cursor = pos;
+        self.ensure_visible();
+    }
+
+    fn move_doc_start(&mut self) { self.cursor = 0; self.ensure_visible(); }
+    fn move_doc_end(&mut self)   { self.cursor = self.text.len_chars(); self.ensure_visible(); }
+
+    fn delete_word_back(&mut self) {
+        let end = self.cursor.min(self.text.len_chars());
+        let mut start = end;
+        while start > 0 && !Self::is_word_char(self.text.char(start - 1)) { start -= 1; }
+        while start > 0 &&  Self::is_word_char(self.text.char(start - 1)) { start -= 1; }
+        if start < end {
+            self.text.remove(start..end);
+            self.cursor = start;
+            self.dirty = true;
+            self.ensure_visible();
+        }
+    }
+
+    fn delete_to_line_start(&mut self) {
+        let end = self.cursor.min(self.text.len_chars());
+        let (line, _) = self.cursor_lc();
+        let start = self.text.line_to_char(line);
+        if start < end {
+            self.text.remove(start..end);
+            self.cursor = start;
+            self.dirty = true;
+            self.ensure_visible();
+        }
+    }
+
+    fn delete_word_fwd(&mut self) {
+        let len = self.text.len_chars();
+        let start = self.cursor.min(len);
+        let mut end = start;
+        while end < len && !Self::is_word_char(self.text.char(end)) { end += 1; }
+        while end < len &&  Self::is_word_char(self.text.char(end)) { end += 1; }
+        if end > start {
+            self.text.remove(start..end);
+            self.dirty = true;
+        }
+    }
+
+    fn delete_to_line_end(&mut self) {
+        let len = self.text.len_chars();
+        let start = self.cursor.min(len);
+        let (line, _) = self.cursor_lc();
+        let line_end = self.text.line_to_char(line) + Self::line_len(&self.text, line);
+        if line_end > start {
+            self.text.remove(start..line_end);
+            self.dirty = true;
+        }
+    }
+
     fn scroll_by(&mut self, delta: i32) {
         if delta < 0 {
             self.scroll = self.scroll.saturating_sub((-delta) as usize);
@@ -214,6 +292,16 @@ impl App {
 }
 
 impl ApplicationHandler for App {
+    fn new_events(&mut self, _el: &ActiveEventLoop, cause: StartCause) {
+        if let StartCause::ResumeTimeReached { .. } = cause {
+            if let Some(s) = self.state.as_mut() {
+                s.cursor_visible = !s.cursor_visible;
+                s.cursor_blink = Instant::now() + Duration::from_millis(500);
+                s.win.request_redraw();
+            }
+        }
+    }
+
     fn resumed(&mut self, el: &ActiveEventLoop) {
         let mut attrs = WindowAttributes::default().with_title("local-text");
         #[cfg(target_os = "macos")]
@@ -234,7 +322,9 @@ impl ApplicationHandler for App {
             text:   Rope::new(),
             path:   None,
             dirty:  false,
-            cursor: 0,
+            cursor:         0,
+            cursor_visible: true,
+            cursor_blink:   Instant::now() + Duration::from_millis(500),
             scroll: 0,
             mods:   ModifiersState::default(),
             glyphs,
@@ -274,37 +364,63 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
-                let ctrl = s.mods.control_key() || s.mods.super_key();
+                let ctrl = s.mods.control_key();
+                let cmd  = s.mods.super_key();
+                let alt  = s.mods.alt_key();
 
-                if ctrl {
-                    match &event.logical_key {
-                        Key::Character(c) if c.as_str() == "s" => {
-                            s.save();
-                            render(s);
-                        }
-                        _ => {}
-                    }
+                if (ctrl || cmd) && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "s") {
+                    s.save();
+                    render(s);
+                } else if ctrl && matches!(&event.logical_key, Key::Character(_)) {
+                    // other Ctrl+letter combos: ignore
                 } else {
                     match &event.logical_key {
-                        Key::Named(NamedKey::ArrowLeft)  => s.move_left(),
-                        Key::Named(NamedKey::ArrowRight) => s.move_right(),
-                        Key::Named(NamedKey::ArrowUp)    => s.move_up(),
-                        Key::Named(NamedKey::ArrowDown)  => s.move_down(),
-                        Key::Named(NamedKey::Home)        => s.move_home(),
-                        Key::Named(NamedKey::End)         => s.move_end(),
-                        Key::Named(NamedKey::Backspace)   => s.backspace(),
-                        Key::Named(NamedKey::Delete)      => s.delete_fwd(),
-                        Key::Named(NamedKey::Enter)       => s.insert_str("\n"),
-                        Key::Named(NamedKey::Tab)         => s.insert_str("    "),
-                        Key::Named(NamedKey::PageUp)      => s.scroll_by(-10),
-                        Key::Named(NamedKey::PageDown)    => s.scroll_by(10),
+                        Key::Named(NamedKey::ArrowLeft) => {
+                            if cmd            { s.move_home(); }
+                            else if alt||ctrl { s.move_word_left(); }
+                            else              { s.move_left(); }
+                        }
+                        Key::Named(NamedKey::ArrowRight) => {
+                            if cmd            { s.move_end(); }
+                            else if alt||ctrl { s.move_word_right(); }
+                            else              { s.move_right(); }
+                        }
+                        Key::Named(NamedKey::ArrowUp) => {
+                            if cmd { s.move_doc_start(); } else { s.move_up(); }
+                        }
+                        Key::Named(NamedKey::ArrowDown) => {
+                            if cmd { s.move_doc_end(); } else { s.move_down(); }
+                        }
+                        Key::Named(NamedKey::Home) => {
+                            if ctrl { s.move_doc_start(); } else { s.move_home(); }
+                        }
+                        Key::Named(NamedKey::End) => {
+                            if ctrl { s.move_doc_end(); } else { s.move_end(); }
+                        }
+                        Key::Named(NamedKey::Backspace) => {
+                            if cmd            { s.delete_to_line_start(); }
+                            else if alt||ctrl { s.delete_word_back(); }
+                            else              { s.backspace(); }
+                        }
+                        Key::Named(NamedKey::Delete) => {
+                            if cmd            { s.delete_to_line_end(); }
+                            else if alt||ctrl { s.delete_word_fwd(); }
+                            else              { s.delete_fwd(); }
+                        }
+                        Key::Named(NamedKey::Enter)    => s.insert_str("\n"),
+                        Key::Named(NamedKey::Tab)      => s.insert_str("    "),
+                        Key::Named(NamedKey::PageUp)   => s.scroll_by(-10),
+                        Key::Named(NamedKey::PageDown) => s.scroll_by(10),
                         _ => {
-                            if let Some(txt) = event.text.as_deref() {
-                                for ch in txt.chars() { s.glyphs.load(ch); }
-                                s.insert_str(txt);
+                            if !ctrl && !cmd {
+                                if let Some(txt) = event.text.as_deref() {
+                                    for ch in txt.chars() { s.glyphs.load(ch); }
+                                    s.insert_str(txt);
+                                }
                             }
                         }
                     }
+                    s.reset_blink();
                     render(s);
                 }
             }
@@ -316,7 +432,11 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
-        el.set_control_flow(ControlFlow::Wait);
+        if let Some(s) = &self.state {
+            el.set_control_flow(ControlFlow::WaitUntil(s.cursor_blink));
+        } else {
+            el.set_control_flow(ControlFlow::Wait);
+        }
     }
 }
 
@@ -379,8 +499,9 @@ fn render(s: &mut State) {
     let lh       = s.glyphs.lh;
     let asc      = s.glyphs.asc;
     let cw       = s.glyphs.cw;
-    let total    = s.text.len_lines();
-    let vis      = (editor_h / lh).max(1) as usize;
+    let total          = s.text.len_lines();
+    let vis            = (editor_h / lh).max(1) as usize;
+    let cursor_visible = s.cursor_visible;
 
     // ── Build line snapshot (borrow rope, then release before render_frame) ──
     // Collect only what we need for the visible range to avoid holding a borrow
@@ -416,23 +537,22 @@ fn render(s: &mut State) {
             let py       = vi as i32 * lh;
             let baseline = py + asc;
 
-            // Cursor block
-            if li == cur_line {
-                let cx = ED_LPAD + cur_col as i32 * cw;
-                fill(buf, w, h, cx, py, cw, lh, ACCENT);
-            }
-
             // Line text
             let mut x = ED_LPAD;
-            for (ci, ch) in text.chars().enumerate() {
-                let fg = if li == cur_line && ci == cur_col { BG } else { FG };
+            for ch in text.chars() {
                 if x + cw > 0 && x < w as i32 {
                     if let Some((m, bmap)) = g.get(ch) {
-                        blit(buf, w, h, bmap, m, x, baseline, fg);
+                        blit(buf, w, h, bmap, m, x, baseline, FG);
                     }
                 }
                 x += cw;
                 if x >= w as i32 { break; }
+            }
+
+            // Thin blinking cursor (2px wide, drawn on top of text)
+            if li == cur_line && cursor_visible {
+                let cx = ED_LPAD + cur_col as i32 * cw;
+                fill(buf, w, h, cx, py, 2, lh, ACCENT);
             }
         }
 
