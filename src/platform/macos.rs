@@ -1,19 +1,23 @@
-// macOS renderer using a layer-hosting NSView + CGImage-per-frame.
+// macOS renderer using a layer-hosting NSView + IOSurface.
 //
 // "Layer-hosting" means we call [view setLayer:layer] BEFORE
 // [view setWantsLayer:YES].  Apple's docs: "AppKit refrains from
-// interfering with the layer's contents."  This prevents AppKit from
-// clearing or replacing our contents during live resize.
+// interfering with the layer's contents."  This is the key difference
+// from a layer-backed view, where AppKit owns the layer and may clear
+// or replace its contents during live resize.
 //
-// CA caches the GPU texture it imports from a CALayer's `contents` pointer.
-// Setting the same IOSurface pointer frame after frame is a no-op — CA
-// composites the stale GPU texture even after we've written new pixels.
+// IOSurface is zero-copy between CPU and GPU: the GPU reads directly from
+// the same physical pages we write to during lock/unlock.  No pixel data
+// is ever copied.
 //
-// Fix: wrap the IOSurface base address in a fresh CGImage each frame.
-// CGImage is a tiny (~200-byte) metadata object; its pixel memory is shared
-// with the IOSurface (no copy, no extra framebuffer).  Because the CGImage
-// pointer is new every frame, CA is forced to re-import the texture from the
-// current IOSurface pixels — eliminating the blank-window flicker.
+// CA only re-composites a layer when one of its model properties changes.
+// Setting `contents` to the same IOSurface pointer is a no-op.  We use
+// the private-but-stable `setContentsChanged` message (used by WebKit for
+// canvas/video) to tell CA the pixels have been updated in-place so it
+// schedules a composite pass without touching any other property.
+//
+// When a resize creates a new surface (new pointer), we set `contents`
+// directly — that forces CA to import the new surface.
 //
 // Pixel format: 0x00RRGGBB (little-endian u32), matching the 'BGRA' OSType.
 
@@ -65,65 +69,23 @@ unsafe extern "C-unwind" {
     fn IOSurfaceGetBytesPerRow(surface: IOSurfaceRef) -> usize;
 }
 
-// ── CoreGraphics C bindings ───────────────────────────────────────────────────
-
-type CGColorSpaceRef    = *mut c_void;
-type CGDataProviderRef  = *mut c_void;
-type CGImageRef         = *mut c_void;
-
-// kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst = (2<<12)|4 = 8196
-const CG_BITMAP_INFO: u32 = 8196;
-
-// CGDataProviderDirectCallbacks: version=0, all callbacks null except getBytesAtPosition.
-// We use the simpler "no-copy" provider that takes a raw pointer directly.
-#[link(name = "CoreGraphics", kind = "framework")]
-unsafe extern "C-unwind" {
-    fn CGColorSpaceCreateDeviceRGB() -> CGColorSpaceRef;
-    fn CGColorSpaceRelease(cs: CGColorSpaceRef);
-    fn CGDataProviderCreateWithData(
-        info:         *mut c_void,
-        data:         *const c_void,
-        size:         usize,
-        release_data: Option<unsafe extern "C" fn(*mut c_void, *const c_void, usize)>,
-    ) -> CGDataProviderRef;
-    fn CGDataProviderRelease(provider: CGDataProviderRef);
-    fn CGImageCreate(
-        width:             usize,
-        height:            usize,
-        bits_per_component: usize,
-        bits_per_pixel:    usize,
-        bytes_per_row:     usize,
-        color_space:       CGColorSpaceRef,
-        bitmap_info:       u32,
-        provider:          CGDataProviderRef,
-        decode:            *const f64,   // NULL
-        should_interpolate: bool,
-        intent:            i32,         // kCGRenderingIntentDefault = 0
-    ) -> CGImageRef;
-    fn CGImageRelease(image: CGImageRef);
-}
-
 const CF_NUMBER_SINT32: i64 = 3;      // kCFNumberSInt32Type
 const CF_STRING_ENC_UTF8: u32 = 0x0800_0100;
 
 // ── Renderer ──────────────────────────────────────────────────────────────────
 
 pub struct Renderer {
-    layer:      Retained<CALayer>,
-    surface:    IOSurfaceRef,
-    colorspace: CGColorSpaceRef,
-    width:      u32,
-    height:     u32,
+    layer:   Retained<CALayer>,
+    surface: IOSurfaceRef,
+    width:   u32,
+    height:  u32,
 }
 
 unsafe impl Send for Renderer {}
 
 impl Drop for Renderer {
     fn drop(&mut self) {
-        unsafe {
-            if !self.surface.is_null()    { CFRelease(self.surface.cast()); }
-            if !self.colorspace.is_null() { CGColorSpaceRelease(self.colorspace); }
-        }
+        if !self.surface.is_null() { unsafe { CFRelease(self.surface.cast()) }; }
     }
 }
 
@@ -154,10 +116,7 @@ impl Renderer {
             _ => panic!("unsupported window handle type on macOS"),
         }
 
-        let colorspace = unsafe { CGColorSpaceCreateDeviceRGB() };
-        assert!(!colorspace.is_null(), "CGColorSpaceCreateDeviceRGB failed");
-
-        Renderer { layer, surface: ptr::null_mut(), colorspace, width: 0, height: 0 }
+        Renderer { layer, surface: ptr::null_mut(), width: 0, height: 0 }
     }
 
     /// Call whenever `WindowEvent::Resized` fires (physical pixel dimensions).
@@ -183,56 +142,36 @@ impl Renderer {
         let h = self.height;
         if w == 0 || h == 0 { return; }
 
-        if self.surface.is_null() {
+        let new_surface = self.surface.is_null();
+        if new_surface {
             self.surface = create_surface(w, h);
         }
 
-        let base_addr;
-        let bytes_per_row;
         unsafe {
             IOSurfaceLock(self.surface, 0, ptr::null_mut());
-            base_addr = IOSurfaceGetBaseAddress(self.surface) as *mut u32;
-            bytes_per_row = IOSurfaceGetBytesPerRow(self.surface);
-            debug_assert_eq!(bytes_per_row / 4, w as usize);
-            let pixels = std::slice::from_raw_parts_mut(base_addr, (w * h) as usize);
+            let base   = IOSurfaceGetBaseAddress(self.surface) as *mut u32;
+            let stride = IOSurfaceGetBytesPerRow(self.surface) / 4;
+            debug_assert_eq!(stride, w as usize);
+            let pixels = std::slice::from_raw_parts_mut(base, (w * h) as usize);
             draw(pixels, w, h);
             IOSurfaceUnlock(self.surface, 0, ptr::null_mut());
         }
 
-        // Create a fresh CGImage wrapping the IOSurface pixel memory (no copy).
-        // The new CGImage pointer forces CA to re-import the GPU texture every
-        // frame, so the on-screen content always matches what we just painted.
-        let cgimage = unsafe {
-            let provider = CGDataProviderCreateWithData(
-                ptr::null_mut(),
-                base_addr.cast(),
-                bytes_per_row * h as usize,
-                None,
-            );
-            let img = CGImageCreate(
-                w as usize, h as usize,
-                8, 32,
-                bytes_per_row,
-                self.colorspace,
-                CG_BITMAP_INFO,
-                provider,
-                ptr::null(),
-                false,
-                0,
-            );
-            CGDataProviderRelease(provider);
-            img
-        };
-        assert!(!cgimage.is_null(), "CGImageCreate returned null");
-
         CATransaction::begin();
         CATransaction::setDisableActions(true);
-        let any: &AnyObject = unsafe { &*(cgimage as *const AnyObject) };
-        unsafe { self.layer.setContents(Some(any)) };
+        if new_surface {
+            // New pointer — CA must import the surface fresh.
+            let any: &AnyObject = unsafe { &*(self.surface as *const AnyObject) };
+            unsafe { self.layer.setContents(Some(any)) };
+        } else {
+            // Same pointer — pixels were updated in-place.  `setContentsChanged`
+            // is a private-but-stable CALayer message (used by WebKit for canvas
+            // and video) that tells CA the surface contents have changed and a
+            // composite pass is needed.  IOSurface remains zero-copy; no pixel
+            // data is copied.
+            unsafe { let _: () = msg_send![&*self.layer, setContentsChanged]; }
+        }
         CATransaction::commit();
-
-        // CA holds its own reference; release ours.
-        unsafe { CGImageRelease(cgimage) };
     }
 }
 
