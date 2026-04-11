@@ -13,7 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
-use winit::window::{Window, WindowAttributes};
+use winit::window::{CursorIcon, Window, WindowAttributes};
 #[cfg(target_os = "macos")]
 use winit::platform::macos::WindowAttributesExtMacOS;
 
@@ -315,7 +315,10 @@ struct State {
     explorer: Option<FileExplorer>,
     mouse_x:    f32,
     mouse_y:    f32,
-    mouse_down: bool,
+    mouse_down:      bool,
+    last_click_time: Instant,
+    last_click_char: usize,
+    click_count:     u32,
 
     find: FindBar,
 }
@@ -582,20 +585,24 @@ impl State {
 
     // ── Cursor movement ───────────────────────────────────────────────────────
 
-    fn move_left(&mut self) {
+    // When !selecting, tail is synced to head so no selection remains.
+    // When selecting, tail (the anchor) stays fixed; only head moves.
+    fn move_left(&mut self, selecting: bool) {
         for c in &mut self.tab_mut().cursors { if c.head > 0 { c.head -= 1; } }
+        if !selecting { for c in &mut self.tab_mut().cursors { c.tail = c.head; } }
         self.dedup_cursors();
         self.ensure_visible();
     }
 
-    fn move_right(&mut self) {
+    fn move_right(&mut self, selecting: bool) {
         let n = self.tab().text.len_chars();
         for c in &mut self.tab_mut().cursors { if c.head < n { c.head += 1; } }
+        if !selecting { for c in &mut self.tab_mut().cursors { c.tail = c.head; } }
         self.dedup_cursors();
         self.ensure_visible();
     }
 
-    fn move_up(&mut self) {
+    fn move_up(&mut self, selecting: bool) {
         let n = self.tab().cursors.len();
         let mut new_heads = Vec::with_capacity(n);
         for i in 0..n {
@@ -609,11 +616,12 @@ impl State {
             new_heads.push(h);
         }
         for (i, h) in new_heads.into_iter().enumerate() { self.tab_mut().cursors[i].head = h; }
+        if !selecting { for c in &mut self.tab_mut().cursors { c.tail = c.head; } }
         self.dedup_cursors();
         self.ensure_visible();
     }
 
-    fn move_down(&mut self) {
+    fn move_down(&mut self, selecting: bool) {
         let n = self.tab().cursors.len();
         let mut new_heads = Vec::with_capacity(n);
         for i in 0..n {
@@ -628,11 +636,12 @@ impl State {
             new_heads.push(h);
         }
         for (i, h) in new_heads.into_iter().enumerate() { self.tab_mut().cursors[i].head = h; }
+        if !selecting { for c in &mut self.tab_mut().cursors { c.tail = c.head; } }
         self.dedup_cursors();
         self.ensure_visible();
     }
 
-    fn move_home(&mut self) {
+    fn move_home(&mut self, selecting: bool) {
         let n = self.tab().cursors.len();
         let mut new_heads = Vec::with_capacity(n);
         for i in 0..n {
@@ -641,11 +650,12 @@ impl State {
             new_heads.push(self.tab().text.line_to_char(line));
         }
         for (i, h) in new_heads.into_iter().enumerate() { self.tab_mut().cursors[i].head = h; }
+        if !selecting { for c in &mut self.tab_mut().cursors { c.tail = c.head; } }
         self.dedup_cursors();
         self.ensure_visible();
     }
 
-    fn move_end(&mut self) {
+    fn move_end(&mut self, selecting: bool) {
         let n = self.tab().cursors.len();
         let mut new_heads = Vec::with_capacity(n);
         for i in 0..n {
@@ -654,11 +664,12 @@ impl State {
             new_heads.push(self.tab().text.line_to_char(line) + Self::line_len(&self.tab().text, line));
         }
         for (i, h) in new_heads.into_iter().enumerate() { self.tab_mut().cursors[i].head = h; }
+        if !selecting { for c in &mut self.tab_mut().cursors { c.tail = c.head; } }
         self.dedup_cursors();
         self.ensure_visible();
     }
 
-    fn move_word_left(&mut self) {
+    fn move_word_left(&mut self, selecting: bool) {
         let n = self.tab().cursors.len();
         let mut new_heads = Vec::with_capacity(n);
         for i in 0..n {
@@ -668,11 +679,12 @@ impl State {
             new_heads.push(pos);
         }
         for (i, h) in new_heads.into_iter().enumerate() { self.tab_mut().cursors[i].head = h; }
+        if !selecting { for c in &mut self.tab_mut().cursors { c.tail = c.head; } }
         self.dedup_cursors();
         self.ensure_visible();
     }
 
-    fn move_word_right(&mut self) {
+    fn move_word_right(&mut self, selecting: bool) {
         let n = self.tab().cursors.len();
         let mut new_heads = Vec::with_capacity(n);
         for i in 0..n {
@@ -683,19 +695,22 @@ impl State {
             new_heads.push(pos);
         }
         for (i, h) in new_heads.into_iter().enumerate() { self.tab_mut().cursors[i].head = h; }
+        if !selecting { for c in &mut self.tab_mut().cursors { c.tail = c.head; } }
         self.dedup_cursors();
         self.ensure_visible();
     }
 
-    fn move_doc_start(&mut self) {
+    fn move_doc_start(&mut self, selecting: bool) {
         for c in &mut self.tab_mut().cursors { c.head = 0; }
+        if !selecting { for c in &mut self.tab_mut().cursors { c.tail = c.head; } }
         self.dedup_cursors();
         self.ensure_visible();
     }
 
-    fn move_doc_end(&mut self) {
+    fn move_doc_end(&mut self, selecting: bool) {
         let n = self.tab().text.len_chars();
         for c in &mut self.tab_mut().cursors { c.head = n; }
+        if !selecting { for c in &mut self.tab_mut().cursors { c.tail = c.head; } }
         self.dedup_cursors();
         self.ensure_visible();
     }
@@ -734,13 +749,6 @@ impl State {
 
     fn rebuild_glyphs(&mut self) {
         self.glyphs.resize(self.font_size);
-    }
-
-    fn prepare_move(&mut self, selecting: bool) {
-        if !selecting {
-            for c in &mut self.tab_mut().cursors { c.tail = c.head; }
-        }
-        // If selecting: tail stays put, head will be moved by the movement method
     }
 
     fn xy_to_char(&self, mx: i32, my: i32) -> usize {
@@ -1193,7 +1201,10 @@ impl ApplicationHandler for App {
             explorer,
             mouse_x:    0.0,
             mouse_y:    0.0,
-            mouse_down: false,
+            mouse_down:      false,
+            last_click_time: Instant::now() - Duration::from_secs(1),
+            last_click_char: usize::MAX,
+            click_count:     0,
             find: FindBar::new(),
         };
 
@@ -1226,8 +1237,14 @@ impl ApplicationHandler for App {
             WindowEvent::CursorMoved { position, .. } => {
                 s.mouse_x = position.x as f32;
                 s.mouse_y = position.y as f32;
+                let mx = s.mouse_x as i32;
+                let my = s.mouse_y as i32;
+                let in_editor = my >= s.tab_h()
+                    && my < s.h as i32 - s.status_h() - s.find_h()
+                    && mx >= s.explorer_w();
+                s.win.set_cursor(if in_editor { CursorIcon::Text } else { CursorIcon::Default });
                 if s.mouse_down {
-                    let pos = s.xy_to_char(s.mouse_x as i32, s.mouse_y as i32);
+                    let pos = s.xy_to_char(mx, my);
                     s.tab_mut().primary_mut().head = pos;
                     s.ensure_visible();
                     render(s);
@@ -1324,9 +1341,38 @@ impl ApplicationHandler for App {
                     if alt {
                         s.tab_mut().cursors.push(Cursor::new(pos));
                         s.dedup_cursors();
+                        s.mouse_down = false;
                     } else {
-                        s.tab_mut().cursors = vec![Cursor { head: pos, tail: pos }];
-                        s.mouse_down = true;
+                        let now  = Instant::now();
+                        let fast = now.duration_since(s.last_click_time) < Duration::from_millis(500);
+                        let same = pos == s.last_click_char;
+                        s.click_count = if fast && same { s.click_count + 1 } else { 1 };
+                        s.last_click_time = now;
+                        s.last_click_char = pos;
+                        match s.click_count {
+                            2 => {
+                                // Double-click: select word under cursor
+                                let (lo, hi) = word_bounds_at(s.tab(), pos);
+                                s.tab_mut().cursors = vec![Cursor { head: hi, tail: lo }];
+                                s.mouse_down = false;
+                            }
+                            n if n >= 3 => {
+                                // Triple-click: select whole line
+                                let len = s.tab().text.len_chars();
+                                let li  = s.tab().text.char_to_line(pos.min(len));
+                                let ls  = s.tab().text.line_to_char(li);
+                                let le  = if li + 1 < s.tab().text.len_lines() {
+                                    s.tab().text.line_to_char(li + 1)
+                                } else { len };
+                                s.tab_mut().cursors = vec![Cursor { head: le, tail: ls }];
+                                s.mouse_down = false;
+                            }
+                            _ => {
+                                // Single click: place cursor
+                                s.tab_mut().cursors = vec![Cursor { head: pos, tail: pos }];
+                                s.mouse_down = true;
+                            }
+                        }
                     }
                     s.reset_blink();
                     render(s);
@@ -1534,32 +1580,26 @@ impl ApplicationHandler for App {
                         } else {
                             match &event.logical_key {
                                 Key::Named(NamedKey::ArrowLeft) => {
-                                    s.prepare_move(shift);
-                                    if cmd            { s.move_home(); }
-                                    else if alt||ctrl { s.move_word_left(); }
-                                    else              { s.move_left(); }
+                                    if cmd            { s.move_home(shift); }
+                                    else if alt||ctrl { s.move_word_left(shift); }
+                                    else              { s.move_left(shift); }
                                 }
                                 Key::Named(NamedKey::ArrowRight) => {
-                                    s.prepare_move(shift);
-                                    if cmd            { s.move_end(); }
-                                    else if alt||ctrl { s.move_word_right(); }
-                                    else              { s.move_right(); }
+                                    if cmd            { s.move_end(shift); }
+                                    else if alt||ctrl { s.move_word_right(shift); }
+                                    else              { s.move_right(shift); }
                                 }
                                 Key::Named(NamedKey::ArrowUp) => {
-                                    s.prepare_move(shift);
-                                    if cmd { s.move_doc_start(); } else { s.move_up(); }
+                                    if cmd { s.move_doc_start(shift); } else { s.move_up(shift); }
                                 }
                                 Key::Named(NamedKey::ArrowDown) => {
-                                    s.prepare_move(shift);
-                                    if cmd { s.move_doc_end(); } else { s.move_down(); }
+                                    if cmd { s.move_doc_end(shift); } else { s.move_down(shift); }
                                 }
                                 Key::Named(NamedKey::Home) => {
-                                    s.prepare_move(shift);
-                                    if ctrl { s.move_doc_start(); } else { s.move_home(); }
+                                    if ctrl { s.move_doc_start(shift); } else { s.move_home(shift); }
                                 }
                                 Key::Named(NamedKey::End) => {
-                                    s.prepare_move(shift);
-                                    if ctrl { s.move_doc_end(); } else { s.move_end(); }
+                                    if ctrl { s.move_doc_end(shift); } else { s.move_end(shift); }
                                 }
                                 Key::Named(NamedKey::Backspace) => {
                                     if cmd            { s.delete_to_line_start(); }
