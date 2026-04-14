@@ -1,0 +1,280 @@
+// Language Server Protocol client.
+//
+// LspManager holds one LspServer per language.  Servers are started lazily when
+// a file of the corresponding language is opened.  Each server gets its own
+// OutputPane for its stdout/stderr log.
+//
+// JSON-RPC framing uses the LSP Content-Length header format.
+// A background thread reads messages from the server's stdout and sends them
+// to the main loop via EventLoopProxy<UserEvent>.
+
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Write};
+use std::path::PathBuf;
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::thread;
+
+use winit::event_loop::EventLoopProxy;
+
+use crate::{Diagnostic, DiagSeverity, Lang, UserEvent};
+
+// ── LspServer ─────────────────────────────────────────────────────────────────
+pub struct LspServer {
+    pub lang:           Lang,
+    pub process:        Child,
+    pub stdin:          ChildStdin,
+    pub output_pane_id: usize,
+    pub request_id:     u64,
+    pub doc_version:    HashMap<PathBuf, u64>,
+    pub initialized:    bool,
+}
+
+// ── LspManager ────────────────────────────────────────────────────────────────
+pub struct LspManager {
+    /// Keyed by output_pane_id (same as pane id for the LspOutput pane).
+    pub servers: HashMap<usize, LspServer>,
+}
+
+impl LspManager {
+    pub fn new() -> Self { LspManager { servers: HashMap::new() } }
+
+    pub fn server_for_lang_mut(&mut self, lang: Lang) -> Option<&mut LspServer> {
+        self.servers.values_mut().find(|s| s.lang == lang)
+    }
+
+    pub fn has_server_for(&self, lang: Lang) -> bool {
+        self.servers.values().any(|s| s.lang == lang)
+    }
+}
+
+// ── JSON-RPC framing ──────────────────────────────────────────────────────────
+
+/// Write a Content-Length-framed JSON-RPC message to the server's stdin.
+pub fn write_message(stdin: &mut ChildStdin, body: &str) -> std::io::Result<()> {
+    write!(stdin, "Content-Length: {}\r\n\r\n{}", body.len(), body)?;
+    stdin.flush()
+}
+
+/// Read one Content-Length-framed message from a buffered reader.
+/// Returns None on EOF or parse error.
+pub fn read_message<R: BufRead>(reader: &mut R) -> Option<String> {
+    let mut content_length: Option<usize> = None;
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).ok()? == 0 { return None; }
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() { break; }
+        if let Some(rest) = trimmed.strip_prefix("Content-Length: ") {
+            content_length = rest.trim().parse().ok();
+        }
+    }
+    let n = content_length?;
+    let mut buf = vec![0u8; n];
+    reader.read_exact(&mut buf).ok()?;
+    String::from_utf8(buf).ok()
+}
+
+/// Send a JSON-RPC notification (no id).
+pub fn send_notification(server: &mut LspServer, method: &str, params: serde_json::Value) {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method":  method,
+        "params":  params,
+    }).to_string();
+    let _ = write_message(&mut server.stdin, &body);
+}
+
+/// Send a JSON-RPC request. Returns the request id.
+pub fn send_request(server: &mut LspServer, method: &str, params: serde_json::Value) -> u64 {
+    server.request_id += 1;
+    let id = server.request_id;
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id":      id,
+        "method":  method,
+        "params":  params,
+    }).to_string();
+    let _ = write_message(&mut server.stdin, &body);
+    id
+}
+
+// ── Diagnostic parsing ────────────────────────────────────────────────────────
+
+/// If the message is a publishDiagnostics notification, return the (path, diagnostics).
+pub fn parse_diagnostics(json: &str) -> Option<(PathBuf, Vec<Diagnostic>)> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    if v["method"].as_str() != Some("textDocument/publishDiagnostics") { return None; }
+    let params = &v["params"];
+    let uri = params["uri"].as_str()?;
+    let path = PathBuf::from(uri.strip_prefix("file://")?);
+    let diags = params["diagnostics"].as_array()?.iter().filter_map(|d| {
+        let s = &d["range"]["start"];
+        let e = &d["range"]["end"];
+        let severity = match d["severity"].as_u64().unwrap_or(1) {
+            2 => DiagSeverity::Warning,
+            3 => DiagSeverity::Info,
+            4 => DiagSeverity::Hint,
+            _ => DiagSeverity::Error,
+        };
+        Some(Diagnostic {
+            line:      s["line"].as_u64()? as usize,
+            col_start: s["character"].as_u64()? as usize,
+            col_end:   e["character"].as_u64()? as usize,
+            severity,
+            message:   d["message"].as_str().unwrap_or("").to_owned(),
+        })
+    }).collect();
+    Some((path, diags))
+}
+
+/// Check if the message is an `initialize` response so we know when to send `initialized`.
+pub fn is_initialize_response(json: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else { return false; };
+    v["result"].is_object() && v["id"].as_u64() == Some(1)
+}
+
+// ── Server spawning ───────────────────────────────────────────────────────────
+
+/// Spawn a language server for the given language. Returns None if the binary
+/// is not installed or the language has no configured server.
+pub fn start_server(
+    lang: Lang,
+    output_pane_id: usize,
+    proxy: EventLoopProxy<UserEvent>,
+) -> Option<LspServer> {
+    let (cmd, args): (&str, &[&str]) = match lang {
+        Lang::Rust       => ("rust-analyzer", &["--stdio"]),
+        Lang::TypeScript => ("typescript-language-server", &["--stdio"]),
+        Lang::Python     => ("pylsp", &[]),
+        Lang::None       => return None,
+    };
+
+    let mut child = Command::new(cmd)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?; // silently returns None if binary not found
+
+    let stdin  = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+
+    // stdout reader: JSON-RPC messages → LspOutput + LspDiagnostics events
+    let proxy_out = proxy.clone();
+    let opi = output_pane_id;
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        while let Some(msg) = read_message(&mut reader) {
+            // Log to output pane
+            let _ = proxy_out.send_event(UserEvent::LspOutput {
+                pane_id: opi,
+                data:    msg.as_bytes().to_vec(),
+            });
+            // Parse diagnostics
+            if let Some((path, diags)) = parse_diagnostics(&msg) {
+                let _ = proxy_out.send_event(UserEvent::LspDiagnostics { path, diagnostics: diags });
+            }
+            // If this is the initialize response, send `initialized`
+            if is_initialize_response(&msg) {
+                // Can't access stdin here; the main thread handles this via the initialized flag.
+            }
+        }
+    });
+
+    // stderr reader: raw log lines → LspOutput events
+    let proxy_err = proxy;
+    thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines().flatten() {
+            let _ = proxy_err.send_event(UserEvent::LspOutput {
+                pane_id: opi,
+                data:    line.into_bytes(),
+            });
+        }
+    });
+
+    Some(LspServer {
+        lang,
+        process: child,
+        stdin,
+        output_pane_id,
+        request_id: 0,
+        doc_version: HashMap::new(),
+        initialized: false,
+    })
+}
+
+// ── LSP notification helpers ──────────────────────────────────────────────────
+
+/// Build textDocument/didOpen params.
+pub fn did_open_params(path: &PathBuf, text: &str, lang_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "textDocument": {
+            "uri":        uri_from_path(path),
+            "languageId": lang_id,
+            "version":    1,
+            "text":       text,
+        }
+    })
+}
+
+/// Build textDocument/didChange params (full document sync).
+pub fn did_change_params(path: &PathBuf, text: &str, version: u64) -> serde_json::Value {
+    serde_json::json!({
+        "textDocument": {
+            "uri":     uri_from_path(path),
+            "version": version,
+        },
+        "contentChanges": [{ "text": text }]
+    })
+}
+
+/// Send LSP initialize + initialized handshake.
+pub fn send_initialize(server: &mut LspServer, root_path: Option<&PathBuf>) {
+    let root_uri = root_path.map(uri_from_path);
+    let params = serde_json::json!({
+        "processId": std::process::id(),
+        "rootUri":   root_uri,
+        "capabilities": {
+            "textDocument": {
+                "publishDiagnostics": { "relatedInformation": false },
+                "synchronization": { "didSave": true }
+            }
+        }
+    });
+    send_request(server, "initialize", params);
+}
+
+/// Send textDocument/didOpen.
+pub fn notify_did_open(server: &mut LspServer, path: &PathBuf, text: &str) {
+    let lang_id = match server.lang {
+        Lang::Rust       => "rust",
+        Lang::TypeScript => "typescript",
+        Lang::Python     => "python",
+        Lang::None       => "text",
+    };
+    let params = did_open_params(path, text, lang_id);
+    send_notification(server, "textDocument/didOpen", params);
+    server.doc_version.insert(path.clone(), 1);
+}
+
+/// Send textDocument/didChange.
+pub fn notify_did_change(server: &mut LspServer, path: &PathBuf, text: &str) {
+    let ver = server.doc_version.entry(path.clone()).or_insert(0);
+    *ver += 1;
+    let version = *ver;
+    let params = did_change_params(path, text, version);
+    send_notification(server, "textDocument/didChange", params);
+}
+
+/// Send the `initialized` notification (after receiving initialize response).
+pub fn send_initialized(server: &mut LspServer) {
+    send_notification(server, "initialized", serde_json::json!({}));
+    server.initialized = true;
+}
+
+fn uri_from_path(path: &PathBuf) -> String {
+    format!("file://{}", path.display())
+}

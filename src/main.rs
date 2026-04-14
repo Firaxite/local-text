@@ -1,4 +1,6 @@
 mod platform;
+mod terminal;
+mod lsp;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -11,11 +13,13 @@ use std::time::{Duration, Instant};
 #[cfg(feature = "logging")]
 use std::time::{SystemTime, UNIX_EPOCH};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, StartCause, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{CursorIcon, Window, WindowAttributes};
 #[cfg(target_os = "macos")]
 use winit::platform::macos::WindowAttributesExtMacOS;
+#[cfg(unix)]
+use libc;
 
 #[cfg(feature = "logging")]
 fn ts() -> u128 {
@@ -51,7 +55,7 @@ const HL_MATCH:        u32 = 0x3D3557; // subtle purple — inactive find matche
 const HL_MATCH_ACTIVE: u32 = 0x524175; // brighter purple — active match
 
 // ── Language detection ────────────────────────────────────────────────────────
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Lang { None, Rust, Python, TypeScript }
 
 impl Lang {
@@ -170,7 +174,9 @@ impl FindBar {
 }
 
 // ── Tab (per-file state) ──────────────────────────────────────────────────────
+#[derive(Clone)]
 struct Tab {
+    buf_id:  usize,   // shared with sibling tabs showing the same buffer
     text:    Rope,
     path:    Option<PathBuf>,
     dirty:   bool,
@@ -180,8 +186,8 @@ struct Tab {
 }
 
 impl Tab {
-    fn untitled() -> Self {
-        Tab { text: Rope::new(), path: None, dirty: false,
+    fn untitled(buf_id: usize) -> Self {
+        Tab { buf_id, text: Rope::new(), path: None, dirty: false,
               cursors: vec![Cursor::new(0)], scroll: 0, hscroll: 0 }
     }
 
@@ -296,14 +302,328 @@ fn load_dir_entries(dir: &PathBuf, depth: usize, show_hidden: bool) -> Vec<FileE
     entries
 }
 
+// ── Pane layout types ─────────────────────────────────────────────────────────
+const DRAG_ZONE: u32 = 0x2A3F6F;
+
+#[derive(Clone, Copy)]
+struct Rect { x: i32, y: i32, w: i32, h: i32 }
+
+#[derive(Clone, Copy, PartialEq)]
+enum Axis { H, V }
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum DropZone { Center, Left, Right, Top, Bottom }
+
+enum PaneTree {
+    Leaf(usize),
+    Split { axis: Axis, ratio: f32, a: Box<PaneTree>, b: Box<PaneTree> },
+}
+
+#[derive(Clone, PartialEq)]
+enum PaneKind { Editor, Terminal, LspOutput }
+
+struct Pane {
+    id:     usize,
+    kind:   PaneKind,
+    tabs:   Vec<Tab>,
+    active: usize,
+    find:   FindBar,
+}
+
+impl Pane {
+    fn new(id: usize, buf_id: usize) -> Self {
+        Pane { id, kind: PaneKind::Editor, tabs: vec![Tab::untitled(buf_id)], active: 0, find: FindBar::new() }
+    }
+    fn tab(&self)     -> &Tab     { &self.tabs[self.active] }
+    fn tab_mut(&mut self) -> &mut Tab { &mut self.tabs[self.active] }
+    fn display_name(&self) -> &str { self.tab().display_name() }
+}
+
+struct DragState {
+    source_pane: usize,
+    source_tab:  usize,
+    cur_x:     f32,
+    cur_y:     f32,
+    over_pane: Option<usize>,
+    zone:      Option<DropZone>,
+}
+
+struct ResizeDrag {
+    path: Vec<bool>,   // path through tree to the Split node (false=left/top, true=right/bottom)
+    axis: Axis,
+    rect: Rect,        // bounding rect of that Split node
+}
+
+const BORDER_HIT: i32 = 4;  // px on each side of the 1px divider that triggers resize
+
+/// Walk the tree to find if (mx, my) is within BORDER_HIT of any split divider.
+/// Returns the path, axis, and bounding rect of the matching Split node.
+fn find_border_at(tree: &PaneTree, rect: Rect, mx: i32, my: i32) -> Option<(Vec<bool>, Axis, Rect)> {
+    match tree {
+        PaneTree::Leaf(_) => None,
+        PaneTree::Split { axis, ratio, a, b } => {
+            let (ra, rb) = split_rect(rect, *axis, *ratio);
+            let on_border = match axis {
+                Axis::H => {
+                    let bx = ra.x + ra.w;   // x of the 1px gap
+                    mx >= bx - BORDER_HIT && mx <= bx + BORDER_HIT
+                        && my >= rect.y && my < rect.y + rect.h
+                }
+                Axis::V => {
+                    let by = ra.y + ra.h;   // y of the 1px gap
+                    my >= by - BORDER_HIT && my <= by + BORDER_HIT
+                        && mx >= rect.x && mx < rect.x + rect.w
+                }
+            };
+            if on_border { return Some((vec![], *axis, rect)); }
+            if let Some((mut path, ax, r)) = find_border_at(a, ra, mx, my) {
+                path.insert(0, false);
+                return Some((path, ax, r));
+            }
+            if let Some((mut path, ax, r)) = find_border_at(b, rb, mx, my) {
+                path.insert(0, true);
+                return Some((path, ax, r));
+            }
+            None
+        }
+    }
+}
+
+/// Update the ratio of the Split node reached by following `path` from the root.
+fn update_ratio(tree: &mut PaneTree, path: &[bool], new_ratio: f32) {
+    if let PaneTree::Split { ratio, a, b, .. } = tree {
+        if path.is_empty() {
+            *ratio = new_ratio.clamp(0.05, 0.95);
+        } else {
+            let child = if path[0] { b.as_mut() } else { a.as_mut() };
+            update_ratio(child, &path[1..], new_ratio);
+        }
+    }
+}
+
+fn split_rect(rect: Rect, axis: Axis, ratio: f32) -> (Rect, Rect) {
+    match axis {
+        Axis::H => {
+            let s = (rect.w as f32 * ratio) as i32;
+            let a = Rect { x: rect.x,         y: rect.y, w: s,                h: rect.h };
+            let b = Rect { x: rect.x + s + 1, y: rect.y, w: rect.w - s - 1,  h: rect.h };
+            (a, b)
+        }
+        Axis::V => {
+            let s = (rect.h as f32 * ratio) as i32;
+            let a = Rect { x: rect.x, y: rect.y,         w: rect.w, h: s };
+            let b = Rect { x: rect.x, y: rect.y + s + 1, w: rect.w, h: rect.h - s - 1 };
+            (a, b)
+        }
+    }
+}
+
+fn layout_tree(tree: &PaneTree, rect: Rect) -> Vec<(usize, Rect)> {
+    match tree {
+        PaneTree::Leaf(id) => vec![(*id, rect)],
+        PaneTree::Split { axis, ratio, a, b } => {
+            let (ra, rb) = split_rect(rect, *axis, *ratio);
+            let mut v = layout_tree(a, ra);
+            v.extend(layout_tree(b, rb));
+            v
+        }
+    }
+}
+
+fn pane_at_pos(tree: &PaneTree, mx: i32, my: i32, rect: Rect) -> Option<usize> {
+    match tree {
+        PaneTree::Leaf(id) => {
+            if mx >= rect.x && mx < rect.x + rect.w && my >= rect.y && my < rect.y + rect.h {
+                Some(*id)
+            } else { None }
+        }
+        PaneTree::Split { axis, ratio, a, b } => {
+            let (ra, rb) = split_rect(rect, *axis, *ratio);
+            pane_at_pos(a, mx, my, ra).or_else(|| pane_at_pos(b, mx, my, rb))
+        }
+    }
+}
+
+fn drop_zone(mx: i32, my: i32, pane_rect: Rect, tab_h: i32) -> DropZone {
+    let ey = pane_rect.y + tab_h;
+    let eh = pane_rect.h - tab_h;
+    if eh <= 0 { return DropZone::Center; }
+    let rx = (mx - pane_rect.x) as f32 / pane_rect.w as f32;
+    let ry = (my - ey) as f32 / eh as f32;
+    if rx < 0.25      { DropZone::Left }
+    else if rx > 0.75 { DropZone::Right }
+    else if ry < 0.25 { DropZone::Top }
+    else if ry > 0.75 { DropZone::Bottom }
+    else              { DropZone::Center }
+}
+
+fn insert_pane(tree: PaneTree, target_id: usize, new_id: usize, zone: DropZone) -> PaneTree {
+    match tree {
+        PaneTree::Leaf(id) if id == target_id => {
+            let (axis, new_first) = match zone {
+                DropZone::Left   => (Axis::H, true),
+                DropZone::Right  => (Axis::H, false),
+                DropZone::Top    => (Axis::V, true),
+                DropZone::Bottom => (Axis::V, false),
+                DropZone::Center => return PaneTree::Leaf(id),
+            };
+            let (a, b): (Box<PaneTree>, Box<PaneTree>) = if new_first {
+                (Box::new(PaneTree::Leaf(new_id)), Box::new(PaneTree::Leaf(id)))
+            } else {
+                (Box::new(PaneTree::Leaf(id)), Box::new(PaneTree::Leaf(new_id)))
+            };
+            PaneTree::Split { axis, ratio: 0.5, a, b }
+        }
+        PaneTree::Leaf(id) => PaneTree::Leaf(id),
+        PaneTree::Split { axis, ratio, a, b } => PaneTree::Split {
+            axis, ratio,
+            a: Box::new(insert_pane(*a, target_id, new_id, zone)),
+            b: Box::new(insert_pane(*b, target_id, new_id, zone)),
+        }
+    }
+}
+
+fn remove_pane_from_tree(tree: PaneTree, target_id: usize) -> Option<PaneTree> {
+    match tree {
+        PaneTree::Leaf(id) if id == target_id => None,
+        PaneTree::Leaf(id) => Some(PaneTree::Leaf(id)),
+        PaneTree::Split { axis, ratio, a, b } => {
+            match (remove_pane_from_tree(*a, target_id), remove_pane_from_tree(*b, target_id)) {
+                (None, Some(t)) | (Some(t), None) => Some(t),
+                (Some(a), Some(b)) => Some(PaneTree::Split { axis, ratio, a: Box::new(a), b: Box::new(b) }),
+                (None, None) => None,
+            }
+        }
+    }
+}
+
+fn perform_drop(s: &mut State, drag: DragState) {
+    let (src_pid, src_tidx) = (drag.source_pane, drag.source_tab);
+    let Some(dst_pid) = drag.over_pane else { return };
+    let Some(zone)    = drag.zone      else { return };
+    // Only editor panes can be drag sources
+    if s.panes.get(&src_pid).map_or(true, |p| p.kind != PaneKind::Editor) { return; }
+    // Destination pane contains only this tab → no-op (splitting would leave it empty)
+    if src_pid == dst_pid && s.panes[&src_pid].tabs.len() == 1 { return; }
+    // Center of same pane → no-op
+    if src_pid == dst_pid && zone == DropZone::Center { return; }
+
+    // Extract the tab from source pane
+    if src_tidx >= s.panes[&src_pid].tabs.len() { return; }
+    let tab = s.panes.get_mut(&src_pid).unwrap().tabs.remove(src_tidx);
+    {
+        let sp = s.panes.get_mut(&src_pid).unwrap();
+        if sp.active >= sp.tabs.len() && !sp.tabs.is_empty() { sp.active = sp.tabs.len() - 1; }
+    }
+
+    if zone == DropZone::Center {
+        let dp = s.panes.get_mut(&dst_pid).unwrap();
+        dp.tabs.push(tab);
+        dp.active = dp.tabs.len() - 1;
+        s.active_pane = dst_pid;
+    } else {
+        let new_id = s.next_pane_id;
+        s.next_pane_id += 1;
+        let mut new_pane = Pane::new(new_id, 0); // buf_id overwritten below
+        new_pane.tabs = vec![tab];
+        new_pane.active = 0;
+        s.panes.insert(new_id, new_pane);
+        let old_tree = std::mem::replace(&mut s.pane_tree, PaneTree::Leaf(0));
+        s.pane_tree = insert_pane(old_tree, dst_pid, new_id, zone);
+        s.active_pane = new_id;
+    }
+
+    // Remove source pane if empty
+    if s.panes.get(&src_pid).map_or(false, |p| p.tabs.is_empty()) && src_pid != dst_pid {
+        s.panes.remove(&src_pid);
+        let old_tree = std::mem::replace(&mut s.pane_tree, PaneTree::Leaf(0));
+        if let Some(new_tree) = remove_pane_from_tree(old_tree, src_pid) {
+            s.pane_tree = new_tree;
+        }
+    }
+}
+
+fn resize_terminal_panes(s: &mut State) {
+    let area = s.pane_area();
+    let tab_h = s.tab_h();
+    let lh    = s.glyphs.lh;
+    let cw    = s.glyphs.cw;
+    let layout = layout_tree(&s.pane_tree, area);
+    for (pid, rect) in layout {
+        if s.panes.get(&pid).map_or(false, |p| p.kind == PaneKind::Terminal) {
+            if let Some(tp) = s.term_panes.get_mut(&pid) {
+                let cols = (rect.w / cw).max(1) as usize;
+                let rows = ((rect.h - tab_h) / lh).max(1) as usize;
+                terminal::resize_pty(tp, cols, rows);
+            }
+        }
+    }
+}
+
+fn open_terminal_pane(s: &mut State) {
+    let id = s.next_pane_id;
+    s.next_pane_id += 1;
+    let area = s.pane_area();
+    let cols = (area.w / s.glyphs.cw).max(1) as usize;
+    let rows = ((area.h / 2) / s.glyphs.lh).max(1) as usize;
+    let proxy = s.proxy.clone();
+    let tp = terminal::spawn_terminal(id, cols, rows, proxy);
+    s.term_panes.insert(id, tp);
+    let pane = Pane { id, kind: PaneKind::Terminal, tabs: vec![], active: 0, find: FindBar::new() };
+    s.panes.insert(id, pane);
+    let active = s.active_pane;
+    let old_tree = std::mem::replace(&mut s.pane_tree, PaneTree::Leaf(0));
+    s.pane_tree = insert_pane(old_tree, active, id, DropZone::Bottom);
+    s.active_pane = id;
+}
+
+// ── User events (background threads → main loop) ──────────────────────────────
+#[derive(Clone, PartialEq)]
+pub enum DiagSeverity { Error, Warning, Info, Hint }
+
+#[derive(Clone)]
+pub struct Diagnostic {
+    pub line:      usize,
+    pub col_start: usize,
+    pub col_end:   usize,
+    pub severity:  DiagSeverity,
+    pub message:   String,
+}
+
+pub struct OutputPane {
+    pub id:     usize,
+    pub lines:  Vec<String>,
+    pub scroll: usize,
+    pub title:  String,
+}
+
+pub enum UserEvent {
+    TermOutput     { pane_id: usize, data: Vec<u8> },
+    LspOutput      { pane_id: usize, data: Vec<u8> },
+    LspDiagnostics { path: PathBuf, diagnostics: Vec<Diagnostic> },
+    Redraw,
+}
+
 // ── Application state ─────────────────────────────────────────────────────────
 struct State {
     win:      Arc<Window>,
     renderer: platform::Renderer,
     w: u32, h: u32,
 
-    tabs:   Vec<Tab>,
-    active: usize,
+    pane_tree:    PaneTree,
+    panes:        HashMap<usize, Pane>,
+    active_pane:  usize,
+    next_pane_id: usize,
+    next_buf_id:  usize,
+    drag:         Option<DragState>,
+    drag_pending: Option<(usize, usize, f32, f32)>,
+    resize_drag:  Option<ResizeDrag>,
+
+    term_panes:  HashMap<usize, terminal::TermPane>,
+    lsp_panes:   HashMap<usize, OutputPane>,
+    lsp:         lsp::LspManager,
+    diagnostics: HashMap<PathBuf, Vec<Diagnostic>>,
+    proxy:       EventLoopProxy<UserEvent>,
 
     cursor_visible: bool,
     cursor_blink:   Instant,
@@ -319,13 +639,15 @@ struct State {
     last_click_time: Instant,
     last_click_char: usize,
     click_count:     u32,
-
-    find: FindBar,
 }
 
 impl State {
-    fn tab(&self)         -> &Tab     { &self.tabs[self.active] }
-    fn tab_mut(&mut self) -> &mut Tab { &mut self.tabs[self.active] }
+    fn pane(&self)         -> &Pane     { &self.panes[&self.active_pane] }
+    fn pane_mut(&mut self) -> &mut Pane { let id = self.active_pane; self.panes.get_mut(&id).unwrap() }
+    fn tab(&self)          -> &Tab      { self.pane().tab() }
+    fn tab_mut(&mut self)  -> &mut Tab  { let id = self.active_pane; self.panes.get_mut(&id).unwrap().tab_mut() }
+    fn find(&self)         -> &FindBar  { &self.pane().find }
+    fn find_mut(&mut self) -> &mut FindBar { let id = self.active_pane; &mut self.panes.get_mut(&id).unwrap().find }
 
     fn explorer_w(&self) -> i32 {
         if self.explorer.is_some() { EXPLORER_W } else { 0 }
@@ -333,12 +655,47 @@ impl State {
 
     fn tab_h(&self)    -> i32 { self.glyphs.lh + 4 }
     fn status_h(&self) -> i32 { self.glyphs.lh + 4 }
-    fn find_h(&self)   -> i32 {
-        if !self.find.open { return 0; }
-        let row_h = self.glyphs.lh + 4;
-        if self.find.replace_open { row_h * 2 } else { row_h }
+
+    fn line_num_digits(total: usize) -> usize {
+        let mut d = 1;
+        let mut x = total.max(1);
+        while x >= 10 { d += 1; x /= 10; }
+        d.max(2)
     }
-    fn editor_h(&self) -> i32 { self.h as i32 - self.tab_h() - self.status_h() - self.find_h() }
+    // Width of the line-number gutter: digits × cw + ED_LPAD gap before text.
+    fn gutter_w(total: usize, cw: i32) -> i32 {
+        Self::line_num_digits(total) as i32 * cw + ED_LPAD
+    }
+    fn active_gutter_w(&self) -> i32 {
+        Self::gutter_w(self.tab().text.len_lines(), self.glyphs.cw)
+    }
+
+    fn pane_find_h(pane: &Pane, lh: i32) -> i32 {
+        if !pane.find.open { return 0; }
+        let row_h = lh + 4;
+        if pane.find.replace_open { row_h * 2 } else { row_h }
+    }
+    fn find_h(&self) -> i32 { Self::pane_find_h(self.pane(), self.glyphs.lh) }
+
+    fn pane_area(&self) -> Rect {
+        let ew = self.explorer_w();
+        Rect { x: ew, y: 0, w: self.w as i32 - ew, h: self.h as i32 - self.status_h() }
+    }
+
+    fn active_pane_rect(&self) -> Rect {
+        let area = self.pane_area();
+        layout_tree(&self.pane_tree, area)
+            .into_iter()
+            .find(|(id, _)| *id == self.active_pane)
+            .map(|(_, r)| r)
+            .unwrap_or(area)
+    }
+
+    fn editor_h(&self) -> i32 {
+        let r  = self.active_pane_rect();
+        let fh = self.find_h();
+        r.h - self.tab_h() - fh
+    }
 
     fn cursor_lc(&self) -> (usize, usize) {
         let t    = self.tab();
@@ -365,10 +722,15 @@ impl State {
     }
 
     fn ensure_visible(&mut self) {
-        let vis_v = (self.editor_h() / self.glyphs.lh).max(1) as usize;
-        let vis_h = ((self.w as i32 - self.explorer_w() - ED_LPAD) / self.glyphs.cw).max(1) as usize;
+        let r   = self.active_pane_rect();
+        let fh  = { let ap = self.active_pane; Self::pane_find_h(&self.panes[&ap], self.glyphs.lh) };
+        let eh  = r.h - self.tab_h() - fh;
+        let vis_v = (eh / self.glyphs.lh).max(1) as usize;
+        let gw    = { let ap = self.active_pane; Self::gutter_w(self.panes[&ap].tab().text.len_lines(), self.glyphs.cw) };
+        let vis_h = ((r.w - gw) / self.glyphs.cw).max(1) as usize;
         let (line, col) = self.cursor_lc();
-        let t = self.tab_mut();
+        let id = self.active_pane;
+        let t = self.panes.get_mut(&id).unwrap().tab_mut();
         if line < t.scroll              { t.scroll  = line; }
         if line >= t.scroll  + vis_v   { t.scroll  = line + 1 - vis_v; }
         if col  < t.hscroll             { t.hscroll = col; }
@@ -733,7 +1095,9 @@ impl State {
     }
 
     fn hscroll_by(&mut self, delta: i32) {
-        let vis_h = ((self.w as i32 - self.explorer_w() - ED_LPAD) / self.glyphs.cw).max(1) as usize;
+        let r  = self.active_pane_rect();
+        let gw = self.active_gutter_w();
+        let vis_h = ((r.w - gw) / self.glyphs.cw).max(1) as usize;
         let max_len = (0..self.tab().text.len_lines())
             .map(|li| Self::line_len(&self.tab().text, li))
             .max()
@@ -752,11 +1116,12 @@ impl State {
     }
 
     fn xy_to_char(&self, mx: i32, my: i32) -> usize {
+        let r     = self.active_pane_rect();
         let tab_h = self.tab_h();
         let lh    = self.glyphs.lh;
         let cw    = self.glyphs.cw;
-        let ed_x  = self.explorer_w() + ED_LPAD;
-        let vi    = ((my - tab_h).max(0) / lh) as usize;
+        let ed_x  = r.x + Self::gutter_w(self.tab().text.len_lines(), cw);
+        let vi    = ((my - r.y - tab_h).max(0) / lh) as usize;
         let t     = self.tab();
         let li    = (t.scroll + vi).min(t.text.len_lines().saturating_sub(1));
         let col   = ((mx - ed_x).max(0) / cw) as usize + t.hscroll;
@@ -766,19 +1131,73 @@ impl State {
 
 // ── Helper: open file in a tab ────────────────────────────────────────────────
 fn open_or_reuse_tab(s: &mut State, path: PathBuf) {
-    for i in 0..s.tabs.len() {
-        if s.tabs[i].path.as_deref() == Some(path.as_path()) {
-            s.active = i;
+    let ap = s.active_pane;
+    let pane = s.panes.get_mut(&ap).unwrap();
+    for i in 0..pane.tabs.len() {
+        if pane.tabs[i].path.as_deref() == Some(path.as_path()) {
+            pane.active = i;
             return;
         }
     }
-    if s.tab().is_empty_untitled() {
-        s.tab_mut().load_file(path);
+    if pane.tab().is_empty_untitled() {
+        pane.tab_mut().load_file(path.clone());
     } else {
-        let mut tab = Tab::untitled();
-        tab.load_file(path);
-        s.tabs.push(tab);
-        s.active = s.tabs.len() - 1;
+        let mut tab = Tab::untitled(s.next_buf_id);
+        s.next_buf_id += 1;
+        tab.load_file(path.clone());
+        pane.tabs.push(tab);
+        pane.active = pane.tabs.len() - 1;
+    }
+    // Notify LSP of the opened file
+    notify_lsp_open(s, &path);
+}
+
+fn notify_lsp_open(s: &mut State, path: &PathBuf) {
+    let lang = Lang::from_path(path);
+    if lang == Lang::None { return; }
+    // Start server if not running
+    if !s.lsp.has_server_for(lang) {
+        let op_id = s.next_pane_id;
+        s.next_pane_id += 1;
+        let proxy = s.proxy.clone();
+        if let Some(mut srv) = lsp::start_server(lang, op_id, proxy) {
+            // Send initialize request
+            let root = path.parent().map(|p| p.to_path_buf());
+            lsp::send_initialize(&mut srv, root.as_ref());
+            // Register LSP output pane (not shown in tree until user opens it)
+            let title = format!("{:?} LSP Output", lang);
+            let op = OutputPane { id: op_id, lines: vec![], scroll: 0, title };
+            s.lsp_panes.insert(op_id, op);
+            let shell_pane = Pane { id: op_id, kind: PaneKind::LspOutput, tabs: vec![], active: 0, find: FindBar::new() };
+            s.panes.insert(op_id, shell_pane);
+            s.lsp.servers.insert(op_id, srv);
+        }
+    }
+    // Send didOpen to the server for this language
+    let text = {
+        let ap = s.active_pane;
+        s.panes.get(&ap).and_then(|p| p.tabs.get(p.active)).map(|t| t.text.to_string())
+    };
+    if let Some(text) = text {
+        if let Some(srv) = s.lsp.server_for_lang_mut(lang) {
+            lsp::notify_did_open(srv, path, &text);
+        }
+    }
+}
+
+fn notify_lsp_change(s: &mut State) {
+    let (path, text, lang) = {
+        let ap = s.active_pane;
+        let Some(pane) = s.panes.get(&ap) else { return };
+        if pane.kind != PaneKind::Editor { return; }
+        let tab = pane.tab();
+        let Some(path) = tab.path.clone() else { return };
+        let lang = Lang::from_path(&path);
+        if lang == Lang::None { return; }
+        (path, tab.text.to_string(), lang)
+    };
+    if let Some(srv) = s.lsp.server_for_lang_mut(lang) {
+        lsp::notify_did_change(srv, &path, &text);
     }
 }
 
@@ -1105,7 +1524,11 @@ fn word_bounds_at(tab: &Tab, pos: usize) -> (usize, usize) {
 }
 
 fn find_step(s: &mut State, backwards: bool) {
-    let matches = find_matches(&s.tab().text, &s.find.query, s.find.case_sensitive, s.find.whole_word);
+    let (query, cs, ww) = {
+        let f = s.find();
+        (f.query.clone(), f.case_sensitive, f.whole_word)
+    };
+    let matches = find_matches(&s.tab().text, &query, cs, ww);
     if matches.is_empty() { return; }
     let idx = if backwards {
         let p = s.tab().primary().lo();
@@ -1121,7 +1544,7 @@ fn find_step(s: &mut State, backwards: bool) {
 
 fn replace_current(s: &mut State) {
     if s.tab().primary().has_sel() {
-        let repl = s.find.replace.clone();
+        let repl = s.find().replace.clone();
         for ch in repl.chars() { s.glyphs.load(ch); }
         s.insert_str(&repl);
         find_step(s, false);
@@ -1129,9 +1552,13 @@ fn replace_current(s: &mut State) {
 }
 
 fn replace_all(s: &mut State) {
-    let matches = find_matches(&s.tab().text, &s.find.query, s.find.case_sensitive, s.find.whole_word);
+    let (query, cs, ww) = {
+        let f = s.find();
+        (f.query.clone(), f.case_sensitive, f.whole_word)
+    };
+    let matches = find_matches(&s.tab().text, &query, cs, ww);
     if matches.is_empty() { return; }
-    let repl = s.find.replace.clone();
+    let repl = s.find().replace.clone();
     for ch in repl.chars() { s.glyphs.load(ch); }
     for &(lo, hi) in matches.iter().rev() {
         s.tab_mut().text.remove(lo..hi);
@@ -1147,15 +1574,16 @@ struct App {
     state:    Option<State>,
     file_arg: Option<PathBuf>,
     dir_arg:  Option<PathBuf>,
+    proxy:    EventLoopProxy<UserEvent>,
 }
 
 impl App {
-    fn new(file_arg: Option<PathBuf>, dir_arg: Option<PathBuf>) -> Self {
-        Self { state: None, file_arg, dir_arg }
+    fn new(file_arg: Option<PathBuf>, dir_arg: Option<PathBuf>, proxy: EventLoopProxy<UserEvent>) -> Self {
+        Self { state: None, file_arg, dir_arg, proxy }
     }
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<UserEvent> for App {
     fn new_events(&mut self, _el: &ActiveEventLoop, cause: StartCause) {
         if let StartCause::ResumeTimeReached { .. } = cause {
             if let Some(s) = self.state.as_mut() {
@@ -1178,10 +1606,12 @@ impl ApplicationHandler for App {
         let font_size = FONT_PX;
         let glyphs = Glyphs::new(include_bytes!("../assets/JetBrainsMono-Regular.ttf"), font_size);
 
-        let mut initial_tab = Tab::untitled();
+        let mut initial_pane = Pane::new(0, 0); // pane 0, buf 0
         if let Some(path) = self.file_arg.take() {
-            initial_tab.load_file(path);
+            initial_pane.tabs[0].load_file(path);
         }
+        let mut panes = HashMap::new();
+        panes.insert(0usize, initial_pane);
 
         let explorer = self.dir_arg.take().map(FileExplorer::new);
         let sz = win.inner_size();
@@ -1191,8 +1621,19 @@ impl ApplicationHandler for App {
             renderer,
             w: sz.width,
             h: sz.height,
-            tabs:   vec![initial_tab],
-            active: 0,
+            pane_tree:    PaneTree::Leaf(0),
+            panes,
+            active_pane:  0,
+            next_pane_id: 1,
+            next_buf_id:  1,
+            drag:         None,
+            drag_pending: None,
+            resize_drag:  None,
+            term_panes:  HashMap::new(),
+            lsp_panes:   HashMap::new(),
+            lsp:         lsp::LspManager::new(),
+            diagnostics: HashMap::new(),
+            proxy:       self.proxy.clone(),
             cursor_visible: true,
             cursor_blink:   Instant::now() + Duration::from_millis(500),
             mods:   ModifiersState::default(),
@@ -1205,7 +1646,6 @@ impl ApplicationHandler for App {
             last_click_time: Instant::now() - Duration::from_secs(1),
             last_click_char: usize::MAX,
             click_count:     0,
-            find: FindBar::new(),
         };
 
         s.win.request_redraw();
@@ -1227,6 +1667,7 @@ impl ApplicationHandler for App {
                 s.w = sz.width;
                 s.h = sz.height;
                 s.renderer.resize(sz.width, sz.height);
+                resize_terminal_panes(s);
                 render(s);
             }
 
@@ -1239,10 +1680,72 @@ impl ApplicationHandler for App {
                 s.mouse_y = position.y as f32;
                 let mx = s.mouse_x as i32;
                 let my = s.mouse_y as i32;
-                let in_editor = my >= s.tab_h()
-                    && my < s.h as i32 - s.status_h() - s.find_h()
-                    && mx >= s.explorer_w();
-                s.win.set_cursor(if in_editor { CursorIcon::Text } else { CursorIcon::Default });
+
+                // Active pane-resize drag
+                if let Some(ref rd) = s.resize_drag {
+                    let new_ratio = match rd.axis {
+                        Axis::H => ((mx - rd.rect.x) as f32 / rd.rect.w as f32).clamp(0.05, 0.95),
+                        Axis::V => ((my - rd.rect.y) as f32 / rd.rect.h as f32).clamp(0.05, 0.95),
+                    };
+                    let path = rd.path.clone();
+                    let axis = rd.axis;
+                    update_ratio(&mut s.pane_tree, &path, new_ratio);
+                    resize_terminal_panes(s);
+                    s.win.set_cursor(if axis == Axis::H { CursorIcon::EwResize } else { CursorIcon::NsResize });
+                    render(s);
+                    return;
+                }
+
+                // Active tab drag: update over_pane and zone
+                if s.drag.is_some() {
+                    let area = s.pane_area();
+                    let over = pane_at_pos(&s.pane_tree, mx, my, area);
+                    let zone = over.map(|pid| {
+                        let rect = layout_tree(&s.pane_tree, area).into_iter()
+                            .find(|(id, _)| *id == pid).map(|(_, r)| r).unwrap_or(area);
+                        drop_zone(mx, my, rect, s.tab_h())
+                    });
+                    if let Some(ref mut drag) = s.drag {
+                        drag.cur_x = s.mouse_x;
+                        drag.cur_y = s.mouse_y;
+                        drag.over_pane = over;
+                        drag.zone = zone;
+                    }
+                    render(s);
+                    return;
+                }
+
+                // Promote drag_pending to drag if moved >5px
+                if let Some((pane_id, tab_idx, sx, sy)) = s.drag_pending {
+                    let dx = mx as f32 - sx;
+                    let dy = my as f32 - sy;
+                    if dx * dx + dy * dy > 25.0 {
+                        let area = s.pane_area();
+                        let over = pane_at_pos(&s.pane_tree, mx, my, area);
+                        s.drag = Some(DragState {
+                            source_pane: pane_id, source_tab: tab_idx,
+                            cur_x: s.mouse_x, cur_y: s.mouse_y,
+                            over_pane: over, zone: None,
+                        });
+                        s.drag_pending = None;
+                        render(s);
+                        return;
+                    }
+                }
+
+                // Cursor icon: border hover → resize, editor area → text, else default
+                let area = s.pane_area();
+                let on_border = mx >= area.x && my >= area.y && my < area.y + area.h
+                    && find_border_at(&s.pane_tree, area, mx, my).is_some();
+                if on_border {
+                    let axis = find_border_at(&s.pane_tree, area, mx, my).unwrap().1;
+                    s.win.set_cursor(if axis == Axis::H { CursorIcon::EwResize } else { CursorIcon::NsResize });
+                } else {
+                    let r     = s.active_pane_rect();
+                    let fh    = s.find_h();
+                    let in_ed = my >= r.y + s.tab_h() && my < r.y + r.h - fh && mx >= r.x;
+                    s.win.set_cursor(if in_ed { CursorIcon::Text } else { CursorIcon::Default });
+                }
                 if s.mouse_down {
                     let pos = s.xy_to_char(mx, my);
                     s.tab_mut().primary_mut().head = pos;
@@ -1255,7 +1758,16 @@ impl ApplicationHandler for App {
                 state: ElementState::Released,
                 button: MouseButton::Left, ..
             } => {
+                if s.resize_drag.take().is_some() {
+                    render(s);
+                    return;
+                }
                 s.mouse_down = false;
+                s.drag_pending = None;
+                if let Some(drag) = s.drag.take() {
+                    perform_drop(s, drag);
+                    render(s);
+                }
             }
 
             WindowEvent::MouseInput {
@@ -1266,57 +1778,17 @@ impl ApplicationHandler for App {
                 let my  = s.mouse_y as i32;
                 let alt = s.mods.alt_key();
 
-                // Find bar click
-                let in_find = s.find.open && {
-                    let fy = s.h as i32 - s.status_h() - s.find_h();
-                    my >= fy && my < fy + s.find_h()
-                };
-                if in_find {
-                    let find_y    = s.h as i32 - s.status_h() - s.find_h();
-                    let row_h     = s.glyphs.lh + 4;
-                    let cw        = s.glyphs.cw;
-                    let rel_row   = (my - find_y) / row_h;
-                    if rel_row == 0 {
-                        // [Aa] and [W] toggles on the right
-                        let aa_len     = 4usize; // "[Aa]" or "[aa]"
-                        let w_len      = 3usize; // "[W]" or "[w]"
-                        let toggle_w   = (aa_len + 1 + w_len) as i32 * cw + 8;
-                        let aa_x       = s.w as i32 - toggle_w;
-                        let wl_x       = aa_x + (aa_len + 1) as i32 * cw;
-                        if mx >= aa_x && mx < wl_x     { s.find.case_sensitive = !s.find.case_sensitive; }
-                        else if mx >= wl_x             { s.find.whole_word     = !s.find.whole_word; }
-                        else                           { s.find.focus = FindFocus::Query; }
-                    } else if rel_row == 1 && s.find.replace_open {
-                        s.find.focus = FindFocus::Replace;
-                        let repl_len = 6usize; // "[Repl]"
-                        let all_len  = 5usize; // "[All]"
-                        let btn_w    = (repl_len + 1 + all_len) as i32 * cw + 8;
-                        let btn_x    = s.w as i32 - btn_w;
-                        let all_x    = btn_x + (repl_len + 1) as i32 * cw;
-                        if mx >= btn_x && mx < all_x   { replace_current(s); }
-                        else if mx >= all_x            { replace_all(s); }
-                    }
-                    render(s);
-                } else if my < s.tab_h() {
-                    // Tab bar
-                    let cw = s.glyphs.cw;
-                    let mut tx = 0i32;
-                    for i in 0..s.tabs.len() {
-                        let name_len    = s.tabs[i].display_name().chars().count();
-                        let dirty       = s.tabs[i].dirty;
-                        let label_chars = name_len + if dirty { 4 } else { 3 };
-                        let tw          = label_chars as i32 * cw + 1;
-                        if mx < tx + tw {
-                            s.active = i;
-                            render(s);
-                            break;
-                        }
-                        tx += tw;
-                    }
-                } else if s.explorer.is_some() && mx < EXPLORER_W {
-                    // Explorer
+                // Pane border resize
+                let area = s.pane_area();
+                if let Some((path, axis, rect)) = find_border_at(&s.pane_tree, area, mx, my) {
+                    s.resize_drag = Some(ResizeDrag { path, axis, rect });
+                    return;
+                }
+
+                // Explorer panel click
+                if s.explorer.is_some() && mx < s.explorer_w() {
                     let lh  = s.glyphs.lh;
-                    let row = (my - s.tab_h()) / lh;
+                    let row = my / lh;
                     if row == 0 {
                         if let Some(ex) = s.explorer.as_mut() { ex.toggle_hidden(); }
                     } else if row > 0 {
@@ -1324,59 +1796,128 @@ impl ApplicationHandler for App {
                         let action = s.explorer.as_mut().and_then(|ex| {
                             if idx < ex.entries.len() {
                                 ex.selected = idx;
-                                if ex.entries[idx].is_dir {
-                                    ex.toggle(idx);
-                                    None
-                                } else {
-                                    Some(ex.entries[idx].path.clone())
-                                }
+                                if ex.entries[idx].is_dir { ex.toggle(idx); None }
+                                else { Some(ex.entries[idx].path.clone()) }
                             } else { None }
                         });
                         if let Some(path) = action { open_or_reuse_tab(s, path); }
                     }
                     render(s);
+                    return;
+                }
+
+                // Status bar — ignore
+                if my >= s.h as i32 - s.status_h() { return; }
+
+                // Which pane was clicked?
+                let area = s.pane_area();
+                let Some(clicked_pane_id) = pane_at_pos(&s.pane_tree, mx, my, area) else { return };
+                let pane_rect = layout_tree(&s.pane_tree, area).into_iter()
+                    .find(|(id, _)| *id == clicked_pane_id).map(|(_, r)| r).unwrap_or(area);
+
+                let pane_local_y = my - pane_rect.y;
+                let tab_h        = s.tab_h();
+
+                if pane_local_y < tab_h {
+                    // Tab bar click
+                    let cw = s.glyphs.cw;
+                    let mut tx = pane_rect.x;
+                    let n_tabs = s.panes[&clicked_pane_id].tabs.len();
+                    for i in 0..n_tabs {
+                        let (name_len, dirty) = {
+                            let t = &s.panes[&clicked_pane_id].tabs[i];
+                            (t.display_name().chars().count(), t.dirty)
+                        };
+                        let label_chars = name_len + if dirty { 4 } else { 3 };
+                        let tw = label_chars as i32 * cw + 1;
+                        if mx < tx + tw {
+                            s.panes.get_mut(&clicked_pane_id).unwrap().active = i;
+                            s.active_pane = clicked_pane_id;
+                            s.drag_pending = Some((clicked_pane_id, i, s.mouse_x, s.mouse_y));
+                            render(s);
+                            return;
+                        }
+                        tx += tw;
+                    }
+                    s.active_pane = clicked_pane_id;
+                    render(s);
+                    return;
+                }
+
+                // Switch active pane on click
+                s.active_pane = clicked_pane_id;
+
+                // Find bar click
+                let fh = { let ap = clicked_pane_id; State::pane_find_h(&s.panes[&ap], s.glyphs.lh) };
+                let in_find = fh > 0 && {
+                    let fy = pane_rect.y + pane_rect.h - fh;
+                    my >= fy && my < fy + fh
+                };
+                if in_find {
+                    let find_y  = pane_rect.y + pane_rect.h - fh;
+                    let row_h   = s.glyphs.lh + 4;
+                    let cw      = s.glyphs.cw;
+                    let rel_row = (my - find_y) / row_h;
+                    if rel_row == 0 {
+                        let aa_len   = 4usize;
+                        let w_len    = 3usize;
+                        let toggle_w = (aa_len + 1 + w_len) as i32 * cw + 8;
+                        let aa_x     = s.w as i32 - toggle_w;
+                        let wl_x     = aa_x + (aa_len + 1) as i32 * cw;
+                        if mx >= aa_x && mx < wl_x { s.find_mut().case_sensitive = !s.find().case_sensitive; }
+                        else if mx >= wl_x         { s.find_mut().whole_word     = !s.find().whole_word; }
+                        else                       { s.find_mut().focus = FindFocus::Query; }
+                    } else if rel_row == 1 && s.find().replace_open {
+                        s.find_mut().focus = FindFocus::Replace;
+                        let repl_len = 6usize;
+                        let all_len  = 5usize;
+                        let btn_w    = (repl_len + 1 + all_len) as i32 * cw + 8;
+                        let btn_x    = s.w as i32 - btn_w;
+                        let all_x    = btn_x + (repl_len + 1) as i32 * cw;
+                        if mx >= btn_x && mx < all_x { replace_current(s); }
+                        else if mx >= all_x          { replace_all(s); }
+                    }
+                    render(s);
+                    return;
+                }
+
+                // Editor area click
+                let pos = s.xy_to_char(mx, my);
+                if alt {
+                    s.tab_mut().cursors.push(Cursor::new(pos));
+                    s.dedup_cursors();
+                    s.mouse_down = false;
                 } else {
-                    // Editor area
-                    let pos = s.xy_to_char(mx, my);
-                    if alt {
-                        s.tab_mut().cursors.push(Cursor::new(pos));
-                        s.dedup_cursors();
-                        s.mouse_down = false;
-                    } else {
-                        let now  = Instant::now();
-                        let fast = now.duration_since(s.last_click_time) < Duration::from_millis(500);
-                        let same = pos == s.last_click_char;
-                        s.click_count = if fast && same { s.click_count + 1 } else { 1 };
-                        s.last_click_time = now;
-                        s.last_click_char = pos;
-                        match s.click_count {
-                            2 => {
-                                // Double-click: select word under cursor
-                                let (lo, hi) = word_bounds_at(s.tab(), pos);
-                                s.tab_mut().cursors = vec![Cursor { head: hi, tail: lo }];
-                                s.mouse_down = false;
-                            }
-                            n if n >= 3 => {
-                                // Triple-click: select whole line
-                                let len = s.tab().text.len_chars();
-                                let li  = s.tab().text.char_to_line(pos.min(len));
-                                let ls  = s.tab().text.line_to_char(li);
-                                let le  = if li + 1 < s.tab().text.len_lines() {
-                                    s.tab().text.line_to_char(li + 1)
-                                } else { len };
-                                s.tab_mut().cursors = vec![Cursor { head: le, tail: ls }];
-                                s.mouse_down = false;
-                            }
-                            _ => {
-                                // Single click: place cursor
-                                s.tab_mut().cursors = vec![Cursor { head: pos, tail: pos }];
-                                s.mouse_down = true;
-                            }
+                    let now  = Instant::now();
+                    let fast = now.duration_since(s.last_click_time) < Duration::from_millis(500);
+                    let same = pos == s.last_click_char;
+                    s.click_count = if fast && same { s.click_count + 1 } else { 1 };
+                    s.last_click_time = now;
+                    s.last_click_char = pos;
+                    match s.click_count {
+                        2 => {
+                            let (lo, hi) = word_bounds_at(s.tab(), pos);
+                            s.tab_mut().cursors = vec![Cursor { head: hi, tail: lo }];
+                            s.mouse_down = false;
+                        }
+                        n if n >= 3 => {
+                            let len = s.tab().text.len_chars();
+                            let li  = s.tab().text.char_to_line(pos.min(len));
+                            let ls  = s.tab().text.line_to_char(li);
+                            let le  = if li + 1 < s.tab().text.len_lines() {
+                                s.tab().text.line_to_char(li + 1)
+                            } else { len };
+                            s.tab_mut().cursors = vec![Cursor { head: le, tail: ls }];
+                            s.mouse_down = false;
+                        }
+                        _ => {
+                            s.tab_mut().cursors = vec![Cursor { head: pos, tail: pos }];
+                            s.mouse_down = true;
                         }
                     }
-                    s.reset_blink();
-                    render(s);
                 }
+                s.reset_blink();
+                render(s);
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
@@ -1388,9 +1929,38 @@ impl ApplicationHandler for App {
                         (-(p.x as i32) / cw, -(p.y as i32) / lh)
                     }
                 };
-                if dy != 0 { s.scroll_by(dy); }
-                if dx != 0 { s.hscroll_by(dx); }
-                if dx != 0 || dy != 0 { render(s); }
+                let pane_kind = s.panes.get(&s.active_pane).map(|p| p.kind.clone()).unwrap_or(PaneKind::Editor);
+                match pane_kind {
+                    PaneKind::Terminal => {
+                        if dy != 0 {
+                            let tp = s.term_panes.get_mut(&s.active_pane).unwrap();
+                            let sb = tp.grid.scrollback.len();
+                            if dy < 0 {
+                                tp.grid.scroll_offset = (tp.grid.scroll_offset + (-dy) as usize).min(sb);
+                            } else {
+                                tp.grid.scroll_offset = tp.grid.scroll_offset.saturating_sub(dy as usize);
+                            }
+                            render(s);
+                        }
+                    }
+                    PaneKind::LspOutput => {
+                        if dy != 0 {
+                            let op = s.lsp_panes.get_mut(&s.active_pane).unwrap();
+                            let max_scroll = op.lines.len().saturating_sub(1);
+                            if dy < 0 {
+                                op.scroll = (op.scroll + (-dy) as usize).min(max_scroll);
+                            } else {
+                                op.scroll = op.scroll.saturating_sub(dy as usize);
+                            }
+                            render(s);
+                        }
+                    }
+                    PaneKind::Editor => {
+                        if dy != 0 { s.scroll_by(dy); }
+                        if dx != 0 { s.hscroll_by(dx); }
+                        if dx != 0 || dy != 0 { render(s); }
+                    }
+                }
             }
 
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
@@ -1400,30 +1970,50 @@ impl ApplicationHandler for App {
                 let alt   = s.mods.alt_key();
                 let shift = s.mods.shift_key();
 
+                // Ctrl+` — open a new terminal pane (works from any pane kind)
+                if ctrl && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "`") {
+                    open_terminal_pane(s);
+                    render(s);
+                    return;
+                }
+
+                // Terminal pane: forward all key events to the PTY
+                if s.panes.get(&s.active_pane).map_or(false, |p| p.kind == PaneKind::Terminal) {
+                    let bytes = terminal::encode_key(&event.logical_key, s.mods, event.text.as_deref());
+                    if let Some(bytes) = bytes {
+                        if let Some(tp) = s.term_panes.get(&s.active_pane) {
+                            unsafe { libc::write(tp.pty_fd, bytes.as_ptr().cast(), bytes.len()); }
+                        }
+                    }
+                    return;
+                }
+
+                // LspOutput pane: read-only, ignore all input except pane-switch shortcuts
+                if s.panes.get(&s.active_pane).map_or(false, |p| p.kind == PaneKind::LspOutput) {
+                    return;
+                }
+
                 // Find bar: route non-cmd keys when open
-                if s.find.open && !cmd {
+                if s.find().open && !cmd {
                     match &event.logical_key {
-                        Key::Named(NamedKey::Escape) => { s.find.open = false; }
+                        Key::Named(NamedKey::Escape) => { s.find_mut().open = false; }
                         Key::Named(NamedKey::Tab) => {
-                            if s.find.replace_open {
-                                s.find.focus = if s.find.focus == FindFocus::Query {
-                                    FindFocus::Replace
-                                } else {
-                                    FindFocus::Query
-                                };
+                            if s.find().replace_open {
+                                let nf = if s.find().focus == FindFocus::Query { FindFocus::Replace } else { FindFocus::Query };
+                                s.find_mut().focus = nf;
                             }
                         }
                         Key::Named(NamedKey::Enter) => {
-                            if s.find.focus == FindFocus::Replace && s.find.replace_open {
+                            if s.find().focus == FindFocus::Replace && s.find().replace_open {
                                 replace_current(s);
                             } else {
                                 find_step(s, shift);
                             }
                         }
-                        Key::Named(NamedKey::Backspace) => { s.find.active_field_mut().pop(); }
+                        Key::Named(NamedKey::Backspace) => { s.find_mut().active_field_mut().pop(); }
                         _ => {
                             if let Some(txt) = event.text.as_deref() {
-                                s.find.active_field_mut().push_str(txt);
+                                s.find_mut().active_field_mut().push_str(txt);
                             }
                         }
                     }
@@ -1480,60 +2070,117 @@ impl ApplicationHandler for App {
                             s.rebuild_glyphs();
                             true
                         } else if cmd && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "t") {
-                            s.tabs.push(Tab::untitled());
-                            s.active = s.tabs.len() - 1;
+                            let new_buf_id = s.next_buf_id;
+                            s.next_buf_id += 1;
+                            let pane = s.pane_mut();
+                            pane.tabs.push(Tab::untitled(new_buf_id));
+                            pane.active = pane.tabs.len() - 1;
                             s.reset_blink();
                             true
                         } else if cmd && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "w") {
-                            if s.tabs.len() == 1 { el.exit(); }
-                            else {
-                                s.tabs.remove(s.active);
-                                if s.active >= s.tabs.len() { s.active = s.tabs.len() - 1; }
+                            let pane_id = s.active_pane;
+                            let pane_kind = s.panes.get(&pane_id).map(|p| p.kind.clone()).unwrap_or(PaneKind::Editor);
+                            if pane_kind != PaneKind::Editor {
+                                // Terminal / LspOutput panes: always close the pane
+                                s.term_panes.remove(&pane_id); // Drop closes fd
+                                s.lsp_panes.remove(&pane_id);
+                                s.panes.remove(&pane_id);
+                                let old_tree = std::mem::replace(&mut s.pane_tree, PaneTree::Leaf(0));
+                                if let Some(new_tree) = remove_pane_from_tree(old_tree, pane_id) {
+                                    s.pane_tree = new_tree;
+                                }
+                                let new_active = layout_tree(&s.pane_tree, s.pane_area()).first().map(|(id, _)| *id).unwrap_or(0);
+                                s.active_pane = new_active;
+                            } else {
+                                let pane = s.panes.get_mut(&pane_id).unwrap();
+                                if pane.tabs.len() > 1 {
+                                    pane.tabs.remove(pane.active);
+                                    if pane.active >= pane.tabs.len() { pane.active = pane.tabs.len() - 1; }
+                                } else if s.panes.len() > 1 {
+                                    s.panes.remove(&pane_id);
+                                    let old_tree = std::mem::replace(&mut s.pane_tree, PaneTree::Leaf(0));
+                                    if let Some(new_tree) = remove_pane_from_tree(old_tree, pane_id) {
+                                        s.pane_tree = new_tree;
+                                    }
+                                    let new_active = layout_tree(&s.pane_tree, s.pane_area()).first().map(|(id, _)| *id).unwrap_or(0);
+                                    s.active_pane = new_active;
+                                } else {
+                                    el.exit();
+                                }
+                            }
+                            true
+                        } else if cmd && !shift && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "\\") {
+                            if s.pane().kind == PaneKind::Editor {
+                                let new_id = s.next_pane_id;
+                                s.next_pane_id += 1;
+                                let mut new_pane = Pane::new(new_id, 0); // buf_id preserved via clone
+                                new_pane.tabs = vec![s.pane().tab().clone()];
+                                s.panes.insert(new_id, new_pane);
+                                let old_tree = std::mem::replace(&mut s.pane_tree, PaneTree::Leaf(0));
+                                s.pane_tree = insert_pane(old_tree, s.active_pane, new_id, DropZone::Right);
+                                s.active_pane = new_id;
+                            }
+                            true
+                        } else if cmd && shift && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "_") {
+                            if s.pane().kind == PaneKind::Editor {
+                                let new_id = s.next_pane_id;
+                                s.next_pane_id += 1;
+                                let mut new_pane = Pane::new(new_id, 0); // buf_id preserved via clone
+                                new_pane.tabs = vec![s.pane().tab().clone()];
+                                s.panes.insert(new_id, new_pane);
+                                let old_tree = std::mem::replace(&mut s.pane_tree, PaneTree::Leaf(0));
+                                s.pane_tree = insert_pane(old_tree, s.active_pane, new_id, DropZone::Bottom);
+                                s.active_pane = new_id;
                             }
                             true
                         } else if cmd && shift && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "]") {
-                            s.active = (s.active + 1) % s.tabs.len();
+                            let pane = s.pane_mut();
+                            pane.active = (pane.active + 1) % pane.tabs.len();
                             true
                         } else if cmd && shift && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "[") {
-                            s.active = s.active.checked_sub(1).unwrap_or(s.tabs.len() - 1);
+                            let n = s.pane().tabs.len();
+                            let pane = s.pane_mut();
+                            pane.active = pane.active.checked_sub(1).unwrap_or(n - 1);
                             true
                         } else if cmd && matches!(&event.logical_key, Key::Character(c) if matches!(c.as_str(), "1"|"2"|"3"|"4"|"5"|"6"|"7"|"8"|"9")) {
                             if let Key::Character(c) = &event.logical_key {
                                 if let Ok(n) = c.as_str().parse::<usize>() {
-                                    if n >= 1 && n - 1 < s.tabs.len() { s.active = n - 1; }
+                                    let pane = s.pane_mut();
+                                    if n >= 1 && n - 1 < pane.tabs.len() { pane.active = n - 1; }
                                 }
                             }
                             true
                         } else if ctrl && matches!(&event.logical_key, Key::Named(NamedKey::Tab)) {
+                            let n = s.pane().tabs.len();
+                            let pane = s.pane_mut();
                             if shift {
-                                s.active = s.active.checked_sub(1).unwrap_or(s.tabs.len() - 1);
+                                pane.active = pane.active.checked_sub(1).unwrap_or(n - 1);
                             } else {
-                                s.active = (s.active + 1) % s.tabs.len();
+                                pane.active = (pane.active + 1) % n;
                             }
                             true
                         }
                         // ── Find / Replace ────────────────────────────────────────────────────
                         else if cmd && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "f") {
-                            s.find.open         = true;
-                            s.find.replace_open = false;
-                            s.find.focus        = FindFocus::Query;
-                            s.find.query.clear();
-                            if let Some(t) = s.tab().sel_text() { s.find.query = t; }
+                            s.find_mut().open         = true;
+                            s.find_mut().replace_open = false;
+                            s.find_mut().focus        = FindFocus::Query;
+                            s.find_mut().query.clear();
+                            if let Some(t) = s.tab().sel_text() { s.find_mut().query = t; }
                             true
                         } else if cmd && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "h") {
-                            s.find.open         = true;
-                            s.find.replace_open = true;
-                            s.find.focus        = FindFocus::Query;
-                            s.find.query.clear();
-                            if let Some(t) = s.tab().sel_text() { s.find.query = t; }
+                            s.find_mut().open         = true;
+                            s.find_mut().replace_open = true;
+                            s.find_mut().focus        = FindFocus::Query;
+                            s.find_mut().query.clear();
+                            if let Some(t) = s.tab().sel_text() { s.find_mut().query = t; }
                             true
                         } else if cmd && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "g") {
-                            if !s.find.query.is_empty() { find_step(s, shift); }
+                            if !s.find().query.is_empty() { find_step(s, shift); }
                             true
                         }
                         // ── Multi-cursor ──────────────────────────────────────────────────────
                         else if cmd && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "d") {
-                            // If no selection on primary, select word under cursor first
                             if !s.tab().primary().has_sel() {
                                 let pos = s.tab().primary().head;
                                 let (lo, hi) = word_bounds_at(s.tab(), pos);
@@ -1543,8 +2190,8 @@ impl ApplicationHandler for App {
                             }
                             let query = s.tab().sel_text().unwrap_or_default();
                             if !query.is_empty() {
-                                let ms = find_matches(&s.tab().text, &query,
-                                                      s.find.case_sensitive, s.find.whole_word);
+                                let (cs, ww) = { let f = s.find(); (f.case_sensitive, f.whole_word) };
+                                let ms = find_matches(&s.tab().text, &query, cs, ww);
                                 let after = s.tab().primary().hi();
                                 let idx = ms.iter().position(|&(lo, _)| lo >= after).unwrap_or(0);
                                 if let Some(&(mlo, mhi)) = ms.get(idx) {
@@ -1557,8 +2204,8 @@ impl ApplicationHandler for App {
                             true
                         } else if cmd && shift && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "l") {
                             if let Some(query) = s.tab().sel_text().filter(|t| !t.is_empty()) {
-                                let ms = find_matches(&s.tab().text, &query,
-                                                      s.find.case_sensitive, s.find.whole_word);
+                                let (cs, ww) = { let f = s.find(); (f.case_sensitive, f.whole_word) };
+                                let ms = find_matches(&s.tab().text, &query, cs, ww);
                                 if !ms.is_empty() {
                                     s.tab_mut().cursors = ms.into_iter()
                                         .map(|(lo, hi)| Cursor { head: hi, tail: lo })
@@ -1568,11 +2215,17 @@ impl ApplicationHandler for App {
                             }
                             true
                         }
-                        // ── Escape: collapse multi-cursor ─────────────────────────────────────
+                        // ── Escape: cancel drag / collapse multi-cursor / close find ──────────
                         else if matches!(&event.logical_key, Key::Named(NamedKey::Escape)) {
-                            if s.tab().cursors.len() > 1 {
+                            if s.drag.is_some() {
+                                s.drag = None;
+                                true
+                            } else if s.tab().cursors.len() > 1 {
                                 let head = s.tab().primary().head;
                                 s.tab_mut().cursors = vec![Cursor::new(head)];
+                                true
+                            } else if s.find().open {
+                                s.find_mut().open = false;
                                 true
                             } else { false }
                         } else if ctrl && matches!(&event.logical_key, Key::Character(_)) {
@@ -1628,6 +2281,7 @@ impl ApplicationHandler for App {
                             false
                         };
 
+                    notify_lsp_change(s);
                     render(s);
                     let _ = handled;
                 }
@@ -1647,6 +2301,38 @@ impl ApplicationHandler for App {
         } else {
             el.set_control_flow(ControlFlow::Wait);
         }
+    }
+
+    fn user_event(&mut self, _el: &ActiveEventLoop, event: UserEvent) {
+        let Some(s) = self.state.as_mut() else { return };
+        match event {
+            UserEvent::TermOutput { pane_id, data } => {
+                if let Some(tp) = s.term_panes.get_mut(&pane_id) {
+                    terminal::feed_bytes(tp, &data);
+                }
+            }
+            UserEvent::LspOutput { pane_id, data } => {
+                if let Some(op) = s.lsp_panes.get_mut(&pane_id) {
+                    let text = String::from_utf8_lossy(&data);
+                    op.lines.extend(text.lines().map(String::from));
+                }
+                // Send `initialized` notification after receiving initialize response
+                if let Some(srv) = s.lsp.servers.get_mut(&pane_id) {
+                    if !srv.initialized {
+                        if let Ok(text) = String::from_utf8(data) {
+                            if lsp::is_initialize_response(&text) {
+                                lsp::send_initialized(srv);
+                            }
+                        }
+                    }
+                }
+            }
+            UserEvent::LspDiagnostics { path, diagnostics } => {
+                s.diagnostics.insert(path, diagnostics);
+            }
+            UserEvent::Redraw => {}
+        }
+        s.win.request_redraw();
     }
 }
 
@@ -1697,87 +2383,228 @@ fn draw_str(buf: &mut [u32], w: u32, h: u32, g: &Glyphs, text: &str, mut x: i32,
     }
 }
 
+fn draw_squiggle(buf: &mut [u32], w: u32, h: u32, x: i32, y: i32, width: i32, color: u32) {
+    for dx in 0..width {
+        let yoff: i32 = if (dx % 4) < 2 { 0 } else { 2 };
+        for dy in 0..2i32 {
+            let px = x + dx;
+            let py = y + yoff + dy;
+            if px >= 0 && px < w as i32 && py >= 0 && py < h as i32 {
+                buf[(py as u32 * w + px as u32) as usize] = color;
+            }
+        }
+    }
+}
+
+// Per-pane render snapshot
+struct PaneSnap {
+    id:             usize,
+    rect:           Rect,
+    is_active:      bool,
+    scroll:         usize,
+    hscroll:        usize,
+    find_h:         i32,
+    editor_h:       i32,
+    cursors_snap:   Vec<(usize, usize, Option<(usize, usize)>)>,
+    match_ranges:   Vec<(usize, usize)>,
+    find_open:      bool,
+    find_repl_open: bool,
+    find_focus:     FindFocus,
+    case_sensitive: bool,
+    whole_word:     bool,
+    find_query:     String,
+    find_repl:      String,
+    lines:          Vec<(String, usize, Vec<u32>)>,
+    total:          usize,
+    max_line_len:   usize,
+    gutter_w:       i32,
+    ln_digits:      usize,
+    tab_info:       Vec<(String, bool)>,
+    active_tab:     usize,
+    path_name:      String,
+    dirty:          bool,
+    cur_line:       usize,
+    cur_col:        usize,
+    // Diagnostics: (line, col_start, col_end, severity)
+    diagnostics:    Vec<(usize, usize, usize, DiagSeverity)>,
+}
+
 fn render(s: &mut State) {
     let w = s.w;
     let h = s.h;
     if w == 0 || h == 0 { return; }
     dlog!("[render] {}x{} t={}", w, h, ts());
 
-    let explorer_w   = s.explorer_w();
-    let scroll       = s.tab().scroll;
-    let hscroll      = s.tab().hscroll;
-    let tab_h        = s.tab_h();
-    let status_h     = s.status_h();
-    let find_h       = s.find_h();
-    let editor_h     = s.editor_h();
-    let lh           = s.glyphs.lh;
-    let asc          = s.glyphs.asc;
-    let cw           = s.glyphs.cw;
-    let total        = s.tab().text.len_lines();
-    let vis          = (editor_h / lh).max(1) as usize;
-    let cursor_visible = s.cursor_visible;
-
-    // Cursors snapshot: (line, col, sel)
-    let cursors_snap: Vec<(usize, usize, Option<(usize, usize)>)> = {
-        let t = &s.tabs[s.active];
-        t.cursors.iter().map(|c| {
-            let head = c.head.min(t.text.len_chars());
-            let line = t.text.char_to_line(head);
-            let col  = head - t.text.line_to_char(line);
-            (line, col, c.sel())
-        }).collect()
-    };
-    let (cur_line, cur_col) = cursors_snap.last().map(|&(l, c, _)| (l, c)).unwrap_or((0, 0));
-
-    // Find bar snapshot
-    let find_open      = s.find.open;
-    let find_repl_open = s.find.replace_open;
-    let find_focus     = s.find.focus;
-    let case_sensitive = s.find.case_sensitive;
-    let whole_word     = s.find.whole_word;
-    let find_query     = s.find.query.clone();
-    let find_repl      = s.find.replace.clone();
-    let find_matches_snap: Vec<(usize, usize)> = if find_open && !find_query.is_empty() {
-        find_matches(&s.tab().text, &find_query, case_sensitive, whole_word)
-    } else { vec![] };
-
-    // Language / syntax
-    let lang = s.tab().path.as_deref().map(Lang::from_path).unwrap_or(Lang::None);
-    let mut hl_state = MlState::Normal;
-    if lang != Lang::None {
-        for li in 0..scroll {
-            let chars: Vec<char> = s.tab().text.line(li)
-                .chars().take_while(|&c| c != '\n' && c != '\r').collect();
-            let (_, ns) = highlight_line(&chars, lang, hl_state);
-            hl_state = ns;
+    // Sync shared buffers: propagate the active tab's text/path/dirty to all
+    // other tabs with the same buf_id (O(1) Rope clone per sibling).
+    // Only applies to editor panes (terminal/output panes have no tabs).
+    if s.panes.get(&s.active_pane).map_or(false, |p| p.kind == PaneKind::Editor) {
+        let ap = s.active_pane;
+        let at = s.panes[&ap].active;
+        let buf_id = s.panes[&ap].tabs[at].buf_id;
+        let text   = s.panes[&ap].tabs[at].text.clone();
+        let path   = s.panes[&ap].tabs[at].path.clone();
+        let dirty  = s.panes[&ap].tabs[at].dirty;
+        for (pid, p) in s.panes.iter_mut() {
+            for (tidx, t) in p.tabs.iter_mut().enumerate() {
+                if t.buf_id == buf_id && (*pid != ap || tidx != at) {
+                    t.text  = text.clone();
+                    t.path  = path.clone();
+                    t.dirty = dirty;
+                }
+            }
         }
     }
 
-    let line_count = vis.min(total.saturating_sub(scroll));
-    let mut lines: Vec<(String, usize, Vec<u32>)> = Vec::with_capacity(line_count);
-    for vi in 0..line_count {
-        let li         = scroll + vi;
-        let line_start = s.tab().text.line_to_char(li);
-        let chars: Vec<char> = s.tab().text.line(li)
-            .chars().take_while(|&c| c != '\n' && c != '\r').collect();
-        let text: String = chars.iter().collect();
-        let (colors, ns) = if lang != Lang::None {
-            highlight_line(&chars, lang, hl_state)
-        } else {
-            (vec![FG; chars.len()], hl_state)
-        };
-        hl_state = ns;
-        lines.push((text, line_start, colors));
+    let tab_h    = s.tab_h();
+    let status_h = s.status_h();
+    let lh       = s.glyphs.lh;
+    let asc      = s.glyphs.asc;
+    let cw       = s.glyphs.cw;
+    let cursor_visible = s.cursor_visible;
+    let explorer_w = s.explorer_w();
+    let area     = s.pane_area();
+    let layout   = layout_tree(&s.pane_tree, area);
+    let active_pane_id = s.active_pane;
+
+    // Build terminal pane snapshots
+    struct TermPaneSnap {
+        rect:          Rect,
+        is_active:     bool,
+        visible_rows:  Vec<Vec<terminal::Cell>>,
+        cursor_col:    usize,
+        cursor_row:    usize,
+        cursor_visible: bool,
+        title:         String,
     }
+    let term_snaps: Vec<TermPaneSnap> = layout.iter().filter_map(|&(pid, rect)| {
+        let pane = s.panes.get(&pid)?;
+        if pane.kind != PaneKind::Terminal { return None; }
+        let tp = s.term_panes.get(&pid)?;
+        Some(TermPaneSnap {
+            rect,
+            is_active: pid == active_pane_id,
+            visible_rows: tp.grid.visible_rows(),
+            cursor_col: tp.grid.cur_col,
+            cursor_row: tp.grid.cur_row,
+            cursor_visible,
+            title: tp.title.clone(),
+        })
+    }).collect();
 
-    let max_line_len = (0..total).map(|li| State::line_len(&s.tab().text, li)).max().unwrap_or(0);
-    let path_name    = s.tab().display_name().to_owned();
-    let dirty        = s.tab().dirty;
+    // Build LSP output pane snapshots
+    struct OutPaneSnap {
+        rect:          Rect,
+        is_active:     bool,
+        visible_lines: Vec<String>,
+        title:         String,
+        total_lines:   usize,
+        scroll:        usize,
+    }
+    let out_snaps: Vec<OutPaneSnap> = layout.iter().filter_map(|&(pid, rect)| {
+        let pane = s.panes.get(&pid)?;
+        if pane.kind != PaneKind::LspOutput { return None; }
+        let op = s.lsp_panes.get(&pid)?;
+        let content_h = (rect.h - tab_h).max(0);
+        let vis = (content_h / lh).max(1) as usize;
+        let scroll = op.scroll;
+        let start = scroll.min(op.lines.len());
+        let visible_lines: Vec<String> = op.lines[start..].iter().take(vis).cloned().collect();
+        Some(OutPaneSnap {
+            rect,
+            is_active: pid == active_pane_id,
+            visible_lines,
+            title: op.title.clone(),
+            total_lines: op.lines.len(),
+            scroll,
+        })
+    }).collect();
 
-    let tab_info: Vec<(String, bool)> = s.tabs.iter()
-        .map(|t| (t.display_name().to_owned(), t.dirty))
-        .collect();
-    let active_tab = s.active;
+    // Build per-pane snapshots (editor panes only)
+    let pane_snaps: Vec<PaneSnap> = layout.iter().filter_map(|&(pid, rect)| {
+        let pane = s.panes.get(&pid)?;
+        if pane.kind != PaneKind::Editor { return None; }
+        Some((pid, rect, pane))
+    }).map(|(pid, rect, pane)| {
+        let tab  = pane.tab();
+        let fh   = State::pane_find_h(pane, lh);
+        let eh   = (rect.h - tab_h - fh).max(0);
+        let vis  = (eh / lh).max(1) as usize;
+        let scroll  = tab.scroll;
+        let hscroll = tab.hscroll;
+        let total   = tab.text.len_lines();
+        let lang    = tab.path.as_deref().map(Lang::from_path).unwrap_or(Lang::None);
+
+        let cursors_snap: Vec<(usize, usize, Option<(usize, usize)>)> = tab.cursors.iter().map(|c| {
+            let head = c.head.min(tab.text.len_chars());
+            let line = tab.text.char_to_line(head);
+            let col  = head - tab.text.line_to_char(line);
+            (line, col, c.sel())
+        }).collect();
+        let (cur_line, cur_col) = cursors_snap.last().map(|&(l, c, _)| (l, c)).unwrap_or((0, 0));
+
+        let fq = pane.find.query.clone();
+        let match_ranges: Vec<(usize, usize)> = if pane.find.open && !fq.is_empty() {
+            find_matches(&tab.text, &fq, pane.find.case_sensitive, pane.find.whole_word)
+        } else { vec![] };
+
+        // Syntax highlight lines
+        let mut hl_state = MlState::Normal;
+        if lang != Lang::None {
+            for li in 0..scroll {
+                let chars: Vec<char> = tab.text.line(li)
+                    .chars().take_while(|&c| c != '\n' && c != '\r').collect();
+                let (_, ns) = highlight_line(&chars, lang, hl_state);
+                hl_state = ns;
+            }
+        }
+        let line_count = vis.min(total.saturating_sub(scroll));
+        let mut lines: Vec<(String, usize, Vec<u32>)> = Vec::with_capacity(line_count);
+        for vi in 0..line_count {
+            let li         = scroll + vi;
+            let line_start = tab.text.line_to_char(li);
+            let chars: Vec<char> = tab.text.line(li)
+                .chars().take_while(|&c| c != '\n' && c != '\r').collect();
+            let text: String = chars.iter().collect();
+            let (colors, ns) = if lang != Lang::None {
+                highlight_line(&chars, lang, hl_state)
+            } else {
+                (vec![FG; chars.len()], hl_state)
+            };
+            hl_state = ns;
+            lines.push((text, line_start, colors));
+        }
+
+        let max_line_len = (0..total).map(|li| State::line_len(&tab.text, li)).max().unwrap_or(0);
+        let ln_digits = State::line_num_digits(total);
+        let gutter_w  = State::gutter_w(total, cw);
+        let tab_info: Vec<(String, bool)> = pane.tabs.iter()
+            .map(|t| (t.display_name().to_owned(), t.dirty)).collect();
+
+        PaneSnap {
+            id: pid,
+            rect,
+            is_active: pid == active_pane_id,
+            scroll, hscroll, find_h: fh, editor_h: eh,
+            cursors_snap, match_ranges,
+            find_open: pane.find.open, find_repl_open: pane.find.replace_open,
+            find_focus: pane.find.focus, case_sensitive: pane.find.case_sensitive,
+            whole_word: pane.find.whole_word,
+            find_query: fq, find_repl: pane.find.replace.clone(),
+            lines, total, max_line_len, gutter_w, ln_digits,
+            tab_info, active_tab: pane.active,
+            path_name: tab.display_name().to_owned(), dirty: tab.dirty,
+            cur_line, cur_col,
+            diagnostics: tab.path.as_ref()
+                .and_then(|p| s.diagnostics.get(p))
+                .map(|diags| diags.iter().map(|d| (d.line, d.col_start, d.col_end, d.severity.clone())).collect())
+                .unwrap_or_default(),
+        }
+    }).collect();
+
+    // Drag snapshot
+    let drag_snap: Option<(usize, Option<usize>, Option<DropZone>)> =
+        s.drag.as_ref().map(|d| (d.source_pane, d.over_pane, d.zone));
 
     let show_hidden = s.explorer.as_ref().map_or(false, |ex| ex.show_hidden);
     let explorer_snap: Option<Vec<(String, bool, bool, usize, bool)>> =
@@ -1792,21 +2619,20 @@ fn render(s: &mut State) {
     s.renderer.render_frame(move |buf, w, h| {
         let g = unsafe { &*glyphs };
 
-        // ── Clear ─────────────────────────────────────────────────────────
         for p in buf.iter_mut() { *p = BG; }
 
         // ── Explorer panel ────────────────────────────────────────────────
         if let Some(entries) = &explorer_snap {
-            let panel_h = h as i32 - tab_h - status_h;
-            fill(buf, w, h, 0, tab_h, explorer_w, panel_h, BG2);
-            fill(buf, w, h, explorer_w - 1, tab_h, 1, panel_h, BORDER);
+            let panel_h = h as i32 - status_h;
+            fill(buf, w, h, 0, 0, explorer_w, panel_h, BG2);
+            fill(buf, w, h, explorer_w - 1, 0, 1, panel_h, BORDER);
 
             let toggle_label = if show_hidden { "  [x] .hidden" } else { "  [ ] .hidden" };
-            draw_str(buf, w, h, g, toggle_label, 0, tab_h + asc, FG_DIM, explorer_w - 1);
-            fill(buf, w, h, 0, tab_h + lh - 1, explorer_w - 1, 1, BORDER);
+            draw_str(buf, w, h, g, toggle_label, 0, asc, FG_DIM, explorer_w - 1);
+            fill(buf, w, h, 0, lh - 1, explorer_w - 1, 1, BORDER);
 
             for (i, (name, is_dir, expanded, depth, selected)) in entries.iter().enumerate() {
-                let ey = tab_h + lh + i as i32 * lh;
+                let ey = lh + i as i32 * lh;
                 if ey + lh > h as i32 - status_h { break; }
                 let baseline = ey + asc;
                 if *selected { fill(buf, w, h, 0, ey, explorer_w - 1, lh, SEL_BG); }
@@ -1817,174 +2643,308 @@ fn render(s: &mut State) {
             }
         }
 
-        // ── Tab bar ───────────────────────────────────────────────────────
-        fill(buf, w, h, 0, 0, w as i32, tab_h, BG2);
-        fill(buf, w, h, 0, tab_h - 1, w as i32, 1, BORDER);
+        // ── Per-pane rendering ────────────────────────────────────────────
+        for snap in &pane_snaps {
+            let r       = snap.rect;
+            let scroll  = snap.scroll;
+            let hscroll = snap.hscroll;
+            let fh      = snap.find_h;
+            let gutter_w = snap.gutter_w;
+            let ed_x     = r.x + gutter_w;
+            let clip_r   = r.x + r.w;
 
-        let mut tx = 0i32;
-        for (i, (name, dirty_tab)) in tab_info.iter().enumerate() {
-            let label    = if *dirty_tab { format!(" {}• ", name) } else { format!(" {}  ", name) };
-            let tw       = label.chars().count() as i32 * cw;
-            let is_active = i == active_tab;
-            let tab_bg   = if is_active { BG } else { BG2 };
-            fill(buf, w, h, tx, 0, tw, tab_h - 1, tab_bg);
-            if is_active { fill(buf, w, h, tx, tab_h - 2, tw, 2, ACCENT); }
-            draw_str(buf, w, h, g, &label, tx, tab_h * 3 / 4, FG, tx + tw);
-            fill(buf, w, h, tx + tw, 0, 1, tab_h, BORDER);
-            tx += tw + 1;
-        }
+            // Tab bar
+            fill(buf, w, h, r.x, r.y, r.w, tab_h, BG2);
+            fill(buf, w, h, r.x, r.y + tab_h - 1, r.w, 1, BORDER);
+            if snap.is_active {
+                fill(buf, w, h, r.x, r.y, 2, tab_h - 1, ACCENT);
+            }
+            let mut tx = r.x;
+            for (i, (name, dirty_tab)) in snap.tab_info.iter().enumerate() {
+                let label    = if *dirty_tab { format!(" {}• ", name) } else { format!(" {}  ", name) };
+                let tw       = label.chars().count() as i32 * cw;
+                let is_act   = i == snap.active_tab;
+                let tab_bg   = if is_act { BG } else { BG2 };
+                fill(buf, w, h, tx, r.y, tw, tab_h - 1, tab_bg);
+                if is_act { fill(buf, w, h, tx, r.y + tab_h - 2, tw, 2, ACCENT); }
+                draw_str(buf, w, h, g, &label, tx, r.y + tab_h * 3 / 4, FG, (tx + tw).min(clip_r));
+                fill(buf, w, h, tx + tw, r.y, 1, tab_h, BORDER);
+                tx += tw + 1;
+            }
 
-        // ── Editor lines ──────────────────────────────────────────────────
-        let ed_x = explorer_w + ED_LPAD;
-        for (vi, (text, line_start, colors)) in lines.iter().enumerate() {
-            let li       = scroll + vi;
-            let py       = tab_h + vi as i32 * lh;
-            let baseline = py + asc;
+            // Editor lines
+            for (vi, (text, line_start, colors)) in snap.lines.iter().enumerate() {
+                let li       = scroll + vi;
+                let py       = r.y + tab_h + vi as i32 * lh;
+                let baseline = py + asc;
 
-            // Find match highlights (drawn first, lowest layer)
-            for &(mlo, mhi) in &find_matches_snap {
-                let lcc      = text.chars().count();
-                let line_end = line_start + lcc;
-                if mlo < line_end + 1 && mhi > *line_start {
-                    let is_active = cursors_snap.iter().any(|(_, _, sel)| {
-                        sel.map_or(false, |(lo, hi)| lo == mlo && hi == mhi)
-                    });
-                    let color  = if is_active { HL_MATCH_ACTIVE } else { HL_MATCH };
-                    let col_lo = mlo.saturating_sub(*line_start);
-                    let col_hi = mhi.saturating_sub(*line_start).min(lcc);
-                    let sx     = (ed_x + (col_lo as i32 - hscroll as i32) * cw).max(ed_x);
-                    let ex     = ed_x + (col_hi as i32 - hscroll as i32) * cw;
-                    let sw     = (ex - sx).max(0);
-                    if sw > 0 { fill(buf, w, h, sx, py, sw, lh, color); }
+                // Line number (right-aligned in gutter, colored by diagnostic severity)
+                let ln_str  = (li + 1).to_string();
+                let ln_x    = r.x + (snap.ln_digits as i32 - ln_str.len() as i32) * cw;
+                let is_cur  = snap.cursors_snap.iter().any(|&(l, _, _)| l == li);
+                let ln_color = if is_cur {
+                    FG
+                } else {
+                    // Check if any diagnostic is on this line; use worst severity color
+                    let has_error = snap.diagnostics.iter().any(|&(dl, _, _, ref s)| dl == li && *s == DiagSeverity::Error);
+                    let has_warn  = snap.diagnostics.iter().any(|&(dl, _, _, ref s)| dl == li && *s == DiagSeverity::Warning);
+                    if has_error { 0xFF5555u32 } else if has_warn { 0xE0AF68 } else { FG_DIM }
+                };
+                draw_str(buf, w, h, g, &ln_str, ln_x, baseline, ln_color, ed_x);
+
+                // Find match highlights
+                for &(mlo, mhi) in &snap.match_ranges {
+                    let lcc      = text.chars().count();
+                    let line_end = line_start + lcc;
+                    if mlo < line_end + 1 && mhi > *line_start {
+                        let is_act = snap.cursors_snap.iter().any(|(_, _, sel)| {
+                            sel.map_or(false, |(lo, hi)| lo == mlo && hi == mhi)
+                        });
+                        let color  = if is_act { HL_MATCH_ACTIVE } else { HL_MATCH };
+                        let col_lo = mlo.saturating_sub(*line_start);
+                        let col_hi = mhi.saturating_sub(*line_start).min(lcc);
+                        let sx     = (ed_x + (col_lo as i32 - hscroll as i32) * cw).max(ed_x);
+                        let ex     = (ed_x + (col_hi as i32 - hscroll as i32) * cw).min(clip_r);
+                        let sw     = (ex - sx).max(0);
+                        if sw > 0 { fill(buf, w, h, sx, py, sw, lh, color); }
+                    }
+                }
+
+                // Selection highlights
+                for &(_, _, sel) in &snap.cursors_snap {
+                    if let Some((sel_lo, sel_hi)) = sel {
+                        let lcc      = text.chars().count();
+                        let line_end = line_start + lcc;
+                        if sel_lo < line_end + 1 && sel_hi > *line_start {
+                            let col_lo = sel_lo.saturating_sub(*line_start);
+                            let col_hi = if sel_hi > line_end { lcc + 1 } else { sel_hi - line_start };
+                            let sx_raw = ed_x + (col_lo as i32 - hscroll as i32) * cw;
+                            let sx_end = (ed_x + (col_hi as i32 - hscroll as i32) * cw).min(clip_r);
+                            let sx     = sx_raw.max(ed_x);
+                            let sw     = (sx_end - sx).max(0);
+                            if sw > 0 { fill(buf, w, h, sx, py, sw, lh, SEL_BG); }
+                        }
+                    }
+                }
+
+                // Text
+                let mut x = ed_x - hscroll as i32 * cw;
+                for (ci, ch) in text.chars().enumerate() {
+                    if x + cw > 0 && x < clip_r {
+                        let color = colors.get(ci).copied().unwrap_or(FG);
+                        if let Some((m, bmap)) = g.get(ch) {
+                            blit(buf, w, h, bmap, m, x, baseline, color);
+                        }
+                    }
+                    x += cw;
+                    if x >= clip_r { break; }
+                }
+
+                // Cursors
+                for &(c_line, c_col, _) in &snap.cursors_snap {
+                    if c_line == li && cursor_visible {
+                        let cx = ed_x + (c_col as i32 - hscroll as i32) * cw;
+                        if cx >= ed_x && cx < clip_r { fill(buf, w, h, cx, py, 2, lh, ACCENT); }
+                    }
+                }
+
+                // Diagnostic squiggles
+                for &(dline, cs, ce, ref sev) in &snap.diagnostics {
+                    if dline != li { continue; }
+                    let color = match sev {
+                        DiagSeverity::Error   => 0xFF5555u32,
+                        DiagSeverity::Warning => 0xE0AF68,
+                        _                     => FG_DIM,
+                    };
+                    let x1 = (ed_x + (cs as i32 - hscroll as i32) * cw).max(ed_x);
+                    let x2 = ed_x + (ce as i32 - hscroll as i32) * cw;
+                    let sq_w = (x2 - x1).max(cw).min(clip_r - x1);
+                    if sq_w > 0 { draw_squiggle(buf, w, h, x1, baseline + 2, sq_w, color); }
                 }
             }
 
-            // Selection highlights for all cursors
-            for &(_, _, sel) in &cursors_snap {
-                if let Some((sel_lo, sel_hi)) = sel {
-                    let line_char_count = text.chars().count();
-                    let line_end        = line_start + line_char_count;
-                    if sel_lo < line_end + 1 && sel_hi > *line_start {
-                        let col_lo = sel_lo.saturating_sub(*line_start);
-                        let col_hi = if sel_hi > line_end { line_char_count + 1 }
-                                     else { sel_hi - line_start };
-                        let sx_raw = ed_x + (col_lo as i32 - hscroll as i32) * cw;
-                        let sx_end = ed_x + (col_hi as i32 - hscroll as i32) * cw;
-                        let sx     = sx_raw.max(ed_x);
-                        let sw     = (sx_end - sx).max(0);
-                        if sw > 0 { fill(buf, w, h, sx, py, sw, lh, SEL_BG); }
+            // Scrollbars
+            let total  = snap.total;
+            let vis    = (snap.editor_h / lh).max(1) as usize;
+            let editor_w = r.w;
+
+            if total > vis {
+                let track_h = snap.editor_h;
+                let thumb_h = ((track_h * vis as i32) / total as i32).max(SB_W);
+                let thumb_y = r.y + tab_h + ((scroll as i32 * (track_h - thumb_h)) / (total - vis) as i32);
+                fill(buf, w, h, r.x + r.w - SB_W, r.y + tab_h, SB_W, track_h, BG2);
+                fill(buf, w, h, r.x + r.w - SB_W, thumb_y, SB_W, thumb_h, SB_THUMB);
+            }
+
+            let text_area_w = editor_w - gutter_w;
+            let vis_cols = (text_area_w / cw).max(1) as usize;
+            if snap.max_line_len > vis_cols {
+                let track_w = text_area_w - if total > vis { SB_W } else { 0 };
+                let thumb_w = ((track_w * vis_cols as i32) / snap.max_line_len as i32).max(SB_W);
+                let thumb_x = ed_x + ((hscroll as i32 * (track_w - thumb_w)) / (snap.max_line_len - vis_cols) as i32);
+                let sb_y    = r.y + r.h - fh - SB_W;
+                fill(buf, w, h, r.x, sb_y, track_w, SB_W, BG2);
+                fill(buf, w, h, thumb_x, sb_y, thumb_w, SB_W, SB_THUMB);
+            }
+
+            // Find bar
+            if snap.find_open {
+                let row_h  = lh + 4;
+                let find_y = r.y + r.h - fh;
+                fill(buf, w, h, r.x, find_y, r.w, fh, BG2);
+                fill(buf, w, h, r.x, find_y, r.w, 1, BORDER);
+
+                let row1_base = find_y + row_h * 3 / 4;
+                let label     = "Find: ";
+                let lw        = label.len() as i32 * cw;
+                draw_str(buf, w, h, g, label, r.x + 4, row1_base, FG_DIM, clip_r);
+
+                let aa_str   = if snap.case_sensitive { "[Aa]" } else { "[aa]" };
+                let ww_str   = if snap.whole_word     { "[W]"  } else { "[w]"  };
+                let toggle_w = (aa_str.len() + 1 + ww_str.len()) as i32 * cw + 8;
+                let aa_x     = clip_r - toggle_w;
+                let ww_x     = aa_x + (aa_str.len() + 1) as i32 * cw;
+                draw_str(buf, w, h, g, aa_str, aa_x, row1_base,
+                         if snap.case_sensitive { ACCENT } else { FG_DIM }, clip_r);
+                draw_str(buf, w, h, g, ww_str, ww_x, row1_base,
+                         if snap.whole_word     { ACCENT } else { FG_DIM }, clip_r);
+
+                let mc_str = format!("{} matches", snap.match_ranges.len());
+                let mc_w   = mc_str.len() as i32 * cw;
+                let mc_x   = aa_x - mc_w - cw;
+                draw_str(buf, w, h, g, &mc_str, mc_x, row1_base, FG_DIM, mc_x + mc_w + cw);
+
+                let qx    = r.x + 4 + lw;
+                let qclip = mc_x - cw;
+                draw_str(buf, w, h, g, &snap.find_query, qx, row1_base, FG, qclip);
+                if snap.find_focus == FindFocus::Query {
+                    let cx = qx + snap.find_query.chars().count() as i32 * cw;
+                    if cx < qclip { fill(buf, w, h, cx, find_y + 2, 2, lh, ACCENT); }
+                }
+
+                if snap.find_repl_open {
+                    let row2_y    = find_y + row_h;
+                    let row2_base = row2_y + row_h * 3 / 4;
+                    fill(buf, w, h, r.x, row2_y, r.w, 1, BORDER);
+
+                    let rlabel = "Replace: ";
+                    let rlw    = rlabel.len() as i32 * cw;
+                    draw_str(buf, w, h, g, rlabel, r.x + 4, row2_base, FG_DIM, clip_r);
+
+                    let repl_str = "[Repl]";
+                    let all_str  = "[All]";
+                    let btn_w    = (repl_str.len() + 1 + all_str.len()) as i32 * cw + 8;
+                    let btn_x    = clip_r - btn_w;
+                    let all_x    = btn_x + (repl_str.len() + 1) as i32 * cw;
+                    draw_str(buf, w, h, g, repl_str, btn_x, row2_base, FG_DIM, clip_r);
+                    draw_str(buf, w, h, g, all_str,  all_x, row2_base, FG_DIM, clip_r);
+
+                    let rx    = r.x + 4 + rlw;
+                    let rclip = btn_x - cw;
+                    draw_str(buf, w, h, g, &snap.find_repl, rx, row2_base, FG, rclip);
+                    if snap.find_focus == FindFocus::Replace {
+                        let cx = rx + snap.find_repl.chars().count() as i32 * cw;
+                        if cx < rclip { fill(buf, w, h, cx, row2_y + 2, 2, lh, ACCENT); }
                     }
                 }
             }
+        }
 
-            // Text
-            let mut x = ed_x - hscroll as i32 * cw;
-            for (ci, ch) in text.chars().enumerate() {
-                if x + cw > 0 && x < w as i32 {
-                    let color = colors.get(ci).copied().unwrap_or(FG);
-                    if let Some((m, bmap)) = g.get(ch) {
-                        blit(buf, w, h, bmap, m, x, baseline, color);
+        // ── Terminal panes ────────────────────────────────────────────────
+        for snap in &term_snaps {
+            let r = snap.rect;
+            // Tab bar
+            fill(buf, w, h, r.x, r.y, r.w, tab_h, BG2);
+            fill(buf, w, h, r.x, r.y + tab_h - 1, r.w, 1, BORDER);
+            if snap.is_active { fill(buf, w, h, r.x, r.y, 2, tab_h - 1, ACCENT); }
+            draw_str(buf, w, h, g, &format!(" {}", snap.title), r.x + 4, r.y + tab_h * 3 / 4, FG, r.x + r.w);
+            // Grid rows
+            for (vi, row) in snap.visible_rows.iter().enumerate() {
+                let py       = r.y + tab_h + vi as i32 * lh;
+                let baseline = py + asc;
+                for (ci, cell) in row.iter().enumerate() {
+                    let cx = r.x + ci as i32 * cw;
+                    if cx >= r.x + r.w { break; }
+                    if cell.bg != BG { fill(buf, w, h, cx, py, cw, lh, cell.bg); }
+                    if cell.ch != ' ' {
+                        if let Some((m, bmap)) = g.get(cell.ch) {
+                            blit(buf, w, h, bmap, m, cx, baseline, cell.fg);
+                        }
                     }
                 }
-                x += cw;
-                if x >= w as i32 { break; }
             }
+            // Cursor (block, 2px wide)
+            if snap.is_active && snap.cursor_visible {
+                let cx = r.x + snap.cursor_col as i32 * cw;
+                let cy = r.y + tab_h + snap.cursor_row as i32 * lh;
+                fill(buf, w, h, cx, cy, 2, lh, ACCENT);
+            }
+        }
 
-            // All cursors on this line
-            for &(c_line, c_col, _) in &cursors_snap {
-                if c_line == li && cursor_visible {
-                    let cx = ed_x + (c_col as i32 - hscroll as i32) * cw;
-                    if cx >= ed_x { fill(buf, w, h, cx, py, 2, lh, ACCENT); }
+        // ── LSP output panes ──────────────────────────────────────────────
+        for snap in &out_snaps {
+            let r = snap.rect;
+            // Tab bar
+            fill(buf, w, h, r.x, r.y, r.w, tab_h, BG2);
+            fill(buf, w, h, r.x, r.y + tab_h - 1, r.w, 1, BORDER);
+            if snap.is_active { fill(buf, w, h, r.x, r.y, 2, tab_h - 1, ACCENT); }
+            draw_str(buf, w, h, g, &format!(" {}", snap.title), r.x + 4, r.y + tab_h * 3 / 4, FG_DIM, r.x + r.w);
+            // Lines
+            for (vi, line) in snap.visible_lines.iter().enumerate() {
+                let py       = r.y + tab_h + vi as i32 * lh;
+                let baseline = py + asc;
+                draw_str(buf, w, h, g, line, r.x + 4, baseline, FG_DIM, r.x + r.w);
+            }
+            // Scrollbar
+            if snap.total_lines > 0 {
+                let content_h = (r.h - tab_h).max(0);
+                let vis = (content_h / lh).max(1) as usize;
+                if snap.total_lines > vis {
+                    let thumb_h = ((content_h * vis as i32) / snap.total_lines as i32).max(SB_W);
+                    let scroll_max = snap.total_lines - vis;
+                    let thumb_y = r.y + tab_h + if scroll_max > 0 {
+                        (snap.scroll as i32 * (content_h - thumb_h)) / scroll_max as i32
+                    } else { 0 };
+                    fill(buf, w, h, r.x + r.w - SB_W, r.y + tab_h, SB_W, content_h, BG2);
+                    fill(buf, w, h, r.x + r.w - SB_W, thumb_y, SB_W, thumb_h, SB_THUMB);
                 }
             }
         }
 
-        // ── Scrollbars ────────────────────────────────────────────────────
-        let editor_w = w as i32 - explorer_w;
-
-        if total > vis {
-            let track_h = editor_h;
-            let thumb_h = ((track_h * vis as i32) / total as i32).max(SB_W);
-            let thumb_y = tab_h + ((scroll as i32 * (track_h - thumb_h)) / (total - vis) as i32);
-            fill(buf, w, h, w as i32 - SB_W, tab_h, SB_W, track_h, BG2);
-            fill(buf, w, h, w as i32 - SB_W, thumb_y, SB_W, thumb_h, SB_THUMB);
+        // ── Pane border dividers ──────────────────────────────────────────
+        for snap in &pane_snaps {
+            // 1px right border (between H-split panes)
+            fill(buf, w, h, snap.rect.x + snap.rect.w, snap.rect.y, 1, snap.rect.h, BORDER);
+            // 1px bottom border (between V-split panes)
+            fill(buf, w, h, snap.rect.x, snap.rect.y + snap.rect.h, snap.rect.w, 1, BORDER);
+        }
+        // Also draw borders for terminal and output panes
+        for snap in &term_snaps {
+            fill(buf, w, h, snap.rect.x + snap.rect.w, snap.rect.y, 1, snap.rect.h, BORDER);
+            fill(buf, w, h, snap.rect.x, snap.rect.y + snap.rect.h, snap.rect.w, 1, BORDER);
+        }
+        for snap in &out_snaps {
+            fill(buf, w, h, snap.rect.x + snap.rect.w, snap.rect.y, 1, snap.rect.h, BORDER);
+            fill(buf, w, h, snap.rect.x, snap.rect.y + snap.rect.h, snap.rect.w, 1, BORDER);
         }
 
-        let vis_cols = (editor_w / cw).max(1) as usize;
-        if max_line_len > vis_cols {
-            let track_w = editor_w - if total > vis { SB_W } else { 0 };
-            let thumb_w = ((track_w * vis_cols as i32) / max_line_len as i32).max(SB_W);
-            let thumb_x = explorer_w + ((hscroll as i32 * (track_w - thumb_w)) / (max_line_len - vis_cols) as i32);
-            let sb_y    = h as i32 - status_h - find_h - SB_W;
-            fill(buf, w, h, explorer_w, sb_y, track_w, SB_W, BG2);
-            fill(buf, w, h, thumb_x, sb_y, thumb_w, SB_W, SB_THUMB);
-        }
-
-        // ── Find bar panel ────────────────────────────────────────────────
-        if find_open {
-            let row_h   = lh + 4;
-            let find_y  = h as i32 - status_h - find_h;
-            fill(buf, w, h, 0, find_y, w as i32, find_h, BG2);
-            fill(buf, w, h, 0, find_y, w as i32, 1, BORDER);
-
-            // Row 1: Find
-            let row1_base = find_y + row_h * 3 / 4;
-            let label     = "Find: ";
-            let lw        = label.len() as i32 * cw;
-            draw_str(buf, w, h, g, label, 4, row1_base, FG_DIM, w as i32);
-
-            // Toggles [Aa] [W] on the right
-            let aa_str    = if case_sensitive { "[Aa]" } else { "[aa]" };
-            let ww_str    = if whole_word     { "[W]"  } else { "[w]"  };
-            let toggle_w  = (aa_str.len() + 1 + ww_str.len()) as i32 * cw + 8;
-            let aa_x      = w as i32 - toggle_w;
-            let ww_x      = aa_x + (aa_str.len() + 1) as i32 * cw;
-            draw_str(buf, w, h, g, aa_str, aa_x, row1_base,
-                     if case_sensitive { ACCENT } else { FG_DIM }, w as i32);
-            draw_str(buf, w, h, g, ww_str, ww_x, row1_base,
-                     if whole_word     { ACCENT } else { FG_DIM }, w as i32);
-
-            // Match count
-            let mc_str = format!("{} matches", find_matches_snap.len());
-            let mc_w   = mc_str.len() as i32 * cw;
-            let mc_x   = aa_x - mc_w - cw;
-            draw_str(buf, w, h, g, &mc_str, mc_x, row1_base, FG_DIM, mc_x + mc_w + cw);
-
-            // Query text + cursor
-            let qx    = 4 + lw;
-            let qclip = mc_x - cw;
-            draw_str(buf, w, h, g, &find_query, qx, row1_base, FG, qclip);
-            if find_focus == FindFocus::Query {
-                let cx = qx + find_query.chars().count() as i32 * cw;
-                if cx < qclip { fill(buf, w, h, cx, find_y + 2, 2, lh, ACCENT); }
-            }
-
-            // Row 2: Replace
-            if find_repl_open {
-                let row2_y    = find_y + row_h;
-                let row2_base = row2_y + row_h * 3 / 4;
-                fill(buf, w, h, 0, row2_y, w as i32, 1, BORDER);
-
-                let rlabel = "Replace: ";
-                let rlw    = rlabel.len() as i32 * cw;
-                draw_str(buf, w, h, g, rlabel, 4, row2_base, FG_DIM, w as i32);
-
-                // Buttons [Repl] [All]
-                let repl_str = "[Repl]";
-                let all_str  = "[All]";
-                let btn_w    = (repl_str.len() + 1 + all_str.len()) as i32 * cw + 8;
-                let btn_x    = w as i32 - btn_w;
-                let all_x    = btn_x + (repl_str.len() + 1) as i32 * cw;
-                draw_str(buf, w, h, g, repl_str, btn_x, row2_base, FG_DIM, w as i32);
-                draw_str(buf, w, h, g, all_str,  all_x, row2_base, FG_DIM, w as i32);
-
-                let rx    = 4 + rlw;
-                let rclip = btn_x - cw;
-                draw_str(buf, w, h, g, &find_repl, rx, row2_base, FG, rclip);
-                if find_focus == FindFocus::Replace {
-                    let cx = rx + find_repl.chars().count() as i32 * cw;
-                    if cx < rclip { fill(buf, w, h, cx, row2_y + 2, 2, lh, ACCENT); }
-                }
+        // ── Drag drop zone overlay ────────────────────────────────────────
+        if let Some((_, Some(over_id), Some(zone))) = drag_snap {
+            if let Some(snap) = pane_snaps.iter().find(|p| p.id == over_id) {
+                let r  = snap.rect;
+                let th = tab_h;
+                let zone_rect = match zone {
+                    DropZone::Center => Rect { x: r.x + r.w/4,       y: r.y + th + (r.h-th)/4,       w: r.w/2,     h: (r.h-th)/2 },
+                    DropZone::Left   => Rect { x: r.x,               y: r.y + th,                     w: r.w/4,     h: r.h - th },
+                    DropZone::Right  => Rect { x: r.x + r.w*3/4,     y: r.y + th,                     w: r.w/4,     h: r.h - th },
+                    DropZone::Top    => Rect { x: r.x,               y: r.y + th,                     w: r.w,       h: (r.h-th)/4 },
+                    DropZone::Bottom => Rect { x: r.x,               y: r.y + th + (r.h-th)*3/4,      w: r.w,       h: (r.h-th)/4 },
+                };
+                fill(buf, w, h, zone_rect.x, zone_rect.y, zone_rect.w, zone_rect.h, DRAG_ZONE);
+                fill(buf, w, h, zone_rect.x,               zone_rect.y,                zone_rect.w, 1,            ACCENT);
+                fill(buf, w, h, zone_rect.x,               zone_rect.y + zone_rect.h-1, zone_rect.w, 1,           ACCENT);
+                fill(buf, w, h, zone_rect.x,               zone_rect.y,                1, zone_rect.h,            ACCENT);
+                fill(buf, w, h, zone_rect.x + zone_rect.w-1, zone_rect.y,              1, zone_rect.h,            ACCENT);
             }
         }
 
@@ -1993,14 +2953,14 @@ fn render(s: &mut State) {
         fill(buf, w, h, 0, sy, w as i32, status_h, BG2);
         fill(buf, w, h, 0, sy, w as i32, 1, BORDER);
 
-        let sbase      = sy + status_h * 3 / 4;
-        let dirty_mark = if dirty { " *" } else { "" };
-        let name_str   = format!("  {path_name}{dirty_mark}");
-        draw_str(buf, w, h, g, &name_str, 0, sbase, FG, w as i32);
-
-        let lc_str = format!("Ln {}, Col {}  ", cur_line + 1, cur_col + 1);
-        let lc_w   = lc_str.chars().count() as i32 * cw;
-        draw_str(buf, w, h, g, &lc_str, w as i32 - lc_w, sbase, FG_DIM, w as i32);
+        let sbase = sy + status_h * 3 / 4;
+        if let Some(snap) = pane_snaps.iter().find(|p| p.is_active) {
+            let dirty_mark = if snap.dirty { " *" } else { "" };
+            draw_str(buf, w, h, g, &format!("  {}{dirty_mark}", snap.path_name), 0, sbase, FG, w as i32);
+            let lc_str = format!("Ln {}, Col {}  ", snap.cur_line + 1, snap.cur_col + 1);
+            let lc_w   = lc_str.chars().count() as i32 * cw;
+            draw_str(buf, w, h, g, &lc_str, w as i32 - lc_w, sbase, FG_DIM, w as i32);
+        }
     });
 }
 
@@ -2012,7 +2972,8 @@ fn main() {
         Some(p)               => (Some(p), None),
         None                  => (None, None),
     };
-    let el = EventLoop::new().unwrap();
-    let mut app = App::new(file_arg, dir_arg);
+    let el = EventLoop::<UserEvent>::with_user_event().build().unwrap();
+    let proxy = el.create_proxy();
+    let mut app = App::new(file_arg, dir_arg, proxy);
     el.run_app(&mut app).unwrap();
 }

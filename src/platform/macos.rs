@@ -19,7 +19,23 @@
 // When a resize creates a new surface (new pointer), we set `contents`
 // directly — that forces CA to import the new surface.
 //
+// After live resize ends, CA's render server stops responding to
+// `setContentsChanged` until a fresh `setContents` re-establishes the
+// compositing connection.  We handle this with a `needs_reimport` flag:
+// after any resize-triggered `setContents`, we force one additional surface
+// recreation + `setContents` on the very next non-resize render.  That
+// single recovery render wakes CA back up; subsequent renders revert to the
+// cheaper `setContentsChanged` path.  The recovery render does NOT re-set
+// the flag, preventing an infinite cycle.
+//
 // Pixel format: 0x00RRGGBB (little-endian u32), matching the 'BGRA' OSType.
+
+macro_rules! dlog {
+    ($($arg:tt)*) => {
+        #[cfg(feature = "logging")]
+        dlog!($($arg)*);
+    }
+}
 
 use std::ffi::c_void;
 use std::ptr;
@@ -75,10 +91,13 @@ const CF_STRING_ENC_UTF8: u32 = 0x0800_0100;
 // ── Renderer ──────────────────────────────────────────────────────────────────
 
 pub struct Renderer {
-    layer:   Retained<CALayer>,
-    surface: IOSurfaceRef,
-    width:   u32,
-    height:  u32,
+    layer:        Retained<CALayer>,
+    surface:      IOSurfaceRef,
+    width:        u32,
+    height:       u32,
+    view:         *mut AnyObject,   // NSView — owned by NSWindow, valid as long as the window lives
+    frame_count:  u64,
+    needs_reimport: bool,
 }
 
 unsafe impl Send for Renderer {}
@@ -107,27 +126,33 @@ impl Renderer {
         // Layer-hosting setup: assign our layer to the NSView BEFORE calling
         // setWantsLayer:YES.  AppKit only manages the frame (keeping it in sync
         // with the view bounds) and never touches the contents.
-        match window.window_handle().unwrap().as_raw() {
+        let view_ptr = match window.window_handle().unwrap().as_raw() {
             RawWindowHandle::AppKit(h) => unsafe {
                 let view: &NSObject = h.ns_view.cast().as_ref();
                 let _: () = msg_send![view, setLayer: &*layer];
                 let _: () = msg_send![view, setWantsLayer: Bool::YES];
+                h.ns_view.as_ptr() as *mut AnyObject
             },
             _ => panic!("unsupported window handle type on macOS"),
-        }
+        };
 
-        Renderer { layer, surface: ptr::null_mut(), width: 0, height: 0 }
+        Renderer { layer, surface: ptr::null_mut(), width: 0, height: 0, view: view_ptr, frame_count: 0, needs_reimport: false }
     }
 
     /// Call whenever `WindowEvent::Resized` fires (physical pixel dimensions).
     pub fn resize(&mut self, width: u32, height: u32) {
-        if width == self.width && height == self.height { return; }
+        if width == self.width && height == self.height {
+            dlog!("[resize] resize() called but dimensions unchanged ({}x{}), skipping", width, height);
+            return;
+        }
+        dlog!("[resize] Renderer::resize {}x{} -> {}x{}", self.width, self.height, width, height);
         self.width  = width;
         self.height = height;
         // Drop old surface; a fresh one sized to the new dimensions is
         // created on the next render_frame call.  AppKit keeps the layer
         // frame in sync with the view bounds automatically — no setFrame needed.
         if !self.surface.is_null() {
+            dlog!("[resize] Releasing old IOSurface");
             unsafe { CFRelease(self.surface.cast()) };
             self.surface = ptr::null_mut();
         }
@@ -142,8 +167,34 @@ impl Renderer {
         let h = self.height;
         if w == 0 || h == 0 { return; }
 
+        // Guard: if AppKit replaced the view's layer after live resize (possible in
+        // layer-hosting mode), our stored layer is orphaned.  Re-attach it so CA
+        // composites our content again.
+        unsafe {
+            let view_layer: *mut AnyObject = msg_send![self.view, layer];
+            let our_layer:  *const c_void  = (&*self.layer as *const CALayer).cast();
+            if view_layer as *const c_void != our_layer {
+                dlog!("[render] layer detached (view.layer={:p} self.layer={:p}) — reattaching",
+                          view_layer, our_layer);
+                let _: () = msg_send![self.view, setLayer:     &*self.layer];
+                let _: () = msg_send![self.view, setWantsLayer: Bool::YES];
+            }
+        }
+
+        // Recovery: after a resize-triggered setContents, CA stops responding to
+        // setContentsChanged until a fresh setContents re-establishes the connection.
+        // Force surface recreation on the very next non-resize render.
+        let is_recovery_render = self.needs_reimport && !self.surface.is_null();
+        if is_recovery_render {
+            dlog!("[render] needs_reimport: dropping surface to force setContents on frame {}", self.frame_count);
+            unsafe { CFRelease(self.surface.cast()) };
+            self.surface = ptr::null_mut();
+        }
+        self.needs_reimport = false;
+
         let new_surface = self.surface.is_null();
         if new_surface {
+            dlog!("[resize] Allocating new IOSurface {}x{}", w, h);
             self.surface = create_surface(w, h);
         }
 
@@ -157,21 +208,32 @@ impl Renderer {
             IOSurfaceUnlock(self.surface, 0, ptr::null_mut());
         }
 
+        self.frame_count += 1;
         CATransaction::begin();
         CATransaction::setDisableActions(true);
         if new_surface {
             // New pointer — CA must import the surface fresh.
+            dlog!("[render] frame {} setContents (new surface {:p}) recovery={}", self.frame_count, self.surface, is_recovery_render);
+            if !is_recovery_render {
+                self.needs_reimport = true;  // schedule one recovery render after this
+            }
             let any: &AnyObject = unsafe { &*(self.surface as *const AnyObject) };
             unsafe { self.layer.setContents(Some(any)) };
         } else {
-            // Same pointer — pixels were updated in-place.  `setContentsChanged`
-            // is a private-but-stable CALayer message (used by WebKit for canvas
-            // and video) that tells CA the surface contents have changed and a
-            // composite pass is needed.  IOSurface remains zero-copy; no pixel
-            // data is copied.
+            // Same pointer — pixels were updated in-place.
+            dlog!("[render] frame {} setContentsChanged", self.frame_count);
             unsafe { let _: () = msg_send![&*self.layer, setContentsChanged]; }
         }
         CATransaction::commit();
+
+        // Force CA to submit the implicit transaction to the render server immediately,
+        // rather than waiting for the run-loop iteration to end.  After live resize,
+        // the run-loop end flush may not fire in time (or at all) for our timer-driven
+        // renders, leaving committed transactions invisible until the next resize event.
+        unsafe {
+            use objc2::ClassType;
+            let _: () = msg_send![CATransaction::class(), flush];
+        }
     }
 }
 
