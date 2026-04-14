@@ -1131,7 +1131,19 @@ impl State {
 
 // ── Helper: open file in a tab ────────────────────────────────────────────────
 fn open_or_reuse_tab(s: &mut State, path: PathBuf) {
-    let ap = s.active_pane;
+    // Find the nearest editor pane to open the file in (active if it's an editor,
+    // otherwise find the first editor pane in the layout).
+    let ap = if s.panes.get(&s.active_pane).map_or(false, |p| p.kind == PaneKind::Editor) {
+        s.active_pane
+    } else {
+        let area = s.pane_area();
+        let Some(id) = layout_tree(&s.pane_tree, area).into_iter()
+            .find(|(id, _)| s.panes.get(id).map_or(false, |p| p.kind == PaneKind::Editor))
+            .map(|(id, _)| id)
+        else { return; };
+        s.active_pane = id;
+        id
+    };
     let pane = s.panes.get_mut(&ap).unwrap();
     for i in 0..pane.tabs.len() {
         if pane.tabs[i].path.as_deref() == Some(path.as_path()) {
@@ -1847,6 +1859,12 @@ impl ApplicationHandler<UserEvent> for App {
                 // Switch active pane on click
                 s.active_pane = clicked_pane_id;
 
+                // Non-editor panes (Terminal, LspOutput) have no tabs/find bar/cursors
+                if s.panes[&clicked_pane_id].kind != PaneKind::Editor {
+                    render(s);
+                    return;
+                }
+
                 // Find bar click
                 let fh = { let ap = clicked_pane_id; State::pane_find_h(&s.panes[&ap], s.glyphs.lh) };
                 let in_find = fh > 0 && {
@@ -2134,19 +2152,25 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                             true
                         } else if cmd && shift && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "]") {
-                            let pane = s.pane_mut();
-                            pane.active = (pane.active + 1) % pane.tabs.len();
+                            if s.pane().kind == PaneKind::Editor && !s.pane().tabs.is_empty() {
+                                let pane = s.pane_mut();
+                                pane.active = (pane.active + 1) % pane.tabs.len();
+                            }
                             true
                         } else if cmd && shift && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "[") {
-                            let n = s.pane().tabs.len();
-                            let pane = s.pane_mut();
-                            pane.active = pane.active.checked_sub(1).unwrap_or(n - 1);
+                            if s.pane().kind == PaneKind::Editor && !s.pane().tabs.is_empty() {
+                                let n = s.pane().tabs.len();
+                                let pane = s.pane_mut();
+                                pane.active = pane.active.checked_sub(1).unwrap_or(n - 1);
+                            }
                             true
                         } else if cmd && matches!(&event.logical_key, Key::Character(c) if matches!(c.as_str(), "1"|"2"|"3"|"4"|"5"|"6"|"7"|"8"|"9")) {
-                            if let Key::Character(c) = &event.logical_key {
-                                if let Ok(n) = c.as_str().parse::<usize>() {
-                                    let pane = s.pane_mut();
-                                    if n >= 1 && n - 1 < pane.tabs.len() { pane.active = n - 1; }
+                            if s.pane().kind == PaneKind::Editor {
+                                if let Key::Character(c) = &event.logical_key {
+                                    if let Ok(n) = c.as_str().parse::<usize>() {
+                                        let pane = s.pane_mut();
+                                        if n >= 1 && n - 1 < pane.tabs.len() { pane.active = n - 1; }
+                                    }
                                 }
                             }
                             true
