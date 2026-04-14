@@ -1,9 +1,11 @@
 mod platform;
+mod settings;
 mod terminal;
 mod lsp;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use fontdue::{Font, FontSettings, Metrics};
@@ -639,6 +641,10 @@ struct State {
     last_click_time: Instant,
     last_click_char: usize,
     click_count:     u32,
+
+    settings:      settings::Settings,
+    settings_open: bool,
+    needs_redraw:  bool,
 }
 
 impl State {
@@ -1583,15 +1589,34 @@ fn replace_all(s: &mut State) {
 
 // ── App ───────────────────────────────────────────────────────────────────────
 struct App {
-    state:    Option<State>,
-    file_arg: Option<PathBuf>,
-    dir_arg:  Option<PathBuf>,
-    proxy:    EventLoopProxy<UserEvent>,
+    state:        Option<State>,
+    file_arg:     Option<PathBuf>,
+    dir_arg:      Option<PathBuf>,
+    proxy:        EventLoopProxy<UserEvent>,
+    dirty:        Arc<AtomicBool>,
+    display_link: Option<platform::DisplayLink>,
 }
 
 impl App {
     fn new(file_arg: Option<PathBuf>, dir_arg: Option<PathBuf>, proxy: EventLoopProxy<UserEvent>) -> Self {
-        Self { state: None, file_arg, dir_arg, proxy }
+        Self { state: None, file_arg, dir_arg, proxy, dirty: Arc::new(AtomicBool::new(false)), display_link: None }
+    }
+
+    fn apply_vsync_setting(&mut self) {
+        let vsync = self.state.as_ref().map_or(false, |s| s.settings.vsync);
+        if vsync {
+            if self.display_link.is_none() {
+                let proxy  = self.proxy.clone();
+                let dirty2 = Arc::clone(&self.dirty);
+                self.display_link = platform::DisplayLink::new(move || {
+                    if dirty2.swap(false, Ordering::AcqRel) {
+                        let _ = proxy.send_event(UserEvent::Redraw);
+                    }
+                });
+            }
+        } else {
+            self.display_link = None;
+        }
     }
 }
 
@@ -1602,7 +1627,9 @@ impl ApplicationHandler<UserEvent> for App {
                 dlog!("[blink] t={}", ts());
                 s.cursor_visible = !s.cursor_visible;
                 s.cursor_blink = Instant::now() + Duration::from_millis(500);
-                s.win.request_redraw();
+                // Mark dirty; vsync display link or about_to_wait flush will trigger the render.
+                self.dirty.store(true, Ordering::Release);
+                s.needs_redraw = true;
             }
         }
     }
@@ -1612,8 +1639,13 @@ impl ApplicationHandler<UserEvent> for App {
         #[cfg(target_os = "macos")]
         { attrs = attrs.with_title_hidden(true).with_titlebar_transparent(true); }
 
+        let loaded_settings = settings::Settings::load();
+
         let win = Arc::new(el.create_window(attrs).unwrap());
-        let renderer = platform::Renderer::new(win.clone());
+        let renderer = match loaded_settings.renderer {
+            settings::RendererBackend::Gpu => platform::Renderer::new_gpu(&win),
+            settings::RendererBackend::Cpu => platform::Renderer::new_cpu(&win),
+        };
 
         let font_size = FONT_PX;
         let glyphs = Glyphs::new(include_bytes!("../assets/JetBrainsMono-Regular.ttf"), font_size);
@@ -1658,10 +1690,15 @@ impl ApplicationHandler<UserEvent> for App {
             last_click_time: Instant::now() - Duration::from_secs(1),
             last_click_char: usize::MAX,
             click_count:     0,
+
+            settings:      loaded_settings,
+            settings_open: false,
+            needs_redraw:  false,
         };
 
         s.win.request_redraw();
         self.state = Some(s);
+        self.apply_vsync_setting();
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: winit::window::WindowId, event: WindowEvent) {
@@ -1680,7 +1717,7 @@ impl ApplicationHandler<UserEvent> for App {
                 s.h = sz.height;
                 s.renderer.resize(sz.width, sz.height);
                 resize_terminal_panes(s);
-                render(s);
+                { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
             }
 
             WindowEvent::ModifiersChanged(m) => {
@@ -1704,7 +1741,7 @@ impl ApplicationHandler<UserEvent> for App {
                     update_ratio(&mut s.pane_tree, &path, new_ratio);
                     resize_terminal_panes(s);
                     s.win.set_cursor(if axis == Axis::H { CursorIcon::EwResize } else { CursorIcon::NsResize });
-                    render(s);
+                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                     return;
                 }
 
@@ -1723,7 +1760,7 @@ impl ApplicationHandler<UserEvent> for App {
                         drag.over_pane = over;
                         drag.zone = zone;
                     }
-                    render(s);
+                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                     return;
                 }
 
@@ -1740,7 +1777,7 @@ impl ApplicationHandler<UserEvent> for App {
                             over_pane: over, zone: None,
                         });
                         s.drag_pending = None;
-                        render(s);
+                        { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                         return;
                     }
                 }
@@ -1762,7 +1799,7 @@ impl ApplicationHandler<UserEvent> for App {
                     let pos = s.xy_to_char(mx, my);
                     s.tab_mut().primary_mut().head = pos;
                     s.ensure_visible();
-                    render(s);
+                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                 }
             }
 
@@ -1771,14 +1808,14 @@ impl ApplicationHandler<UserEvent> for App {
                 button: MouseButton::Left, ..
             } => {
                 if s.resize_drag.take().is_some() {
-                    render(s);
+                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                     return;
                 }
                 s.mouse_down = false;
                 s.drag_pending = None;
                 if let Some(drag) = s.drag.take() {
                     perform_drop(s, drag);
-                    render(s);
+                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                 }
             }
 
@@ -1789,6 +1826,55 @@ impl ApplicationHandler<UserEvent> for App {
                 let mx  = s.mouse_x as i32;
                 let my  = s.mouse_y as i32;
                 let alt = s.mods.alt_key();
+
+                // Settings panel intercepts all clicks when open
+                if s.settings_open {
+                    let cw = s.glyphs.cw;
+                    let lh = s.glyphs.lh;
+                    let pw = 36 * cw;
+                    let ph = 6 * lh + 8;
+                    let px = (s.w as i32 - pw) / 2;
+                    let py = (s.h as i32 - ph) / 2;
+                    if mx >= px && mx < px + pw && my >= py && my < py + ph {
+                        let btn_x = px + 14 * cw;
+                        let ry    = py + lh + 8;
+                        let vy    = ry + lh + 4;
+                        if my >= ry && my < ry + lh {
+                            // Renderer row
+                            if mx >= btn_x && mx < btn_x + 5 * cw {
+                                // CPU button
+                                if s.renderer.is_gpu() {
+                                    s.settings.renderer = settings::RendererBackend::Cpu;
+                                    s.renderer = platform::Renderer::new_cpu(&s.win);
+                                    s.renderer.resize(s.w, s.h);
+                                    s.settings.save();
+                                }
+                            } else if mx >= btn_x + 6 * cw && mx < btn_x + 11 * cw {
+                                // GPU button
+                                if !s.renderer.is_gpu() {
+                                    s.settings.renderer = settings::RendererBackend::Gpu;
+                                    s.renderer = platform::Renderer::new_gpu(&s.win);
+                                    s.renderer.resize(s.w, s.h);
+                                    s.settings.save();
+                                }
+                            }
+                        } else if my >= vy && my < vy + lh && mx >= btn_x && mx < btn_x + 7 * cw {
+                            // VSync toggle — drop s before calling &mut self method
+                            s.settings.vsync = !s.settings.vsync;
+                            s.settings.save();
+                            let _ = s;
+                            self.apply_vsync_setting();
+                            let s = self.state.as_mut().unwrap();
+                            s.needs_redraw = true;
+                            self.dirty.store(true, Ordering::Release);
+                            return;
+                        }
+                    } else {
+                        s.settings_open = false; // click outside = close
+                    }
+                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                    return;
+                }
 
                 // Pane border resize
                 let area = s.pane_area();
@@ -1814,7 +1900,7 @@ impl ApplicationHandler<UserEvent> for App {
                         });
                         if let Some(path) = action { open_or_reuse_tab(s, path); }
                     }
-                    render(s);
+                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                     return;
                 }
 
@@ -1846,13 +1932,13 @@ impl ApplicationHandler<UserEvent> for App {
                             s.panes.get_mut(&clicked_pane_id).unwrap().active = i;
                             s.active_pane = clicked_pane_id;
                             s.drag_pending = Some((clicked_pane_id, i, s.mouse_x, s.mouse_y));
-                            render(s);
+                            { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                             return;
                         }
                         tx += tw;
                     }
                     s.active_pane = clicked_pane_id;
-                    render(s);
+                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                     return;
                 }
 
@@ -1861,7 +1947,7 @@ impl ApplicationHandler<UserEvent> for App {
 
                 // Non-editor panes (Terminal, LspOutput) have no tabs/find bar/cursors
                 if s.panes[&clicked_pane_id].kind != PaneKind::Editor {
-                    render(s);
+                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                     return;
                 }
 
@@ -1895,7 +1981,7 @@ impl ApplicationHandler<UserEvent> for App {
                         if mx >= btn_x && mx < all_x { replace_current(s); }
                         else if mx >= all_x          { replace_all(s); }
                     }
-                    render(s);
+                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                     return;
                 }
 
@@ -1935,7 +2021,7 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
                 s.reset_blink();
-                render(s);
+                { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
@@ -1958,7 +2044,7 @@ impl ApplicationHandler<UserEvent> for App {
                             } else {
                                 tp.grid.scroll_offset = tp.grid.scroll_offset.saturating_sub(dy as usize);
                             }
-                            render(s);
+                            { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                         }
                     }
                     PaneKind::LspOutput => {
@@ -1970,13 +2056,13 @@ impl ApplicationHandler<UserEvent> for App {
                             } else {
                                 op.scroll = op.scroll.saturating_sub(dy as usize);
                             }
-                            render(s);
+                            { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                         }
                     }
                     PaneKind::Editor => {
                         if dy != 0 { s.scroll_by(dy); }
                         if dx != 0 { s.hscroll_by(dx); }
-                        if dx != 0 || dy != 0 { render(s); }
+                        if dx != 0 || dy != 0 { { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); } }
                     }
                 }
             }
@@ -1988,10 +2074,23 @@ impl ApplicationHandler<UserEvent> for App {
                 let alt   = s.mods.alt_key();
                 let shift = s.mods.shift_key();
 
+                // Cmd+, — toggle settings panel
+                if cmd && matches!(&event.logical_key, Key::Character(c) if c.as_str() == ",") {
+                    s.settings_open = !s.settings_open;
+                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                    return;
+                }
+                // Escape — close settings panel if open
+                if s.settings_open && matches!(&event.logical_key, Key::Named(NamedKey::Escape)) {
+                    s.settings_open = false;
+                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                    return;
+                }
+
                 // Ctrl+` — open a new terminal pane (works from any pane kind)
                 if ctrl && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "`") {
                     open_terminal_pane(s);
-                    render(s);
+                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                     return;
                 }
 
@@ -2035,7 +2134,7 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                         }
                     }
-                    render(s);
+                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                 } else {
                     // Main editor keyboard handling
                     let handled =
@@ -2306,7 +2405,7 @@ impl ApplicationHandler<UserEvent> for App {
                         };
 
                     notify_lsp_change(s);
-                    render(s);
+                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                     let _ = handled;
                 }
             }
@@ -2320,7 +2419,13 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
-        if let Some(s) = &self.state {
+        if let Some(s) = self.state.as_mut() {
+            // When vsync is off (no display link), flush dirty flag here so we get
+            // one render per event batch rather than one per event.
+            if !s.settings.vsync && s.needs_redraw {
+                s.needs_redraw = false;
+                s.win.request_redraw();
+            }
             el.set_control_flow(ControlFlow::WaitUntil(s.cursor_blink));
         } else {
             el.set_control_flow(ControlFlow::Wait);
@@ -2637,6 +2742,10 @@ fn render(s: &mut State) {
                 (e.name.clone(), e.is_dir, e.expanded, e.depth, i == ex.selected)
             }).collect()
         });
+
+    let settings_open  = s.settings_open;
+    let renderer_is_gpu = s.renderer.is_gpu();
+    let vsync_on       = s.settings.vsync;
 
     let glyphs = &s.glyphs as *const Glyphs;
 
@@ -2970,6 +3079,49 @@ fn render(s: &mut State) {
                 fill(buf, w, h, zone_rect.x,               zone_rect.y,                1, zone_rect.h,            ACCENT);
                 fill(buf, w, h, zone_rect.x + zone_rect.w-1, zone_rect.y,              1, zone_rect.h,            ACCENT);
             }
+        }
+
+        // ── Settings panel (modal overlay) ───────────────────────────────
+        if settings_open {
+            let pw = 36 * cw;
+            let ph = 6 * lh + 8;
+            let px = (w as i32 - pw) / 2;
+            let py = (h as i32 - ph) / 2;
+            // Background + 1px border on all four sides
+            fill(buf, w, h, px, py, pw, ph, BG2);
+            fill(buf, w, h, px,           py,          pw, 1,  BORDER);
+            fill(buf, w, h, px,           py + ph - 1, pw, 1,  BORDER);
+            fill(buf, w, h, px,           py,          1,  ph, BORDER);
+            fill(buf, w, h, px + pw - 1,  py,          1,  ph, BORDER);
+            // Title row
+            draw_str(buf, w, h, g, "  Settings", px, py + lh * 3 / 4, FG, px + pw);
+            fill(buf, w, h, px + 1, py + lh, pw - 2, 1, BORDER);
+            // Renderer row
+            let ry    = py + lh + 8;
+            let btn_x = px + 14 * cw;
+            draw_str(buf, w, h, g, "  Renderer", px, ry + lh * 3 / 4, FG, btn_x - cw);
+            let (cpu_bg, cpu_fg) = if !renderer_is_gpu { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
+            fill(buf, w, h, btn_x,          ry, 5 * cw, lh, cpu_bg);
+            draw_str(buf, w, h, g, " CPU ", btn_x,          ry + lh * 3 / 4, cpu_fg, btn_x + 5 * cw);
+            let (gpu_bg, gpu_fg) = if  renderer_is_gpu { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
+            fill(buf, w, h, btn_x + 6 * cw, ry, 5 * cw, lh, gpu_bg);
+            draw_str(buf, w, h, g, " GPU ", btn_x + 6 * cw, ry + lh * 3 / 4, gpu_fg, btn_x + 11 * cw);
+            // VSync row
+            let vy = ry + lh + 4;
+            draw_str(buf, w, h, g, "  VSync", px, vy + lh * 3 / 4, FG, btn_x - cw);
+            let (vs_bg, vs_fg) = if vsync_on { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
+            let vs_label = if vsync_on { " [x] On " } else { " [ ] Off" };
+            fill(buf, w, h, btn_x, vy, 8 * cw, lh, vs_bg);
+            draw_str(buf, w, h, g, vs_label, btn_x, vy + lh * 3 / 4, vs_fg, btn_x + 8 * cw);
+            // Info row: approximate RAM usage
+            let mem_str = if renderer_is_gpu {
+                "  GPU (+~66 MB at 4K) — no tearing at any size".to_string()
+            } else {
+                "  CPU (no extra RAM) — coalesced + vsync-aligned".to_string()
+            };
+            draw_str(buf, w, h, g, &mem_str, px, vy + lh + 4 + lh * 3 / 4, FG_DIM, px + pw);
+            // Hint
+            draw_str(buf, w, h, g, "  Cmd+,  or  Esc  to close", px, vy + 2 * lh + 8 + lh * 3 / 4, FG_DIM, px + pw);
         }
 
         // ── Status bar ────────────────────────────────────────────────────
