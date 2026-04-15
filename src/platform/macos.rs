@@ -237,9 +237,11 @@ impl CpuRenderer {
 
         unsafe {
             IOSurfaceLock(self.surface, 0, ptr::null_mut());
+            let bpr    = IOSurfaceGetBytesPerRow(self.surface);
+            let stride = (bpr / 4) as u32; // u32s per row (>= w when aligned)
             let base   = IOSurfaceGetBaseAddress(self.surface) as *mut u32;
-            let pixels = std::slice::from_raw_parts_mut(base, (w * h) as usize);
-            draw(pixels, w, h);
+            let pixels = std::slice::from_raw_parts_mut(base, (stride * h) as usize);
+            draw(pixels, stride, h);
             IOSurfaceUnlock(self.surface, 0, ptr::null_mut());
         }
 
@@ -359,9 +361,11 @@ impl GpuRenderer {
         // CPU write into the IOSurface
         unsafe {
             IOSurfaceLock(self.surface, 0, ptr::null_mut());
+            let bpr    = IOSurfaceGetBytesPerRow(self.surface);
+            let stride = (bpr / 4) as u32; // u32s per row (>= w when 16-byte aligned)
             let base   = IOSurfaceGetBaseAddress(self.surface) as *mut u32;
-            let pixels = std::slice::from_raw_parts_mut(base, (w * h) as usize);
-            draw(pixels, w, h);
+            let pixels = std::slice::from_raw_parts_mut(base, (stride * h) as usize);
+            draw(pixels, stride, h);
             IOSurfaceUnlock(self.surface, 0, ptr::null_mut());
         }
 
@@ -513,7 +517,9 @@ fn create_surface(width: u32, height: u32) -> IOSurfaceRef {
 
         let v_width  = make_num(width);
         let v_height = make_num(height);
-        let v_bpr    = make_num(width * 4);
+        // Metal requires bytesPerRow aligned to 16 bytes.
+        let bpr = (width * 4 + 15) & !15;
+        let v_bpr    = make_num(bpr);
         let v_bpe    = make_num(4);
         let v_pixfmt = make_num(PIXEL_FORMAT_BGRA);
 
