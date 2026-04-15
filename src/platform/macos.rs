@@ -34,6 +34,17 @@ type CFAllocatorRef  = *const c_void;
 type CFDictionaryRef = *const c_void;
 type IOSurfaceRef    = *mut c_void;
 
+// Opaque stand-in for the C struct `__IOSurface` so that `*mut IOSurface`
+// gets the correct objc2 Encode = `^{__IOSurface=}` rather than `^v`.
+// Metal's -newTextureWithDescriptor:iosurface:plane: checks this encoding.
+#[repr(C)]
+struct IOSurface(c_void);
+
+unsafe impl objc2::RefEncode for IOSurface {
+    const ENCODING_REF: objc2::Encoding =
+        objc2::Encoding::Pointer(&objc2::Encoding::Struct("__IOSurface", &[]));
+}
+
 // 'BGRA' pixel format — matches 0x00RRGGBB u32 stored in little-endian memory.
 const PIXEL_FORMAT_BGRA: u32 = 0x4247_5241;
 
@@ -367,15 +378,15 @@ impl GpuRenderer {
             desc.setStorageMode(MTLStorageMode::Shared);
             desc.setUsage(MTLTextureUsage::ShaderRead);
 
-            // Wrap IOSurface as a Metal texture (zero-copy, same physical memory)
-            let io_surf_ref = self.surface;
+            // Wrap IOSurface as a Metal texture (zero-copy, same physical memory).
+            // Cast to *mut IOSurface so msg_send! encodes it as ^{__IOSurface=}
+            // rather than ^v — Metal's runtime type check requires the former.
+            let io_surf_ptr = self.surface as *mut IOSurface;
             let tex = unsafe {
-                // We pass the raw IOSurface pointer; the ObjC method accepts an IOSurfaceRef.
-                // Cast via msg_send to avoid needing the objc2_io_surface typed binding.
                 let tex: *mut AnyObject = msg_send![
                     &*self.device,
                     newTextureWithDescriptor: &*desc,
-                    iosurface: io_surf_ref,
+                    iosurface: io_surf_ptr,
                     plane: 0usize
                 ];
                 if tex.is_null() { return; }
