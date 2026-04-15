@@ -82,9 +82,8 @@ enum MlState {
 }
 
 // ── Layout ────────────────────────────────────────────────────────────────────
-const FONT_PX:    f32 = 14.0;
-const EXPLORER_W: i32 = 200;
-const ED_LPAD:    i32 = 6;
+const FONT_PX:  f32 = 14.0;
+const ED_LPAD:  i32 = 6;
 const SB_W:       i32 = 6;
 const SB_THUMB:   u32 = 0x414868;
 
@@ -176,8 +175,12 @@ impl FindBar {
 }
 
 // ── Tab (per-file state) ──────────────────────────────────────────────────────
+#[derive(Clone, PartialEq)]
+enum TabKind { Editor, Settings }
+
 #[derive(Clone)]
 struct Tab {
+    kind:    TabKind,
     buf_id:  usize,   // shared with sibling tabs showing the same buffer
     text:    Rope,
     path:    Option<PathBuf>,
@@ -189,19 +192,28 @@ struct Tab {
 
 impl Tab {
     fn untitled(buf_id: usize) -> Self {
-        Tab { buf_id, text: Rope::new(), path: None, dirty: false,
+        Tab { kind: TabKind::Editor, buf_id, text: Rope::new(), path: None, dirty: false,
               cursors: vec![Cursor::new(0)], scroll: 0, hscroll: 0 }
     }
 
+    fn settings() -> Self {
+        Tab { kind: TabKind::Settings, buf_id: usize::MAX, text: Rope::new(),
+              path: None, dirty: false, cursors: vec![Cursor::new(0)],
+              scroll: 0, hscroll: 0 }
+    }
+
     fn display_name(&self) -> &str {
-        self.path.as_deref()
-            .and_then(|p| p.file_name())
-            .and_then(|n| n.to_str())
-            .unwrap_or("Untitled")
+        match self.kind {
+            TabKind::Settings => "Settings",
+            TabKind::Editor   => self.path.as_deref()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .unwrap_or("Untitled"),
+        }
     }
 
     fn is_empty_untitled(&self) -> bool {
-        self.path.is_none() && self.text.len_chars() == 0
+        self.kind == TabKind::Editor && self.path.is_none() && self.text.len_chars() == 0
     }
 
     fn primary(&self) -> &Cursor { self.cursors.last().unwrap() }
@@ -579,6 +591,17 @@ fn open_terminal_pane(s: &mut State) {
     s.active_pane = id;
 }
 
+fn open_settings_tab(s: &mut State) {
+    if s.panes.get(&s.active_pane).map_or(false, |p| p.kind != PaneKind::Editor) { return; }
+    let pane = s.pane_mut();
+    if let Some(i) = pane.tabs.iter().position(|t| t.kind == TabKind::Settings) {
+        pane.active = i;
+    } else {
+        pane.tabs.push(Tab::settings());
+        pane.active = pane.tabs.len() - 1;
+    }
+}
+
 // ── User events (background threads → main loop) ──────────────────────────────
 #[derive(Clone, PartialEq)]
 pub enum DiagSeverity { Error, Warning, Info, Hint }
@@ -634,7 +657,9 @@ struct State {
     font_size: f32,
     glyphs:     Glyphs,
 
-    explorer: Option<FileExplorer>,
+    explorer:      Option<FileExplorer>,
+    explorer_w:    i32,   // sidebar pixel width (default 200)
+    explorer_drag: bool,  // true while dragging the explorer right border
     mouse_x:    f32,
     mouse_y:    f32,
     mouse_down:      bool,
@@ -642,9 +667,8 @@ struct State {
     last_click_char: usize,
     click_count:     u32,
 
-    settings:      settings::Settings,
-    settings_open: bool,
-    needs_redraw:  bool,
+    settings:     settings::Settings,
+    needs_redraw: bool,
 }
 
 impl State {
@@ -656,7 +680,7 @@ impl State {
     fn find_mut(&mut self) -> &mut FindBar { let id = self.active_pane; &mut self.panes.get_mut(&id).unwrap().find }
 
     fn explorer_w(&self) -> i32 {
-        if self.explorer.is_some() { EXPLORER_W } else { 0 }
+        if self.explorer.is_some() { self.explorer_w } else { 0 }
     }
 
     fn tab_h(&self)    -> i32 { self.glyphs.lh + 4 }
@@ -1684,6 +1708,8 @@ impl ApplicationHandler<UserEvent> for App {
             font_size,
             glyphs,
             explorer,
+            explorer_w:    200,
+            explorer_drag: false,
             mouse_x:    0.0,
             mouse_y:    0.0,
             mouse_down:      false,
@@ -1691,9 +1717,8 @@ impl ApplicationHandler<UserEvent> for App {
             last_click_char: usize::MAX,
             click_count:     0,
 
-            settings:      loaded_settings,
-            settings_open: false,
-            needs_redraw:  false,
+            settings:     loaded_settings,
+            needs_redraw: false,
         };
 
         s.win.request_redraw();
@@ -1729,6 +1754,13 @@ impl ApplicationHandler<UserEvent> for App {
                 s.mouse_y = position.y as f32;
                 let mx = s.mouse_x as i32;
                 let my = s.mouse_y as i32;
+
+                // Explorer border drag
+                if s.explorer_drag {
+                    s.explorer_w = mx.clamp(80, 600);
+                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                    return;
+                }
 
                 // Active pane-resize drag
                 if let Some(ref rd) = s.resize_drag {
@@ -1807,6 +1839,11 @@ impl ApplicationHandler<UserEvent> for App {
                 state: ElementState::Released,
                 button: MouseButton::Left, ..
             } => {
+                if s.explorer_drag {
+                    s.explorer_drag = false;
+                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                    return;
+                }
                 if s.resize_drag.take().is_some() {
                     { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                     return;
@@ -1827,53 +1864,13 @@ impl ApplicationHandler<UserEvent> for App {
                 let my  = s.mouse_y as i32;
                 let alt = s.mods.alt_key();
 
-                // Settings panel intercepts all clicks when open
-                if s.settings_open {
-                    let cw = s.glyphs.cw;
-                    let lh = s.glyphs.lh;
-                    let pw = 36 * cw;
-                    let ph = 6 * lh + 8;
-                    let px = (s.w as i32 - pw) / 2;
-                    let py = (s.h as i32 - ph) / 2;
-                    if mx >= px && mx < px + pw && my >= py && my < py + ph {
-                        let btn_x = px + 14 * cw;
-                        let ry    = py + lh + 8;
-                        let vy    = ry + lh + 4;
-                        if my >= ry && my < ry + lh {
-                            // Renderer row
-                            if mx >= btn_x && mx < btn_x + 5 * cw {
-                                // CPU button
-                                if s.renderer.is_gpu() {
-                                    s.settings.renderer = settings::RendererBackend::Cpu;
-                                    s.renderer = platform::Renderer::new_cpu(&s.win);
-                                    s.renderer.resize(s.w, s.h);
-                                    s.settings.save();
-                                }
-                            } else if mx >= btn_x + 6 * cw && mx < btn_x + 11 * cw {
-                                // GPU button
-                                if !s.renderer.is_gpu() {
-                                    s.settings.renderer = settings::RendererBackend::Gpu;
-                                    s.renderer = platform::Renderer::new_gpu(&s.win);
-                                    s.renderer.resize(s.w, s.h);
-                                    s.settings.save();
-                                }
-                            }
-                        } else if my >= vy && my < vy + lh && mx >= btn_x && mx < btn_x + 7 * cw {
-                            // VSync toggle — drop s before calling &mut self method
-                            s.settings.vsync = !s.settings.vsync;
-                            s.settings.save();
-                            let _ = s;
-                            self.apply_vsync_setting();
-                            let s = self.state.as_mut().unwrap();
-                            s.needs_redraw = true;
-                            self.dirty.store(true, Ordering::Release);
-                            return;
-                        }
-                    } else {
-                        s.settings_open = false; // click outside = close
+                // Explorer border drag start (before pane border and explorer click)
+                if s.explorer.is_some() {
+                    let bx = s.explorer_w();
+                    if (mx - bx).abs() <= BORDER_HIT && my < s.h as i32 - s.status_h() {
+                        s.explorer_drag = true;
+                        return;
                     }
-                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
-                    return;
                 }
 
                 // Pane border resize
@@ -1947,6 +1944,42 @@ impl ApplicationHandler<UserEvent> for App {
 
                 // Non-editor panes (Terminal, LspOutput) have no tabs/find bar/cursors
                 if s.panes[&clicked_pane_id].kind != PaneKind::Editor {
+                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                    return;
+                }
+
+                // Settings tab: intercept content-area clicks for button handling
+                if s.panes[&clicked_pane_id].tabs.get(s.panes[&clicked_pane_id].active)
+                        .map_or(false, |t| t.kind == TabKind::Settings) {
+                    let tab_h     = s.tab_h();
+                    let cw        = s.glyphs.cw;
+                    let lh        = s.glyphs.lh;
+                    let content_y = pane_rect.y + tab_h;
+                    let btn_x     = pane_rect.x + 14 * cw;
+                    let ry        = content_y + lh + 8;
+                    let vy        = ry + lh + 4;
+                    if my >= ry && my < ry + lh {
+                        if mx >= btn_x && mx < btn_x + 5 * cw && s.renderer.is_gpu() {
+                            s.settings.renderer = settings::RendererBackend::Cpu;
+                            s.renderer = platform::Renderer::new_cpu(&s.win);
+                            s.renderer.resize(s.w, s.h);
+                            s.settings.save();
+                        } else if mx >= btn_x + 6 * cw && mx < btn_x + 11 * cw && !s.renderer.is_gpu() {
+                            s.settings.renderer = settings::RendererBackend::Gpu;
+                            s.renderer = platform::Renderer::new_gpu(&s.win);
+                            s.renderer.resize(s.w, s.h);
+                            s.settings.save();
+                        }
+                    } else if my >= vy && my < vy + lh && mx >= btn_x && mx < btn_x + 8 * cw {
+                        s.settings.vsync = !s.settings.vsync;
+                        s.settings.save();
+                        let _ = s;
+                        self.apply_vsync_setting();
+                        let s = self.state.as_mut().unwrap();
+                        s.needs_redraw = true;
+                        self.dirty.store(true, Ordering::Release);
+                        return;
+                    }
                     { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                     return;
                 }
@@ -2074,15 +2107,9 @@ impl ApplicationHandler<UserEvent> for App {
                 let alt   = s.mods.alt_key();
                 let shift = s.mods.shift_key();
 
-                // Cmd+, — toggle settings panel
+                // Cmd+, — open/focus Settings tab
                 if cmd && matches!(&event.logical_key, Key::Character(c) if c.as_str() == ",") {
-                    s.settings_open = !s.settings_open;
-                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
-                    return;
-                }
-                // Escape — close settings panel if open
-                if s.settings_open && matches!(&event.logical_key, Key::Named(NamedKey::Escape)) {
-                    s.settings_open = false;
+                    open_settings_tab(s);
                     { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                     return;
                 }
@@ -2136,6 +2163,30 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                 } else {
+                    // Cmd+W for settings tab: close the tab (never dirty, no LSP needed)
+                    if cmd && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "w") {
+                        let pane_id = s.active_pane;
+                        if s.panes.get(&pane_id).and_then(|p| p.tabs.get(p.active))
+                                .map_or(false, |t| t.kind == TabKind::Settings) {
+                            let pane = s.panes.get_mut(&pane_id).unwrap();
+                            pane.tabs.remove(pane.active);
+                            if pane.active >= pane.tabs.len() && !pane.tabs.is_empty() {
+                                pane.active = pane.tabs.len() - 1;
+                            }
+                            if !pane.tabs.is_empty() {
+                                s.needs_redraw = true;
+                                self.dirty.store(true, Ordering::Release);
+                                return;
+                            }
+                            // else: no tabs left → fall through to normal Cmd+W pane-close logic
+                        }
+                    }
+
+                    // Block text editing in settings tabs
+                    let active_tab_is_settings = s.panes.get(&s.active_pane)
+                        .and_then(|p| p.tabs.get(p.active))
+                        .map_or(false, |t| t.kind == TabKind::Settings);
+
                     // Main editor keyboard handling
                     let handled =
                         if cmd && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "a") {
@@ -2174,13 +2225,23 @@ impl ApplicationHandler<UserEvent> for App {
                         } else if (ctrl || cmd) && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "s") {
                             s.tab_mut().save();
                             true
-                        } else if cmd && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "=") {
+                        } else if cmd && shift && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "=") {
                             s.font_size = (s.font_size + 2.0).min(36.0);
                             s.rebuild_glyphs();
                             true
-                        } else if cmd && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "-") {
+                        } else if cmd && shift && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "-") {
                             s.font_size = (s.font_size - 2.0).max(8.0);
                             s.rebuild_glyphs();
+                            true
+                        } else if cmd && !shift && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "=") {
+                            if s.explorer.is_some() {
+                                s.explorer_w = (s.explorer_w + 20).min(600);
+                            }
+                            true
+                        } else if cmd && !shift && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "-") {
+                            if s.explorer.is_some() {
+                                s.explorer_w = (s.explorer_w - 20).max(80);
+                            }
                             true
                         } else if cmd && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "0") {
                             s.font_size = FONT_PX;
@@ -2353,6 +2414,8 @@ impl ApplicationHandler<UserEvent> for App {
                             } else { false }
                         } else if ctrl && matches!(&event.logical_key, Key::Character(_)) {
                             false
+                        } else if active_tab_is_settings {
+                            false // settings tab: block all text editing
                         } else {
                             match &event.logical_key {
                                 Key::Named(NamedKey::ArrowLeft) => {
@@ -2530,6 +2593,7 @@ struct PaneSnap {
     id:             usize,
     rect:           Rect,
     is_active:      bool,
+    is_settings_tab: bool,
     scroll:         usize,
     hscroll:        usize,
     find_h:         i32,
@@ -2653,8 +2717,27 @@ fn render(s: &mut State) {
     let pane_snaps: Vec<PaneSnap> = layout.iter().filter_map(|&(pid, rect)| {
         let pane = s.panes.get(&pid)?;
         if pane.kind != PaneKind::Editor { return None; }
-        Some((pid, rect, pane))
-    }).map(|(pid, rect, pane)| {
+
+        // Settings tab: build a minimal snap (no lines/cursors needed)
+        if pane.tabs.get(pane.active).map_or(false, |t| t.kind == TabKind::Settings) {
+            let tab_info: Vec<(String, bool)> = pane.tabs.iter()
+                .map(|t| (t.display_name().to_owned(), t.dirty)).collect();
+            return Some(PaneSnap {
+                id: pid, rect, is_active: pid == active_pane_id,
+                is_settings_tab: true,
+                tab_info, active_tab: pane.active,
+                scroll: 0, hscroll: 0, find_h: 0, editor_h: 0,
+                cursors_snap: vec![], match_ranges: vec![],
+                find_open: false, find_repl_open: false,
+                find_focus: FindFocus::Query, case_sensitive: false, whole_word: false,
+                find_query: String::new(), find_repl: String::new(),
+                lines: vec![], total: 0, max_line_len: 0,
+                gutter_w: 0, ln_digits: 0,
+                path_name: String::from("Settings"), dirty: false,
+                cur_line: 0, cur_col: 0, diagnostics: vec![],
+            });
+        }
+
         let tab  = pane.tab();
         let fh   = State::pane_find_h(pane, lh);
         let eh   = (rect.h - tab_h - fh).max(0);
@@ -2710,10 +2793,11 @@ fn render(s: &mut State) {
         let tab_info: Vec<(String, bool)> = pane.tabs.iter()
             .map(|t| (t.display_name().to_owned(), t.dirty)).collect();
 
-        PaneSnap {
+        Some(PaneSnap {
             id: pid,
             rect,
             is_active: pid == active_pane_id,
+            is_settings_tab: false,
             scroll, hscroll, find_h: fh, editor_h: eh,
             cursors_snap, match_ranges,
             find_open: pane.find.open, find_repl_open: pane.find.replace_open,
@@ -2728,7 +2812,7 @@ fn render(s: &mut State) {
                 .and_then(|p| s.diagnostics.get(p))
                 .map(|diags| diags.iter().map(|d| (d.line, d.col_start, d.col_end, d.severity.clone())).collect())
                 .unwrap_or_default(),
-        }
+        })
     }).collect();
 
     // Drag snapshot
@@ -2743,9 +2827,9 @@ fn render(s: &mut State) {
             }).collect()
         });
 
-    let settings_open  = s.settings_open;
     let renderer_is_gpu = s.renderer.is_gpu();
-    let vsync_on       = s.settings.vsync;
+    let vsync_on        = s.settings.vsync;
+    let explorer_drag   = s.explorer_drag;
 
     let glyphs = &s.glyphs as *const Glyphs;
 
@@ -2758,7 +2842,8 @@ fn render(s: &mut State) {
         if let Some(entries) = &explorer_snap {
             let panel_h = h as i32 - status_h;
             fill(buf, w, h, 0, 0, explorer_w, panel_h, BG2);
-            fill(buf, w, h, explorer_w - 1, 0, 1, panel_h, BORDER);
+            let border_col = if explorer_drag { ACCENT } else { BORDER };
+            fill(buf, w, h, explorer_w - 1, 0, 1, panel_h, border_col);
 
             let toggle_label = if show_hidden { "  [x] .hidden" } else { "  [ ] .hidden" };
             draw_str(buf, w, h, g, toggle_label, 0, asc, FG_DIM, explorer_w - 1);
@@ -2803,6 +2888,39 @@ fn render(s: &mut State) {
                 draw_str(buf, w, h, g, &label, tx, r.y + tab_h * 3 / 4, FG, (tx + tw).min(clip_r));
                 fill(buf, w, h, tx + tw, r.y, 1, tab_h, BORDER);
                 tx += tw + 1;
+            }
+
+            // Settings tab content
+            if snap.is_settings_tab {
+                let content_y = r.y + tab_h;
+                let btn_x     = r.x + 14 * cw;
+                // Title separator
+                draw_str(buf, w, h, g, "  Settings", r.x, content_y + asc, FG, r.x + r.w);
+                fill(buf, w, h, r.x, content_y + lh, r.w, 1, BORDER);
+                // Renderer row
+                let ry = content_y + lh + 8;
+                draw_str(buf, w, h, g, "  Renderer", r.x, ry + asc, FG, btn_x - cw);
+                let (cpu_bg, cpu_fg) = if !renderer_is_gpu { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
+                fill(buf, w, h, btn_x,          ry, 5 * cw, lh, cpu_bg);
+                draw_str(buf, w, h, g, " CPU ", btn_x,          ry + asc, cpu_fg, btn_x + 5 * cw);
+                let (gpu_bg, gpu_fg) = if  renderer_is_gpu { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
+                fill(buf, w, h, btn_x + 6 * cw, ry, 5 * cw, lh, gpu_bg);
+                draw_str(buf, w, h, g, " GPU ", btn_x + 6 * cw, ry + asc, gpu_fg, btn_x + 11 * cw);
+                // VSync row
+                let vy = ry + lh + 4;
+                draw_str(buf, w, h, g, "  VSync", r.x, vy + asc, FG, btn_x - cw);
+                let (vs_bg, vs_fg) = if vsync_on { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
+                let vs_label = if vsync_on { " [x] On " } else { " [ ] Off" };
+                fill(buf, w, h, btn_x, vy, 8 * cw, lh, vs_bg);
+                draw_str(buf, w, h, g, vs_label, btn_x, vy + asc, vs_fg, btn_x + 8 * cw);
+                // Info row
+                let info = if renderer_is_gpu {
+                    "  GPU (+~66 MB at 4K) — no tearing at any size"
+                } else {
+                    "  CPU (no extra RAM) — coalesced + vsync-aligned"
+                };
+                draw_str(buf, w, h, g, info, r.x, vy + lh + 4 + asc, FG_DIM, r.x + r.w);
+                continue;
             }
 
             // Editor lines
@@ -3079,49 +3197,6 @@ fn render(s: &mut State) {
                 fill(buf, w, h, zone_rect.x,               zone_rect.y,                1, zone_rect.h,            ACCENT);
                 fill(buf, w, h, zone_rect.x + zone_rect.w-1, zone_rect.y,              1, zone_rect.h,            ACCENT);
             }
-        }
-
-        // ── Settings panel (modal overlay) ───────────────────────────────
-        if settings_open {
-            let pw = 36 * cw;
-            let ph = 6 * lh + 8;
-            let px = (w as i32 - pw) / 2;
-            let py = (h as i32 - ph) / 2;
-            // Background + 1px border on all four sides
-            fill(buf, w, h, px, py, pw, ph, BG2);
-            fill(buf, w, h, px,           py,          pw, 1,  BORDER);
-            fill(buf, w, h, px,           py + ph - 1, pw, 1,  BORDER);
-            fill(buf, w, h, px,           py,          1,  ph, BORDER);
-            fill(buf, w, h, px + pw - 1,  py,          1,  ph, BORDER);
-            // Title row
-            draw_str(buf, w, h, g, "  Settings", px, py + lh * 3 / 4, FG, px + pw);
-            fill(buf, w, h, px + 1, py + lh, pw - 2, 1, BORDER);
-            // Renderer row
-            let ry    = py + lh + 8;
-            let btn_x = px + 14 * cw;
-            draw_str(buf, w, h, g, "  Renderer", px, ry + lh * 3 / 4, FG, btn_x - cw);
-            let (cpu_bg, cpu_fg) = if !renderer_is_gpu { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
-            fill(buf, w, h, btn_x,          ry, 5 * cw, lh, cpu_bg);
-            draw_str(buf, w, h, g, " CPU ", btn_x,          ry + lh * 3 / 4, cpu_fg, btn_x + 5 * cw);
-            let (gpu_bg, gpu_fg) = if  renderer_is_gpu { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
-            fill(buf, w, h, btn_x + 6 * cw, ry, 5 * cw, lh, gpu_bg);
-            draw_str(buf, w, h, g, " GPU ", btn_x + 6 * cw, ry + lh * 3 / 4, gpu_fg, btn_x + 11 * cw);
-            // VSync row
-            let vy = ry + lh + 4;
-            draw_str(buf, w, h, g, "  VSync", px, vy + lh * 3 / 4, FG, btn_x - cw);
-            let (vs_bg, vs_fg) = if vsync_on { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
-            let vs_label = if vsync_on { " [x] On " } else { " [ ] Off" };
-            fill(buf, w, h, btn_x, vy, 8 * cw, lh, vs_bg);
-            draw_str(buf, w, h, g, vs_label, btn_x, vy + lh * 3 / 4, vs_fg, btn_x + 8 * cw);
-            // Info row: approximate RAM usage
-            let mem_str = if renderer_is_gpu {
-                "  GPU (+~66 MB at 4K) — no tearing at any size".to_string()
-            } else {
-                "  CPU (no extra RAM) — coalesced + vsync-aligned".to_string()
-            };
-            draw_str(buf, w, h, g, &mem_str, px, vy + lh + 4 + lh * 3 / 4, FG_DIM, px + pw);
-            // Hint
-            draw_str(buf, w, h, g, "  Cmd+,  or  Esc  to close", px, vy + 2 * lh + 8 + lh * 3 / 4, FG_DIM, px + pw);
         }
 
         // ── Status bar ────────────────────────────────────────────────────
