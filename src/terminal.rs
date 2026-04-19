@@ -50,6 +50,15 @@ impl Default for Cell {
     fn default() -> Self { Cell { ch: ' ', fg: DEFAULT_FG, bg: DEFAULT_BG, bold: false } }
 }
 
+// ── Mouse reporting mode ──────────────────────────────────────────────────────
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub enum MouseReportMode {
+    #[default] None,
+    X10,          // ?1000 — press/release only
+    ButtonEvent,  // ?1002 — press, release, drag
+    AnyEvent,     // ?1003 — all motion
+}
+
 // ── TermGrid ─────────────────────────────────────────────────────────────────
 pub struct TermGrid {
     pub cols: usize,
@@ -67,6 +76,8 @@ pub struct TermGrid {
     pub cur_bg: u32,
     pub cur_bold: bool,
     pub cur_visible: bool,
+    pub mouse_report: MouseReportMode,
+    pub mouse_sgr:    bool,
 }
 
 impl TermGrid {
@@ -74,7 +85,8 @@ impl TermGrid {
         let cells = vec![Cell::default(); cols * rows];
         TermGrid { cols, rows, cells, cur_col: 0, cur_row: 0, scrollback: Vec::new(),
                    scroll_offset: 0, cur_fg: DEFAULT_FG, cur_bg: DEFAULT_BG,
-                   cur_bold: false, cur_visible: true }
+                   cur_bold: false, cur_visible: true,
+                   mouse_report: MouseReportMode::None, mouse_sgr: false }
     }
 
     fn cell(&self, row: usize, col: usize) -> &Cell { &self.cells[row * self.cols + col] }
@@ -170,7 +182,7 @@ impl<'a> Perform for VteHandler<'a> {
         }
     }
 
-    fn csi_dispatch(&mut self, params: &vte::Params, _intermediates: &[u8], _ignore: bool, action: char) {
+    fn csi_dispatch(&mut self, params: &vte::Params, intermediates: &[u8], _ignore: bool, action: char) {
         let g = &mut *self.grid;
         // Collect numeric params; 0 where missing.
         let ps: Vec<u16> = params.iter().map(|p| p.first().copied().unwrap_or(0)).collect();
@@ -259,8 +271,20 @@ impl<'a> Perform for VteHandler<'a> {
                     i += 1;
                 }
             }
-            // Cursor show/hide and other private modes — ignore for now
-            'h' | 'l' => {}
+            'h' | 'l' => {
+                let enable = action == 'h';
+                if intermediates.first() == Some(&0x3F) {
+                    for &p in ps.iter() {
+                        match p {
+                            1000 => g.mouse_report = if enable { MouseReportMode::X10 } else { MouseReportMode::None },
+                            1002 => g.mouse_report = if enable { MouseReportMode::ButtonEvent } else { MouseReportMode::None },
+                            1003 => g.mouse_report = if enable { MouseReportMode::AnyEvent } else { MouseReportMode::None },
+                            1006 => g.mouse_sgr = enable,
+                            _ => {}
+                        }
+                    }
+                }
+            }
             // Column/line position
             'G' => { g.cur_col = p0.saturating_sub(1).min(g.cols - 1); }
             'd' => { g.cur_row = p0.saturating_sub(1).min(g.rows - 1); }
@@ -434,5 +458,24 @@ pub fn encode_key(key: &Key, mods: ModifiersState, text: Option<&str>) -> Option
             }
         }
         _ => text.filter(|t| !t.is_empty()).map(|t| t.as_bytes().to_vec()),
+    }
+}
+
+/// Encode a mouse event as bytes to write to the PTY master fd.
+/// col/row are 0-based grid coordinates.
+/// cb is the button code (0=left, 1=mid, 2=right, 3=release(X10), 32+n=motion,
+///    64=scroll-up, 65=scroll-down); modifier bits already OR'd in by caller.
+/// press=false only matters for SGR mode (uses 'm' suffix for release).
+pub fn encode_mouse(col: usize, row: usize, cb: u8, press: bool, sgr: bool) -> Vec<u8> {
+    let cx = col + 1;
+    let cy = row + 1;
+    if sgr {
+        let suffix = if press { 'M' } else { 'm' };
+        format!("\x1b[<{};{};{}{}", cb, cx, cy, suffix).into_bytes()
+    } else {
+        let b_cb = (cb as usize + 32).min(255) as u8;
+        let b_cx = (cx + 32).min(255) as u8;
+        let b_cy = (cy + 32).min(255) as u8;
+        vec![0x1b, b'[', b'M', b_cb, b_cx, b_cy]
     }
 }

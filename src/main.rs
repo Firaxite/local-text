@@ -717,7 +717,8 @@ struct State {
     explorer_drag: bool,  // true while dragging the explorer right border
     mouse_x:    f32,
     mouse_y:    f32,
-    mouse_down:      bool,
+    mouse_down:       bool,
+    term_buttons_held: u8,  // bitmask: bit0=left, bit1=mid, bit2=right
     last_click_time: Instant,
     last_click_char: usize,
     click_count:     u32,
@@ -1887,7 +1888,8 @@ impl ApplicationHandler<UserEvent> for App {
             explorer_drag: false,
             mouse_x:    0.0,
             mouse_y:    0.0,
-            mouse_down:      false,
+            mouse_down:       false,
+            term_buttons_held: 0,
             last_click_time: Instant::now() - Duration::from_secs(1),
             last_click_char: usize::MAX,
             click_count:     0,
@@ -2008,6 +2010,46 @@ impl ApplicationHandler<UserEvent> for App {
                     s.ensure_visible();
                     { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                 }
+                // Terminal mouse motion reporting
+                {
+                    let pane_id = s.active_pane;
+                    if s.panes.get(&pane_id).map_or(false, |p| p.kind == PaneKind::Terminal) {
+                        let tid = s.panes[&pane_id].term_ids.get(s.panes[&pane_id].active).copied();
+                        if let Some(tid) = tid {
+                            if let Some(tp) = s.term_panes.get(&tid) {
+                                let should_report = match tp.grid.mouse_report {
+                                    terminal::MouseReportMode::AnyEvent    => true,
+                                    terminal::MouseReportMode::ButtonEvent => s.term_buttons_held != 0,
+                                    _ => false,
+                                };
+                                if should_report {
+                                    let area = s.pane_area();
+                                    let pane_rect = layout_tree(&s.pane_tree, area).into_iter()
+                                        .find(|(id, _)| *id == pane_id).map(|(_, r)| r).unwrap_or(area);
+                                    let tab_h = s.tab_h();
+                                    let content_y = pane_rect.y + tab_h;
+                                    let cw = s.glyphs.cw;
+                                    let lh = s.glyphs.lh;
+                                    let term_col = ((mx - pane_rect.x) / cw)
+                                        .clamp(0, tp.grid.cols as i32 - 1) as usize;
+                                    let term_row = ((my - content_y) / lh)
+                                        .clamp(0, tp.grid.rows as i32 - 1) as usize;
+                                    let mut mod_bits: u8 = 0;
+                                    if s.mods.shift_key()   { mod_bits |= 4; }
+                                    if s.mods.alt_key()     { mod_bits |= 8; }
+                                    if s.mods.control_key() { mod_bits |= 16; }
+                                    // 32+button for drag, 35 (32+3) for no-button motion
+                                    let cb = if s.term_buttons_held & 1 != 0 { 32u8 | mod_bits }
+                                             else { 35u8 | mod_bits };
+                                    let sgr = tp.grid.mouse_sgr;
+                                    let pty_fd = tp.pty_fd;
+                                    let bytes = terminal::encode_mouse(term_col, term_row, cb, true, sgr);
+                                    unsafe { libc::write(pty_fd, bytes.as_ptr().cast(), bytes.len()); }
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             WindowEvent::MouseInput {
@@ -2028,6 +2070,42 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(drag) = s.drag.take() {
                     perform_drop(s, drag);
                     { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                }
+                // Forward release to terminal if mouse reporting enabled
+                if s.term_buttons_held & 1 != 0 {
+                    s.term_buttons_held &= !1;
+                    let mx = s.mouse_x as i32;
+                    let my = s.mouse_y as i32;
+                    let pane_id = s.active_pane;
+                    if s.panes.get(&pane_id).map_or(false, |p| p.kind == PaneKind::Terminal) {
+                        let area = s.pane_area();
+                        let pane_rect = layout_tree(&s.pane_tree, area).into_iter()
+                            .find(|(id, _)| *id == pane_id).map(|(_, r)| r).unwrap_or(area);
+                        let tab_h = s.tab_h();
+                        let tid = s.panes[&pane_id].term_ids.get(s.panes[&pane_id].active).copied();
+                        if let Some(tid) = tid {
+                            if let Some(tp) = s.term_panes.get(&tid) {
+                                if tp.grid.mouse_report != terminal::MouseReportMode::None {
+                                    let cw = s.glyphs.cw;
+                                    let lh = s.glyphs.lh;
+                                    let content_y = pane_rect.y + tab_h;
+                                    let term_col = ((mx - pane_rect.x) / cw)
+                                        .clamp(0, tp.grid.cols as i32 - 1) as usize;
+                                    let term_row = ((my - content_y) / lh)
+                                        .clamp(0, tp.grid.rows as i32 - 1) as usize;
+                                    let mut mod_bits: u8 = 0;
+                                    if s.mods.shift_key()   { mod_bits |= 4; }
+                                    if s.mods.alt_key()     { mod_bits |= 8; }
+                                    if s.mods.control_key() { mod_bits |= 16; }
+                                    let sgr = tp.grid.mouse_sgr;
+                                    let pty_fd = tp.pty_fd;
+                                    let bytes = terminal::encode_mouse(term_col, term_row,
+                                        if sgr { mod_bits } else { 3 | mod_bits }, false, sgr);
+                                    unsafe { libc::write(pty_fd, bytes.as_ptr().cast(), bytes.len()); }
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
@@ -2188,6 +2266,37 @@ impl ApplicationHandler<UserEvent> for App {
                 s.active_pane = clicked_pane_id;
 
                 // Non-editor panes (Terminal, LspOutput) have no tabs/find bar/cursors
+                if s.panes[&clicked_pane_id].kind == PaneKind::Terminal {
+                    let content_y = pane_rect.y + tab_h;
+                    if my >= content_y {
+                        let tid = s.panes[&clicked_pane_id].term_ids
+                            .get(s.panes[&clicked_pane_id].active).copied();
+                        if let Some(tid) = tid {
+                            if let Some(tp) = s.term_panes.get(&tid) {
+                                if tp.grid.mouse_report != terminal::MouseReportMode::None {
+                                    let cw = s.glyphs.cw;
+                                    let lh = s.glyphs.lh;
+                                    let term_col = ((mx - pane_rect.x) / cw)
+                                        .clamp(0, tp.grid.cols as i32 - 1) as usize;
+                                    let term_row = ((my - content_y) / lh)
+                                        .clamp(0, tp.grid.rows as i32 - 1) as usize;
+                                    let mut mod_bits: u8 = 0;
+                                    if s.mods.shift_key()   { mod_bits |= 4; }
+                                    if s.mods.alt_key()     { mod_bits |= 8; }
+                                    if s.mods.control_key() { mod_bits |= 16; }
+                                    let cb = mod_bits; // left button = 0
+                                    let sgr = tp.grid.mouse_sgr;
+                                    let pty_fd = tp.pty_fd;
+                                    let bytes = terminal::encode_mouse(term_col, term_row, cb, true, sgr);
+                                    unsafe { libc::write(pty_fd, bytes.as_ptr().cast(), bytes.len()); }
+                                    s.term_buttons_held |= 1;
+                                }
+                            }
+                        }
+                    }
+                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                    return;
+                }
                 if s.panes[&clicked_pane_id].kind != PaneKind::Editor {
                     { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                     return;
@@ -2318,12 +2427,49 @@ impl ApplicationHandler<UserEvent> for App {
                             let tid = s.panes.get(&s.active_pane)
                                 .and_then(|p| p.term_ids.get(p.active).copied());
                             let Some(tid) = tid else { return; };
-                            let tp = s.term_panes.get_mut(&tid).unwrap();
-                            let sb = tp.grid.scrollback.len();
-                            if dy < 0 {
-                                tp.grid.scroll_offset = (tp.grid.scroll_offset + (-dy) as usize).min(sb);
+                            // Extract what we need before taking the mutable borrow
+                            let mouse_report = s.term_panes.get(&tid)
+                                .map(|tp| tp.grid.mouse_report).unwrap_or(terminal::MouseReportMode::None);
+                            let scroll_offset = s.term_panes.get(&tid)
+                                .map(|tp| tp.grid.scroll_offset).unwrap_or(0);
+                            if mouse_report != terminal::MouseReportMode::None && scroll_offset == 0 {
+                                // Forward scroll to PTY as mouse button events
+                                let area = s.pane_area();
+                                let pane_id = s.active_pane;
+                                let pane_rect = layout_tree(&s.pane_tree, area).into_iter()
+                                    .find(|(id, _)| *id == pane_id).map(|(_, r)| r).unwrap_or(area);
+                                let tab_h = s.tab_h();
+                                let content_y = pane_rect.y + tab_h;
+                                let cw = s.glyphs.cw;
+                                let lh = s.glyphs.lh;
+                                let mx = s.mouse_x as i32;
+                                let my = s.mouse_y as i32;
+                                let mut mod_bits: u8 = 0;
+                                if s.mods.shift_key()   { mod_bits |= 4; }
+                                if s.mods.alt_key()     { mod_bits |= 8; }
+                                if s.mods.control_key() { mod_bits |= 16; }
+                                let cb_base: u8 = if dy < 0 { 64 } else { 65 };
+                                let cb = cb_base | mod_bits;
+                                let n = (dy.unsigned_abs() as usize).min(3);
+                                let tp = s.term_panes.get(&tid).unwrap();
+                                let sgr = tp.grid.mouse_sgr;
+                                let pty_fd = tp.pty_fd;
+                                let term_col = ((mx - pane_rect.x) / cw)
+                                    .clamp(0, tp.grid.cols as i32 - 1) as usize;
+                                let term_row = ((my - content_y) / lh)
+                                    .clamp(0, tp.grid.rows as i32 - 1) as usize;
+                                for _ in 0..n {
+                                    let bytes = terminal::encode_mouse(term_col, term_row, cb, true, sgr);
+                                    unsafe { libc::write(pty_fd, bytes.as_ptr().cast(), bytes.len()); }
+                                }
                             } else {
-                                tp.grid.scroll_offset = tp.grid.scroll_offset.saturating_sub(dy as usize);
+                                let tp = s.term_panes.get_mut(&tid).unwrap();
+                                let sb = tp.grid.scrollback.len();
+                                if dy < 0 {
+                                    tp.grid.scroll_offset = (tp.grid.scroll_offset + (-dy) as usize).min(sb);
+                                } else {
+                                    tp.grid.scroll_offset = tp.grid.scroll_offset.saturating_sub(dy as usize);
+                                }
                             }
                             { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                         }
