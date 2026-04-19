@@ -10,15 +10,19 @@ pub enum RendererBackend { Cpu, Gpu }
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Settings {
-    pub renderer: RendererBackend,
-    pub vsync:    bool,
+    pub renderer:  RendererBackend,
+    pub vsync:     bool,
+    #[serde(default = "Settings::default_font_size")]
+    pub font_size: f32,
 }
 
 impl Default for Settings {
-    fn default() -> Self { Settings { renderer: RendererBackend::Cpu, vsync: true } }
+    fn default() -> Self { Settings { renderer: RendererBackend::Cpu, vsync: true, font_size: Self::default_font_size() } }
 }
 
 impl Settings {
+    pub fn default_font_size() -> f32 { 14.0 }
+
     fn config_path() -> Option<PathBuf> {
         let home = std::env::var("HOME").ok()?;
         let dir  = PathBuf::from(home).join(".config").join("local-text");

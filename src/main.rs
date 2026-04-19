@@ -117,7 +117,7 @@ impl Glyphs {
         self.lh  = (px * 1.5).ceil() as i32;
         self.asc = (px * 1.1).ceil() as i32;
         for ch in ' '..='~' { self.load(ch); }
-        for ch in ['▶', '▼', '•'] { self.load(ch); }
+        for ch in ['▶', '▼', '•', '×'] { self.load(ch); }
     }
 
     fn load(&mut self, ch: char) {
@@ -144,6 +144,13 @@ impl Cursor {
     fn sel(&self) -> Option<(usize, usize)> {
         if self.has_sel() { Some((self.lo(), self.hi())) } else { None }
     }
+}
+
+// ── Undo history ─────────────────────────────────────────────────────────────
+#[derive(Clone)]
+struct UndoEntry {
+    text:    Rope,
+    cursors: Vec<Cursor>,
 }
 
 // ── Find bar ──────────────────────────────────────────────────────────────────
@@ -180,26 +187,31 @@ enum TabKind { Editor, Settings }
 
 #[derive(Clone)]
 struct Tab {
-    kind:    TabKind,
-    buf_id:  usize,   // shared with sibling tabs showing the same buffer
-    text:    Rope,
-    path:    Option<PathBuf>,
-    dirty:   bool,
-    cursors: Vec<Cursor>, // always non-empty; primary = last element
-    scroll:  usize,
-    hscroll: usize,
+    kind:         TabKind,
+    buf_id:       usize,   // shared with sibling tabs showing the same buffer
+    text:         Rope,
+    path:         Option<PathBuf>,
+    dirty:        bool,
+    cursors:      Vec<Cursor>, // always non-empty; primary = last element
+    scroll:       usize,
+    hscroll:      usize,
+    undo_stack:   Vec<UndoEntry>,
+    redo_stack:   Vec<UndoEntry>,
+    last_typing:  bool, // for coalescing consecutive single-char inserts
 }
 
 impl Tab {
     fn untitled(buf_id: usize) -> Self {
         Tab { kind: TabKind::Editor, buf_id, text: Rope::new(), path: None, dirty: false,
-              cursors: vec![Cursor::new(0)], scroll: 0, hscroll: 0 }
+              cursors: vec![Cursor::new(0)], scroll: 0, hscroll: 0,
+              undo_stack: Vec::new(), redo_stack: Vec::new(), last_typing: false }
     }
 
     fn settings() -> Self {
         Tab { kind: TabKind::Settings, buf_id: usize::MAX, text: Rope::new(),
               path: None, dirty: false, cursors: vec![Cursor::new(0)],
-              scroll: 0, hscroll: 0 }
+              scroll: 0, hscroll: 0,
+              undo_stack: Vec::new(), redo_stack: Vec::new(), last_typing: false }
     }
 
     fn display_name(&self) -> &str {
@@ -228,12 +240,15 @@ impl Tab {
     fn load_file(&mut self, path: PathBuf) {
         match std::fs::read_to_string(&path) {
             Ok(content) => {
-                self.text    = Rope::from_str(&content);
-                self.path    = Some(path);
-                self.cursors = vec![Cursor::new(0)];
-                self.scroll  = 0;
-                self.hscroll = 0;
-                self.dirty   = false;
+                self.text       = Rope::from_str(&content);
+                self.path       = Some(path);
+                self.cursors    = vec![Cursor::new(0)];
+                self.scroll     = 0;
+                self.hscroll    = 0;
+                self.dirty      = false;
+                self.undo_stack = Vec::new();
+                self.redo_stack = Vec::new();
+                self.last_typing = false;
             }
             Err(e) => eprintln!("open error: {e}"),
         }
@@ -337,16 +352,18 @@ enum PaneTree {
 enum PaneKind { Editor, Terminal, LspOutput }
 
 struct Pane {
-    id:     usize,
-    kind:   PaneKind,
-    tabs:   Vec<Tab>,
-    active: usize,
-    find:   FindBar,
+    id:       usize,
+    kind:     PaneKind,
+    tabs:     Vec<Tab>,     // editor tabs (Editor panes)
+    term_ids: Vec<usize>,   // terminal session IDs (Terminal panes)
+    active:   usize,        // index into tabs or term_ids
+    find:     FindBar,
 }
 
 impl Pane {
     fn new(id: usize, buf_id: usize) -> Self {
-        Pane { id, kind: PaneKind::Editor, tabs: vec![Tab::untitled(buf_id)], active: 0, find: FindBar::new() }
+        Pane { id, kind: PaneKind::Editor, tabs: vec![Tab::untitled(buf_id)],
+               term_ids: vec![], active: 0, find: FindBar::new() }
     }
     fn tab(&self)     -> &Tab     { &self.tabs[self.active] }
     fn tab_mut(&mut self) -> &mut Tab { &mut self.tabs[self.active] }
@@ -515,45 +532,79 @@ fn perform_drop(s: &mut State, drag: DragState) {
     let (src_pid, src_tidx) = (drag.source_pane, drag.source_tab);
     let Some(dst_pid) = drag.over_pane else { return };
     let Some(zone)    = drag.zone      else { return };
-    // Only editor panes can be drag sources
-    if s.panes.get(&src_pid).map_or(true, |p| p.kind != PaneKind::Editor) { return; }
-    // Destination pane contains only this tab → no-op (splitting would leave it empty)
-    if src_pid == dst_pid && s.panes[&src_pid].tabs.len() == 1 { return; }
-    // Center of same pane → no-op
-    if src_pid == dst_pid && zone == DropZone::Center { return; }
 
-    // Extract the tab from source pane
-    if src_tidx >= s.panes[&src_pid].tabs.len() { return; }
-    let tab = s.panes.get_mut(&src_pid).unwrap().tabs.remove(src_tidx);
-    {
-        let sp = s.panes.get_mut(&src_pid).unwrap();
-        if sp.active >= sp.tabs.len() && !sp.tabs.is_empty() { sp.active = sp.tabs.len() - 1; }
-    }
+    let src_kind = s.panes.get(&src_pid).map(|p| p.kind.clone()).unwrap_or(PaneKind::Editor);
+    let dst_kind = s.panes.get(&dst_pid).map(|p| p.kind.clone()).unwrap_or(PaneKind::Editor);
 
-    if zone == DropZone::Center {
-        let dp = s.panes.get_mut(&dst_pid).unwrap();
-        dp.tabs.push(tab);
-        dp.active = dp.tabs.len() - 1;
-        s.active_pane = dst_pid;
-    } else {
-        let new_id = s.next_pane_id;
-        s.next_pane_id += 1;
-        let mut new_pane = Pane::new(new_id, 0); // buf_id overwritten below
-        new_pane.tabs = vec![tab];
-        new_pane.active = 0;
-        s.panes.insert(new_id, new_pane);
-        let old_tree = std::mem::replace(&mut s.pane_tree, PaneTree::Leaf(0));
-        s.pane_tree = insert_pane(old_tree, dst_pid, new_id, zone);
-        s.active_pane = new_id;
-    }
+    match src_kind {
+        PaneKind::Editor => {
+            if src_pid == dst_pid && s.panes[&src_pid].tabs.len() == 1 { return; }
+            if src_pid == dst_pid && zone == DropZone::Center { return; }
+            // Can't center-drop an editor tab onto a non-editor pane
+            if zone == DropZone::Center && dst_kind != PaneKind::Editor { return; }
 
-    // Remove source pane if empty
-    if s.panes.get(&src_pid).map_or(false, |p| p.tabs.is_empty()) && src_pid != dst_pid {
-        s.panes.remove(&src_pid);
-        let old_tree = std::mem::replace(&mut s.pane_tree, PaneTree::Leaf(0));
-        if let Some(new_tree) = remove_pane_from_tree(old_tree, src_pid) {
-            s.pane_tree = new_tree;
+            if src_tidx >= s.panes[&src_pid].tabs.len() { return; }
+            let tab = s.panes.get_mut(&src_pid).unwrap().tabs.remove(src_tidx);
+            {
+                let sp = s.panes.get_mut(&src_pid).unwrap();
+                if sp.active >= sp.tabs.len() && !sp.tabs.is_empty() { sp.active = sp.tabs.len() - 1; }
+            }
+            if zone == DropZone::Center {
+                let dp = s.panes.get_mut(&dst_pid).unwrap();
+                dp.tabs.push(tab);
+                dp.active = dp.tabs.len() - 1;
+                s.active_pane = dst_pid;
+            } else {
+                let new_id = s.next_pane_id; s.next_pane_id += 1;
+                let mut new_pane = Pane::new(new_id, 0);
+                new_pane.tabs = vec![tab];
+                new_pane.active = 0;
+                s.panes.insert(new_id, new_pane);
+                let old_tree = std::mem::replace(&mut s.pane_tree, PaneTree::Leaf(0));
+                s.pane_tree = insert_pane(old_tree, dst_pid, new_id, zone);
+                s.active_pane = new_id;
+            }
+            if s.panes.get(&src_pid).map_or(false, |p| p.tabs.is_empty()) && src_pid != dst_pid {
+                s.panes.remove(&src_pid);
+                let old_tree = std::mem::replace(&mut s.pane_tree, PaneTree::Leaf(0));
+                if let Some(t) = remove_pane_from_tree(old_tree, src_pid) { s.pane_tree = t; }
+            }
         }
+        PaneKind::Terminal => {
+            if src_tidx >= s.panes[&src_pid].term_ids.len() { return; }
+            if src_pid == dst_pid && s.panes[&src_pid].term_ids.len() == 1 { return; }
+            if src_pid == dst_pid && zone == DropZone::Center { return; }
+            // Can't center-drop a terminal onto a non-terminal pane
+            if zone == DropZone::Center && dst_kind != PaneKind::Terminal { return; }
+
+            let term_id = s.panes.get_mut(&src_pid).unwrap().term_ids.remove(src_tidx);
+            {
+                let sp = s.panes.get_mut(&src_pid).unwrap();
+                if sp.active >= sp.term_ids.len() && !sp.term_ids.is_empty() {
+                    sp.active = sp.term_ids.len() - 1;
+                }
+            }
+            if zone == DropZone::Center {
+                let dp = s.panes.get_mut(&dst_pid).unwrap();
+                dp.term_ids.push(term_id);
+                dp.active = dp.term_ids.len() - 1;
+                s.active_pane = dst_pid;
+            } else {
+                let new_id = s.next_pane_id; s.next_pane_id += 1;
+                let new_pane = Pane { id: new_id, kind: PaneKind::Terminal, tabs: vec![],
+                                      term_ids: vec![term_id], active: 0, find: FindBar::new() };
+                s.panes.insert(new_id, new_pane);
+                let old_tree = std::mem::replace(&mut s.pane_tree, PaneTree::Leaf(0));
+                s.pane_tree = insert_pane(old_tree, dst_pid, new_id, zone);
+                s.active_pane = new_id;
+            }
+            if s.panes.get(&src_pid).map_or(false, |p| p.term_ids.is_empty()) && src_pid != dst_pid {
+                s.panes.remove(&src_pid);
+                let old_tree = std::mem::replace(&mut s.pane_tree, PaneTree::Leaf(0));
+                if let Some(t) = remove_pane_from_tree(old_tree, src_pid) { s.pane_tree = t; }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -565,30 +616,34 @@ fn resize_terminal_panes(s: &mut State) {
     let layout = layout_tree(&s.pane_tree, area);
     for (pid, rect) in layout {
         if s.panes.get(&pid).map_or(false, |p| p.kind == PaneKind::Terminal) {
-            if let Some(tp) = s.term_panes.get_mut(&pid) {
-                let cols = (rect.w / cw).max(1) as usize;
-                let rows = ((rect.h - tab_h) / lh).max(1) as usize;
-                terminal::resize_pty(tp, cols, rows);
+            let cols = (rect.w / cw).max(1) as usize;
+            let rows = ((rect.h - tab_h) / lh).max(1) as usize;
+            let tids: Vec<usize> = s.panes.get(&pid).map(|p| p.term_ids.clone()).unwrap_or_default();
+            for tid in tids {
+                if let Some(tp) = s.term_panes.get_mut(&tid) {
+                    terminal::resize_pty(tp, cols, rows);
+                }
             }
         }
     }
 }
 
 fn open_terminal_pane(s: &mut State) {
-    let id = s.next_pane_id;
-    s.next_pane_id += 1;
+    let pane_id = s.next_pane_id; s.next_pane_id += 1;
+    let term_id = s.next_pane_id; s.next_pane_id += 1;
     let area = s.pane_area();
     let cols = (area.w / s.glyphs.cw).max(1) as usize;
     let rows = ((area.h / 2) / s.glyphs.lh).max(1) as usize;
     let proxy = s.proxy.clone();
-    let tp = terminal::spawn_terminal(id, cols, rows, proxy);
-    s.term_panes.insert(id, tp);
-    let pane = Pane { id, kind: PaneKind::Terminal, tabs: vec![], active: 0, find: FindBar::new() };
-    s.panes.insert(id, pane);
+    let tp = terminal::spawn_terminal(term_id, cols, rows, proxy);
+    s.term_panes.insert(term_id, tp);
+    let pane = Pane { id: pane_id, kind: PaneKind::Terminal, tabs: vec![],
+                      term_ids: vec![term_id], active: 0, find: FindBar::new() };
+    s.panes.insert(pane_id, pane);
     let active = s.active_pane;
     let old_tree = std::mem::replace(&mut s.pane_tree, PaneTree::Leaf(0));
-    s.pane_tree = insert_pane(old_tree, active, id, DropZone::Bottom);
-    s.active_pane = id;
+    s.pane_tree = insert_pane(old_tree, active, pane_id, DropZone::Bottom);
+    s.active_pane = pane_id;
 }
 
 fn open_settings_tab(s: &mut State) {
@@ -769,13 +824,11 @@ impl State {
 
     // ── Multi-cursor helpers ──────────────────────────────────────────────────
 
-    // Returns cursor indices sorted by lo() descending (right-to-left order).
-    fn cursor_order_rtl(&self) -> Vec<usize> {
+    // Returns cursor indices sorted by lo() ascending (left-to-right order).
+    fn cursor_order_ltr(&self) -> Vec<usize> {
         let n = self.tab().cursors.len();
         let mut order: Vec<usize> = (0..n).collect();
-        order.sort_by(|&a, &b| {
-            self.tab().cursors[b].lo().cmp(&self.tab().cursors[a].lo())
-        });
+        order.sort_by_key(|&i| self.tab().cursors[i].lo());
         order
     }
 
@@ -797,23 +850,69 @@ impl State {
         t.cursors = merged;
     }
 
+    // ── Undo / Redo ───────────────────────────────────────────────────────────
+
+    // Call before every edit. coalesce=true merges with the previous entry when
+    // that entry was also coalesced (used for consecutive single-char typing).
+    fn push_undo(&mut self, coalesce: bool) {
+        let tab = self.tab_mut();
+        if !coalesce || !tab.last_typing {
+            if tab.undo_stack.len() >= 1000 { tab.undo_stack.remove(0); }
+            tab.undo_stack.push(UndoEntry { text: tab.text.clone(), cursors: tab.cursors.clone() });
+            tab.redo_stack.clear();
+        }
+        tab.last_typing = coalesce;
+    }
+
+    fn undo(&mut self) {
+        let Some(entry) = self.tab_mut().undo_stack.pop() else { return };
+        let cur = UndoEntry { text: self.tab().text.clone(), cursors: self.tab().cursors.clone() };
+        let tab = self.tab_mut();
+        tab.redo_stack.push(cur);
+        tab.text    = entry.text;
+        tab.cursors = entry.cursors;
+        tab.dirty   = true;
+        tab.last_typing = false;
+        self.ensure_visible();
+    }
+
+    fn redo(&mut self) {
+        let Some(entry) = self.tab_mut().redo_stack.pop() else { return };
+        let cur = UndoEntry { text: self.tab().text.clone(), cursors: self.tab().cursors.clone() };
+        let tab = self.tab_mut();
+        tab.undo_stack.push(cur);
+        tab.text    = entry.text;
+        tab.cursors = entry.cursors;
+        tab.dirty   = true;
+        tab.last_typing = false;
+        self.ensure_visible();
+    }
+
     // ── Editing ───────────────────────────────────────────────────────────────
 
     fn insert_str(&mut self, text: &str) {
         let n_chars = text.chars().count();
-        let order = self.cursor_order_rtl();
+        // Coalesce consecutive single printable char inserts with no selection.
+        let is_single = n_chars == 1 && !matches!(text, "\n" | "\t");
+        let no_sel = !self.tab().cursors.iter().any(|c| c.has_sel());
+        self.push_undo(is_single && no_sel);
+        let order = self.cursor_order_ltr();
+        let mut delta: isize = 0;
         for &i in &order {
-            let (has_sel, lo, hi) = {
+            let (orig_lo, orig_hi) = {
                 let c = &self.tab().cursors[i];
-                (c.has_sel(), c.lo(), c.hi())
+                (c.lo(), c.hi())
             };
-            if has_sel {
+            let lo = (orig_lo as isize + delta) as usize;
+            let hi = (orig_hi as isize + delta) as usize;
+            if lo < hi {
                 self.tab_mut().text.remove(lo..hi);
-                self.tab_mut().cursors[i] = Cursor::new(lo);
+                delta -= (hi - lo) as isize;
             }
-            let pos = self.tab().cursors[i].head.min(self.tab().text.len_chars());
+            let pos = lo.min(self.tab().text.len_chars());
             self.tab_mut().text.insert(pos, text);
             self.tab_mut().cursors[i] = Cursor::new(pos + n_chars);
+            delta += n_chars as isize;
             self.tab_mut().dirty = true;
         }
         self.dedup_cursors();
@@ -821,20 +920,27 @@ impl State {
     }
 
     fn backspace(&mut self) {
-        let order = self.cursor_order_rtl();
+        self.push_undo(false);
+        let order = self.cursor_order_ltr();
+        let mut delta: isize = 0;
         for &i in &order {
-            let (has_sel, lo, hi, head) = {
+            let (has_sel, orig_lo, orig_hi, orig_head) = {
                 let c = &self.tab().cursors[i];
                 (c.has_sel(), c.lo(), c.hi(), c.head)
             };
+            let lo   = (orig_lo   as isize + delta) as usize;
+            let hi   = (orig_hi   as isize + delta) as usize;
+            let head = (orig_head as isize + delta) as usize;
             if has_sel {
                 self.tab_mut().text.remove(lo..hi);
                 self.tab_mut().cursors[i] = Cursor::new(lo);
+                delta -= (hi - lo) as isize;
                 self.tab_mut().dirty = true;
             } else if head > 0 {
                 let c = head.min(self.tab().text.len_chars());
                 self.tab_mut().text.remove(c - 1..c);
                 self.tab_mut().cursors[i] = Cursor::new(c - 1);
+                delta -= 1;
                 self.tab_mut().dirty = true;
             }
         }
@@ -843,20 +949,28 @@ impl State {
     }
 
     fn delete_fwd(&mut self) {
-        let order = self.cursor_order_rtl();
+        self.push_undo(false);
+        let order = self.cursor_order_ltr();
+        let mut delta: isize = 0;
         for &i in &order {
-            let (has_sel, lo, hi, head) = {
+            let (has_sel, orig_lo, orig_hi, orig_head) = {
                 let c = &self.tab().cursors[i];
                 (c.has_sel(), c.lo(), c.hi(), c.head)
             };
+            let lo   = (orig_lo   as isize + delta) as usize;
+            let hi   = (orig_hi   as isize + delta) as usize;
+            let head = (orig_head as isize + delta) as usize;
             if has_sel {
                 self.tab_mut().text.remove(lo..hi);
                 self.tab_mut().cursors[i] = Cursor::new(lo);
+                delta -= (hi - lo) as isize;
                 self.tab_mut().dirty = true;
             } else {
                 let c = head.min(self.tab().text.len_chars());
                 if c < self.tab().text.len_chars() {
                     self.tab_mut().text.remove(c..c + 1);
+                    self.tab_mut().cursors[i] = Cursor::new(c);
+                    delta -= 1;
                     self.tab_mut().dirty = true;
                 }
             }
@@ -865,24 +979,31 @@ impl State {
     }
 
     fn delete_word_back(&mut self) {
-        let order = self.cursor_order_rtl();
+        self.push_undo(false);
+        let order = self.cursor_order_ltr();
+        let mut delta: isize = 0;
         for &i in &order {
-            let (has_sel, lo, hi) = {
+            let (has_sel, orig_lo, orig_hi, orig_head) = {
                 let c = &self.tab().cursors[i];
-                (c.has_sel(), c.lo(), c.hi())
+                (c.has_sel(), c.lo(), c.hi(), c.head)
             };
+            let lo   = (orig_lo   as isize + delta) as usize;
+            let hi   = (orig_hi   as isize + delta) as usize;
+            let head = (orig_head as isize + delta) as usize;
             if has_sel {
                 self.tab_mut().text.remove(lo..hi);
                 self.tab_mut().cursors[i] = Cursor::new(lo);
+                delta -= (hi - lo) as isize;
                 self.tab_mut().dirty = true;
             } else {
-                let end = self.tab().cursors[i].head.min(self.tab().text.len_chars());
+                let end = head.min(self.tab().text.len_chars());
                 let mut start = end;
                 while start > 0 && !Self::is_word_char(self.tab().text.char(start - 1)) { start -= 1; }
                 while start > 0 &&  Self::is_word_char(self.tab().text.char(start - 1)) { start -= 1; }
                 if start < end {
                     self.tab_mut().text.remove(start..end);
                     self.tab_mut().cursors[i] = Cursor::new(start);
+                    delta -= (end - start) as isize;
                     self.tab_mut().dirty = true;
                 }
             }
@@ -892,27 +1013,35 @@ impl State {
     }
 
     fn delete_to_line_start(&mut self) {
-        let order = self.cursor_order_rtl();
+        self.push_undo(false);
+        let order = self.cursor_order_ltr();
+        let mut delta: isize = 0;
         for &i in &order {
-            let (has_sel, lo, hi) = {
+            let (has_sel, orig_lo, orig_hi, orig_head) = {
                 let c = &self.tab().cursors[i];
-                (c.has_sel(), c.lo(), c.hi())
+                (c.has_sel(), c.lo(), c.hi(), c.head)
             };
+            let lo   = (orig_lo   as isize + delta) as usize;
+            let hi   = (orig_hi   as isize + delta) as usize;
+            let head = (orig_head as isize + delta) as usize;
             if has_sel {
                 self.tab_mut().text.remove(lo..hi);
                 self.tab_mut().cursors[i] = Cursor::new(lo);
+                delta -= (hi - lo) as isize;
                 self.tab_mut().dirty = true;
             } else {
-                let cursor_pos = self.tab().cursors[i].head.min(self.tab().text.len_chars());
+                let cursor_pos = head.min(self.tab().text.len_chars());
                 let line = self.tab().text.char_to_line(cursor_pos);
                 let start = self.tab().text.line_to_char(line);
                 if start < cursor_pos {
                     self.tab_mut().text.remove(start..cursor_pos);
                     self.tab_mut().cursors[i] = Cursor::new(start);
+                    delta -= (cursor_pos - start) as isize;
                     self.tab_mut().dirty = true;
                 } else if start > 0 {
                     self.tab_mut().text.remove(start - 1..start);
                     self.tab_mut().cursors[i] = Cursor::new(start - 1);
+                    delta -= 1;
                     self.tab_mut().dirty = true;
                 }
             }
@@ -922,24 +1051,32 @@ impl State {
     }
 
     fn delete_word_fwd(&mut self) {
-        let order = self.cursor_order_rtl();
+        self.push_undo(false);
+        let order = self.cursor_order_ltr();
+        let mut delta: isize = 0;
         for &i in &order {
-            let (has_sel, lo, hi) = {
+            let (has_sel, orig_lo, orig_hi, orig_head) = {
                 let c = &self.tab().cursors[i];
-                (c.has_sel(), c.lo(), c.hi())
+                (c.has_sel(), c.lo(), c.hi(), c.head)
             };
+            let lo   = (orig_lo   as isize + delta) as usize;
+            let hi   = (orig_hi   as isize + delta) as usize;
+            let head = (orig_head as isize + delta) as usize;
             if has_sel {
                 self.tab_mut().text.remove(lo..hi);
                 self.tab_mut().cursors[i] = Cursor::new(lo);
+                delta -= (hi - lo) as isize;
                 self.tab_mut().dirty = true;
             } else {
                 let len = self.tab().text.len_chars();
-                let start = self.tab().cursors[i].head.min(len);
+                let start = head.min(len);
                 let mut end = start;
                 while end < len && !Self::is_word_char(self.tab().text.char(end)) { end += 1; }
                 while end < len &&  Self::is_word_char(self.tab().text.char(end)) { end += 1; }
                 if end > start {
                     self.tab_mut().text.remove(start..end);
+                    self.tab_mut().cursors[i] = Cursor::new(start);
+                    delta -= (end - start) as isize;
                     self.tab_mut().dirty = true;
                 }
             }
@@ -948,26 +1085,36 @@ impl State {
     }
 
     fn delete_to_line_end(&mut self) {
-        let order = self.cursor_order_rtl();
+        self.push_undo(false);
+        let order = self.cursor_order_ltr();
+        let mut delta: isize = 0;
         for &i in &order {
-            let (has_sel, lo, hi) = {
+            let (has_sel, orig_lo, orig_hi, orig_head) = {
                 let c = &self.tab().cursors[i];
-                (c.has_sel(), c.lo(), c.hi())
+                (c.has_sel(), c.lo(), c.hi(), c.head)
             };
+            let lo   = (orig_lo   as isize + delta) as usize;
+            let hi   = (orig_hi   as isize + delta) as usize;
+            let head = (orig_head as isize + delta) as usize;
             if has_sel {
                 self.tab_mut().text.remove(lo..hi);
                 self.tab_mut().cursors[i] = Cursor::new(lo);
+                delta -= (hi - lo) as isize;
                 self.tab_mut().dirty = true;
             } else {
                 let len = self.tab().text.len_chars();
-                let c = self.tab().cursors[i].head.min(len);
+                let c = head.min(len);
                 let l = self.tab().text.char_to_line(c);
                 let line_end = self.tab().text.line_to_char(l) + Self::line_len(&self.tab().text, l);
                 if line_end > c {
                     self.tab_mut().text.remove(c..line_end);
+                    self.tab_mut().cursors[i] = Cursor::new(c);
+                    delta -= (line_end - c) as isize;
                     self.tab_mut().dirty = true;
                 } else if c < len {
                     self.tab_mut().text.remove(c..c + 1);
+                    self.tab_mut().cursors[i] = Cursor::new(c);
+                    delta -= 1;
                     self.tab_mut().dirty = true;
                 }
             }
@@ -1029,6 +1176,33 @@ impl State {
         }
         for (i, h) in new_heads.into_iter().enumerate() { self.tab_mut().cursors[i].head = h; }
         if !selecting { for c in &mut self.tab_mut().cursors { c.tail = c.head; } }
+        self.dedup_cursors();
+        self.ensure_visible();
+    }
+
+    fn add_cursor_above(&mut self) {
+        let pos  = self.tab().primary().head.min(self.tab().text.len_chars());
+        let line = self.tab().text.char_to_line(pos);
+        if line == 0 { return; }
+        let col  = pos - self.tab().text.line_to_char(line);
+        let prev = line - 1;
+        let new_pos = self.tab().text.line_to_char(prev)
+            + col.min(Self::line_len(&self.tab().text, prev));
+        self.tab_mut().cursors.push(Cursor::new(new_pos));
+        self.dedup_cursors();
+        self.ensure_visible();
+    }
+
+    fn add_cursor_below(&mut self) {
+        let pos  = self.tab().primary().head.min(self.tab().text.len_chars());
+        let line = self.tab().text.char_to_line(pos);
+        let last = Self::last_line(&self.tab().text);
+        if line >= last { return; }
+        let col  = pos - self.tab().text.line_to_char(line);
+        let next = line + 1;
+        let new_pos = self.tab().text.line_to_char(next)
+            + col.min(Self::line_len(&self.tab().text, next));
+        self.tab_mut().cursors.push(Cursor::new(new_pos));
         self.dedup_cursors();
         self.ensure_visible();
     }
@@ -1210,7 +1384,7 @@ fn notify_lsp_open(s: &mut State, path: &PathBuf) {
             let title = format!("{:?} LSP Output", lang);
             let op = OutputPane { id: op_id, lines: vec![], scroll: 0, title };
             s.lsp_panes.insert(op_id, op);
-            let shell_pane = Pane { id: op_id, kind: PaneKind::LspOutput, tabs: vec![], active: 0, find: FindBar::new() };
+            let shell_pane = Pane { id: op_id, kind: PaneKind::LspOutput, tabs: vec![], term_ids: vec![], active: 0, find: FindBar::new() };
             s.panes.insert(op_id, shell_pane);
             s.lsp.servers.insert(op_id, srv);
         }
@@ -1232,6 +1406,7 @@ fn notify_lsp_change(s: &mut State) {
         let ap = s.active_pane;
         let Some(pane) = s.panes.get(&ap) else { return };
         if pane.kind != PaneKind::Editor { return; }
+        if pane.tabs.is_empty() { return; }
         let tab = pane.tab();
         let Some(path) = tab.path.clone() else { return };
         let lang = Lang::from_path(&path);
@@ -1671,7 +1846,7 @@ impl ApplicationHandler<UserEvent> for App {
             settings::RendererBackend::Cpu => platform::Renderer::new_cpu(&win),
         };
 
-        let font_size = FONT_PX;
+        let font_size = loaded_settings.font_size;
         let glyphs = Glyphs::new(include_bytes!("../assets/JetBrainsMono-Regular.ttf"), font_size);
 
         let mut initial_pane = Pane::new(0, 0); // pane 0, buf 0
@@ -1708,7 +1883,7 @@ impl ApplicationHandler<UserEvent> for App {
             font_size,
             glyphs,
             explorer,
-            explorer_w:    200,
+            explorer_w:    ((200.0 * font_size / FONT_PX).round() as i32).clamp(80, 600),
             explorer_drag: false,
             mouse_x:    0.0,
             mouse_y:    0.0,
@@ -1914,8 +2089,56 @@ impl ApplicationHandler<UserEvent> for App {
                 let tab_h        = s.tab_h();
 
                 if pane_local_y < tab_h {
-                    // Tab bar click
                     let cw = s.glyphs.cw;
+
+                    // Terminal pane tab bar
+                    if s.panes[&clicked_pane_id].kind == PaneKind::Terminal {
+                        let mut tx = pane_rect.x;
+                        let n_terms = s.panes[&clicked_pane_id].term_ids.len();
+                        let mut hit = false;
+                        for i in 0..n_terms {
+                            let title_len = {
+                                let tid = s.panes[&clicked_pane_id].term_ids[i];
+                                s.term_panes.get(&tid).map(|tp| tp.title.chars().count()).unwrap_or(8)
+                            };
+                            let tw = (title_len + 3) as i32 * cw;
+                            if mx < tx + tw {
+                                hit = true;
+                                if mx >= tx + tw - cw {
+                                    // × close
+                                    s.active_pane = clicked_pane_id;
+                                    let tid = s.panes.get_mut(&clicked_pane_id).unwrap().term_ids.remove(i);
+                                    s.term_panes.remove(&tid);
+                                    let pane = s.panes.get_mut(&clicked_pane_id).unwrap();
+                                    if pane.term_ids.is_empty() {
+                                        s.panes.remove(&clicked_pane_id);
+                                        let old_tree = std::mem::replace(&mut s.pane_tree, PaneTree::Leaf(0));
+                                        if let Some(t) = remove_pane_from_tree(old_tree, clicked_pane_id) {
+                                            s.pane_tree = t;
+                                        }
+                                        let new_active = layout_tree(&s.pane_tree, s.pane_area())
+                                            .first().map(|(id, _)| *id).unwrap_or(0);
+                                        s.active_pane = new_active;
+                                    } else {
+                                        if pane.active >= pane.term_ids.len() {
+                                            pane.active = pane.term_ids.len() - 1;
+                                        }
+                                    }
+                                } else {
+                                    s.panes.get_mut(&clicked_pane_id).unwrap().active = i;
+                                    s.active_pane = clicked_pane_id;
+                                    s.drag_pending = Some((clicked_pane_id, i, s.mouse_x, s.mouse_y));
+                                }
+                                break;
+                            }
+                            tx += tw + 1;
+                        }
+                        if !hit { s.active_pane = clicked_pane_id; }
+                        { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                        return;
+                    }
+
+                    // Editor pane tab bar
                     let mut tx = pane_rect.x;
                     let n_tabs = s.panes[&clicked_pane_id].tabs.len();
                     for i in 0..n_tabs {
@@ -1926,6 +2149,28 @@ impl ApplicationHandler<UserEvent> for App {
                         let label_chars = name_len + if dirty { 4 } else { 3 };
                         let tw = label_chars as i32 * cw + 1;
                         if mx < tx + tw {
+                            // × button: last cw pixels of the tab
+                            if mx >= tx + tw - cw {
+                                s.active_pane = clicked_pane_id;
+                                let pane_id = clicked_pane_id;
+                                if s.panes[&pane_id].tabs.len() > 1 {
+                                    let pane = s.panes.get_mut(&pane_id).unwrap();
+                                    pane.tabs.remove(i);
+                                    if pane.active >= pane.tabs.len() { pane.active = pane.tabs.len() - 1; }
+                                } else if s.panes.len() > 1 {
+                                    s.panes.remove(&pane_id);
+                                    let old_tree = std::mem::replace(&mut s.pane_tree, PaneTree::Leaf(0));
+                                    if let Some(new_tree) = remove_pane_from_tree(old_tree, pane_id) {
+                                        s.pane_tree = new_tree;
+                                    }
+                                    let new_active = layout_tree(&s.pane_tree, s.pane_area()).first().map(|(id, _)| *id).unwrap_or(0);
+                                    s.active_pane = new_active;
+                                } else {
+                                    el.exit();
+                                }
+                                { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                                return;
+                            }
                             s.panes.get_mut(&clicked_pane_id).unwrap().active = i;
                             s.active_pane = clicked_pane_id;
                             s.drag_pending = Some((clicked_pane_id, i, s.mouse_x, s.mouse_y));
@@ -2121,12 +2366,68 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
 
-                // Terminal pane: forward all key events to the PTY
+                // Terminal pane intercepts (before PTY forwarding)
                 if s.panes.get(&s.active_pane).map_or(false, |p| p.kind == PaneKind::Terminal) {
+                    // Cmd+W — close active terminal tab or pane
+                    if cmd && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "w") {
+                        let pane_id = s.active_pane;
+                        let n = s.panes[&pane_id].term_ids.len();
+                        if n > 1 {
+                            let idx = s.panes[&pane_id].active;
+                            let tid = s.panes.get_mut(&pane_id).unwrap().term_ids.remove(idx);
+                            s.term_panes.remove(&tid);
+                            let pane = s.panes.get_mut(&pane_id).unwrap();
+                            if pane.active >= pane.term_ids.len() {
+                                pane.active = pane.term_ids.len().saturating_sub(1);
+                            }
+                        } else {
+                            let tids: Vec<usize> = s.panes.get(&pane_id)
+                                .map(|p| p.term_ids.clone()).unwrap_or_default();
+                            for tid in tids { s.term_panes.remove(&tid); }
+                            s.panes.remove(&pane_id);
+                            let old_tree = std::mem::replace(&mut s.pane_tree, PaneTree::Leaf(0));
+                            if let Some(t) = remove_pane_from_tree(old_tree, pane_id) { s.pane_tree = t; }
+                            let new_active = layout_tree(&s.pane_tree, s.pane_area())
+                                .first().map(|(id, _)| *id).unwrap_or(0);
+                            s.active_pane = new_active;
+                        }
+                        { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                        return;
+                    }
+                    // Ctrl+Shift+5 — split: new terminal with same shell below
+                    if ctrl && shift && matches!(&event.logical_key, Key::Character(c) if matches!(c.as_str(), "5" | "%")) {
+                        let shell = {
+                            let p = &s.panes[&s.active_pane];
+                            p.term_ids.get(p.active)
+                                .and_then(|&tid| s.term_panes.get(&tid).map(|tp| tp.shell.clone()))
+                                .unwrap_or_else(|| std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned()))
+                        };
+                        let pane_id = s.next_pane_id; s.next_pane_id += 1;
+                        let term_id = s.next_pane_id; s.next_pane_id += 1;
+                        let area = s.pane_area();
+                        let cols = (area.w / s.glyphs.cw).max(1) as usize;
+                        let rows = ((area.h / 2) / s.glyphs.lh).max(1) as usize;
+                        let proxy = s.proxy.clone();
+                        let tp = terminal::spawn_terminal_with_shell(term_id, cols, rows, proxy, Some(shell));
+                        s.term_panes.insert(term_id, tp);
+                        let new_pane = Pane { id: pane_id, kind: PaneKind::Terminal, tabs: vec![],
+                                              term_ids: vec![term_id], active: 0, find: FindBar::new() };
+                        s.panes.insert(pane_id, new_pane);
+                        let cur = s.active_pane;
+                        let old_tree = std::mem::replace(&mut s.pane_tree, PaneTree::Leaf(0));
+                        s.pane_tree = insert_pane(old_tree, cur, pane_id, DropZone::Bottom);
+                        s.active_pane = pane_id;
+                        { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                        return;
+                    }
+                    // Forward all other key events to the active PTY
                     let bytes = terminal::encode_key(&event.logical_key, s.mods, event.text.as_deref());
                     if let Some(bytes) = bytes {
-                        if let Some(tp) = s.term_panes.get(&s.active_pane) {
-                            unsafe { libc::write(tp.pty_fd, bytes.as_ptr().cast(), bytes.len()); }
+                        let p = &s.panes[&s.active_pane];
+                        if let Some(&tid) = p.term_ids.get(p.active) {
+                            if let Some(tp) = s.term_panes.get(&tid) {
+                                unsafe { libc::write(tp.pty_fd, bytes.as_ptr().cast(), bytes.len()); }
+                            }
                         }
                     }
                     return;
@@ -2199,19 +2500,28 @@ impl ApplicationHandler<UserEvent> for App {
                         } else if cmd && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "x") {
                             if let Some(text) = s.tab().sel_text() {
                                 clipboard_set(&text);
-                                let order = s.cursor_order_rtl();
+                                s.push_undo(false);
+                                let order = s.cursor_order_ltr();
+                                let mut delta: isize = 0;
                                 for &i in &order {
                                     if s.tab().cursors[i].has_sel() {
-                                        let lo = s.tab().cursors[i].lo();
-                                        let hi = s.tab().cursors[i].hi();
+                                        let lo = (s.tab().cursors[i].lo() as isize + delta) as usize;
+                                        let hi = (s.tab().cursors[i].hi() as isize + delta) as usize;
                                         s.tab_mut().text.remove(lo..hi);
                                         s.tab_mut().cursors[i] = Cursor::new(lo);
+                                        delta -= (hi - lo) as isize;
                                         s.tab_mut().dirty = true;
                                     }
                                 }
                                 s.dedup_cursors();
                                 s.ensure_visible();
                             }
+                            true
+                        } else if cmd && !shift && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "z") {
+                            s.undo();
+                            true
+                        } else if cmd && shift && matches!(&event.logical_key, Key::Character(c) if matches!(c.as_str(), "z" | "Z")) {
+                            s.redo();
                             true
                         } else if cmd && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "v") {
                             if let Some(text) = clipboard_get() {
@@ -2225,66 +2535,66 @@ impl ApplicationHandler<UserEvent> for App {
                         } else if (ctrl || cmd) && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "s") {
                             s.tab_mut().save();
                             true
-                        } else if cmd && shift && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "=") {
+                        } else if cmd && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "=") {
+                            let old = s.font_size;
                             s.font_size = (s.font_size + 2.0).min(36.0);
+                            let ratio = s.font_size / old;
+                            s.explorer_w = ((s.explorer_w as f32 * ratio).round() as i32).clamp(80, 600);
+                            s.settings.font_size = s.font_size;
+                            s.settings.save();
                             s.rebuild_glyphs();
                             true
-                        } else if cmd && shift && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "-") {
+                        } else if cmd && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "-") {
+                            let old = s.font_size;
                             s.font_size = (s.font_size - 2.0).max(8.0);
+                            let ratio = s.font_size / old;
+                            s.explorer_w = ((s.explorer_w as f32 * ratio).round() as i32).clamp(80, 600);
+                            s.settings.font_size = s.font_size;
+                            s.settings.save();
                             s.rebuild_glyphs();
-                            true
-                        } else if cmd && !shift && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "=") {
-                            if s.explorer.is_some() {
-                                s.explorer_w = (s.explorer_w + 20).min(600);
-                            }
-                            true
-                        } else if cmd && !shift && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "-") {
-                            if s.explorer.is_some() {
-                                s.explorer_w = (s.explorer_w - 20).max(80);
-                            }
                             true
                         } else if cmd && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "0") {
+                            let old = s.font_size;
                             s.font_size = FONT_PX;
+                            let ratio = s.font_size / old;
+                            s.explorer_w = ((s.explorer_w as f32 * ratio).round() as i32).clamp(80, 600);
+                            s.settings.font_size = s.font_size;
+                            s.settings.save();
                             s.rebuild_glyphs();
                             true
-                        } else if cmd && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "t") {
-                            let new_buf_id = s.next_buf_id;
-                            s.next_buf_id += 1;
-                            let pane = s.pane_mut();
-                            pane.tabs.push(Tab::untitled(new_buf_id));
-                            pane.active = pane.tabs.len() - 1;
-                            s.reset_blink();
+                        } else if cmd && matches!(&event.logical_key, Key::Character(c) if matches!(c.as_str(), "t" | "n" | "N")) {
+                            if s.pane().kind == PaneKind::Editor {
+                                let new_buf_id = s.next_buf_id;
+                                s.next_buf_id += 1;
+                                let pane = s.pane_mut();
+                                pane.tabs.push(Tab::untitled(new_buf_id));
+                                pane.active = pane.tabs.len() - 1;
+                                s.reset_blink();
+                            }
                             true
                         } else if cmd && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "w") {
                             let pane_id = s.active_pane;
-                            let pane_kind = s.panes.get(&pane_id).map(|p| p.kind.clone()).unwrap_or(PaneKind::Editor);
-                            if pane_kind != PaneKind::Editor {
-                                // Terminal / LspOutput panes: always close the pane
-                                s.term_panes.remove(&pane_id); // Drop closes fd
-                                s.lsp_panes.remove(&pane_id);
+                            // Terminal panes are handled before PTY forwarding; only editor/lsp reach here
+                            let pane = s.panes.get_mut(&pane_id).unwrap();
+                            if pane.tabs.len() > 1 {
+                                pane.tabs.remove(pane.active);
+                                if pane.active >= pane.tabs.len() { pane.active = pane.tabs.len() - 1; }
+                            } else if s.panes.len() > 1 {
                                 s.panes.remove(&pane_id);
                                 let old_tree = std::mem::replace(&mut s.pane_tree, PaneTree::Leaf(0));
                                 if let Some(new_tree) = remove_pane_from_tree(old_tree, pane_id) {
                                     s.pane_tree = new_tree;
                                 }
-                                let new_active = layout_tree(&s.pane_tree, s.pane_area()).first().map(|(id, _)| *id).unwrap_or(0);
+                                let new_active = layout_tree(&s.pane_tree, s.pane_area())
+                                    .first().map(|(id, _)| *id).unwrap_or(0);
                                 s.active_pane = new_active;
+                            } else if s.explorer.is_some() {
+                                // Directory open: reset to empty tab rather than exiting
+                                let new_buf_id = s.next_buf_id; s.next_buf_id += 1;
+                                let active = s.pane().active;
+                                s.pane_mut().tabs[active] = Tab::untitled(new_buf_id);
                             } else {
-                                let pane = s.panes.get_mut(&pane_id).unwrap();
-                                if pane.tabs.len() > 1 {
-                                    pane.tabs.remove(pane.active);
-                                    if pane.active >= pane.tabs.len() { pane.active = pane.tabs.len() - 1; }
-                                } else if s.panes.len() > 1 {
-                                    s.panes.remove(&pane_id);
-                                    let old_tree = std::mem::replace(&mut s.pane_tree, PaneTree::Leaf(0));
-                                    if let Some(new_tree) = remove_pane_from_tree(old_tree, pane_id) {
-                                        s.pane_tree = new_tree;
-                                    }
-                                    let new_active = layout_tree(&s.pane_tree, s.pane_area()).first().map(|(id, _)| *id).unwrap_or(0);
-                                    s.active_pane = new_active;
-                                } else {
-                                    el.exit();
-                                }
+                                el.exit();
                             }
                             true
                         } else if cmd && !shift && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "\\") {
@@ -2386,7 +2696,15 @@ impl ApplicationHandler<UserEvent> for App {
                                 }
                             }
                             true
-                        } else if cmd && shift && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "l") {
+                        } else if cmd && shift && matches!(&event.logical_key, Key::Character(c) if matches!(c.as_str(), "l" | "L")) {
+                            // If no selection, select word at primary cursor first.
+                            if !s.tab().primary().has_sel() {
+                                let pos = s.tab().primary().head;
+                                let (lo, hi) = word_bounds_at(s.tab(), pos);
+                                if lo < hi {
+                                    *s.tab_mut().primary_mut() = Cursor { head: hi, tail: lo };
+                                }
+                            }
                             if let Some(query) = s.tab().sel_text().filter(|t| !t.is_empty()) {
                                 let (cs, ww) = { let f = s.find(); (f.case_sensitive, f.whole_word) };
                                 let ms = find_matches(&s.tab().text, &query, cs, ww);
@@ -2429,10 +2747,14 @@ impl ApplicationHandler<UserEvent> for App {
                                     else              { s.move_right(shift); }
                                 }
                                 Key::Named(NamedKey::ArrowUp) => {
-                                    if cmd { s.move_doc_start(shift); } else { s.move_up(shift); }
+                                    if cmd && alt      { s.add_cursor_above(); }
+                                    else if cmd        { s.move_doc_start(shift); }
+                                    else               { s.move_up(shift); }
                                 }
                                 Key::Named(NamedKey::ArrowDown) => {
-                                    if cmd { s.move_doc_end(shift); } else { s.move_down(shift); }
+                                    if cmd && alt      { s.add_cursor_below(); }
+                                    else if cmd        { s.move_doc_end(shift); }
+                                    else               { s.move_down(shift); }
                                 }
                                 Key::Named(NamedKey::Home) => {
                                     if ctrl { s.move_doc_start(shift); } else { s.move_home(shift); }
@@ -2662,26 +2984,34 @@ fn render(s: &mut State) {
 
     // Build terminal pane snapshots
     struct TermPaneSnap {
-        rect:          Rect,
-        is_active:     bool,
-        visible_rows:  Vec<Vec<terminal::Cell>>,
-        cursor_col:    usize,
-        cursor_row:    usize,
+        id:             usize,
+        rect:           Rect,
+        is_active:      bool,
+        visible_rows:   Vec<Vec<terminal::Cell>>,
+        cursor_col:     usize,
+        cursor_row:     usize,
         cursor_visible: bool,
-        title:         String,
+        tabs:           Vec<String>,
+        active_tab:     usize,
     }
     let term_snaps: Vec<TermPaneSnap> = layout.iter().filter_map(|&(pid, rect)| {
         let pane = s.panes.get(&pid)?;
         if pane.kind != PaneKind::Terminal { return None; }
-        let tp = s.term_panes.get(&pid)?;
+        let active_tid = pane.term_ids.get(pane.active).copied()?;
+        let tp = s.term_panes.get(&active_tid)?;
+        let tabs: Vec<String> = pane.term_ids.iter()
+            .filter_map(|&tid| s.term_panes.get(&tid).map(|t| t.title.clone()))
+            .collect();
         Some(TermPaneSnap {
+            id: pid,
             rect,
             is_active: pid == active_pane_id,
             visible_rows: tp.grid.visible_rows(),
             cursor_col: tp.grid.cur_col,
             cursor_row: tp.grid.cur_row,
             cursor_visible,
-            title: tp.title.clone(),
+            tabs,
+            active_tab: pane.active,
         })
     }).collect();
 
@@ -2818,6 +3148,9 @@ fn render(s: &mut State) {
     // Drag snapshot
     let drag_snap: Option<(usize, Option<usize>, Option<DropZone>)> =
         s.drag.as_ref().map(|d| (d.source_pane, d.over_pane, d.zone));
+    let drag_src_is_terminal = s.drag.as_ref()
+        .and_then(|d| s.panes.get(&d.source_pane))
+        .map_or(false, |p| p.kind == PaneKind::Terminal);
 
     let show_hidden = s.explorer.as_ref().map_or(false, |ex| ex.show_hidden);
     let explorer_snap: Option<Vec<(String, bool, bool, usize, bool)>> =
@@ -2830,6 +3163,7 @@ fn render(s: &mut State) {
     let renderer_is_gpu = s.renderer.is_gpu();
     let vsync_on        = s.settings.vsync;
     let explorer_drag   = s.explorer_drag;
+    let ui_scale        = s.font_size / FONT_PX;
 
     let glyphs = &s.glyphs as *const Glyphs;
 
@@ -2885,7 +3219,10 @@ fn render(s: &mut State) {
                 let tab_bg   = if is_act { BG } else { BG2 };
                 fill(buf, w, h, tx, r.y, tw, tab_h - 1, tab_bg);
                 if is_act { fill(buf, w, h, tx, r.y + tab_h - 2, tw, 2, ACCENT); }
-                draw_str(buf, w, h, g, &label, tx, r.y + tab_h * 3 / 4, FG, (tx + tw).min(clip_r));
+                draw_str(buf, w, h, g, &label, tx, r.y + tab_h * 3 / 4, FG, (tx + tw - cw).min(clip_r));
+                // × close button (last character cell)
+                let x_col = if is_act { FG } else { FG_DIM };
+                draw_str(buf, w, h, g, "×", tx + tw - cw, r.y + tab_h * 3 / 4, x_col, (tx + tw).min(clip_r));
                 fill(buf, w, h, tx + tw, r.y, 1, tab_h, BORDER);
                 tx += tw + 1;
             }
@@ -2913,13 +3250,18 @@ fn render(s: &mut State) {
                 let vs_label = if vsync_on { " [x] On " } else { " [ ] Off" };
                 fill(buf, w, h, btn_x, vy, 8 * cw, lh, vs_bg);
                 draw_str(buf, w, h, g, vs_label, btn_x, vy + asc, vs_fg, btn_x + 8 * cw);
+                // UI Scale row
+                let sy = vy + lh + 4;
+                draw_str(buf, w, h, g, "  UI Scale", r.x, sy + asc, FG, btn_x - cw);
+                let scale_str = format!("  {:.0}%  (Cmd+= / Cmd+-)", ui_scale * 100.0);
+                draw_str(buf, w, h, g, &scale_str, btn_x, sy + asc, FG_DIM, r.x + r.w);
                 // Info row
                 let info = if renderer_is_gpu {
                     "  GPU (+~66 MB at 4K) — no tearing at any size"
                 } else {
                     "  CPU (no extra RAM) — coalesced + vsync-aligned"
                 };
-                draw_str(buf, w, h, g, info, r.x, vy + lh + 4 + asc, FG_DIM, r.x + r.w);
+                draw_str(buf, w, h, g, info, r.x, sy + lh + 4 + asc, FG_DIM, r.x + r.w);
                 continue;
             }
 
@@ -3108,7 +3450,20 @@ fn render(s: &mut State) {
             fill(buf, w, h, r.x, r.y, r.w, tab_h, BG2);
             fill(buf, w, h, r.x, r.y + tab_h - 1, r.w, 1, BORDER);
             if snap.is_active { fill(buf, w, h, r.x, r.y, 2, tab_h - 1, ACCENT); }
-            draw_str(buf, w, h, g, &format!(" {}", snap.title), r.x + 4, r.y + tab_h * 3 / 4, FG, r.x + r.w);
+            let mut tx = r.x;
+            for (i, title) in snap.tabs.iter().enumerate() {
+                let label  = format!(" {}  ", title);
+                let tw     = label.chars().count() as i32 * cw;
+                let is_act = i == snap.active_tab;
+                fill(buf, w, h, tx, r.y, tw, tab_h - 1, if is_act { BG } else { BG2 });
+                if is_act { fill(buf, w, h, tx, r.y + tab_h - 2, tw, 2, ACCENT); }
+                draw_str(buf, w, h, g, &label, tx, r.y + tab_h * 3 / 4, FG,
+                    (tx + tw - cw).min(r.x + r.w));
+                draw_str(buf, w, h, g, "×", tx + tw - cw, r.y + tab_h * 3 / 4,
+                    if is_act { FG } else { FG_DIM }, (tx + tw).min(r.x + r.w));
+                fill(buf, w, h, tx + tw, r.y, 1, tab_h, BORDER);
+                tx += tw + 1;
+            }
             // Grid rows
             for (vi, row) in snap.visible_rows.iter().enumerate() {
                 let py       = r.y + tab_h + vi as i32 * lh;
@@ -3181,8 +3536,14 @@ fn render(s: &mut State) {
 
         // ── Drag drop zone overlay ────────────────────────────────────────
         if let Some((_, Some(over_id), Some(zone))) = drag_snap {
-            if let Some(snap) = pane_snaps.iter().find(|p| p.id == over_id) {
-                let r  = snap.rect;
+            let target_rect = if drag_src_is_terminal {
+                term_snaps.iter().find(|t| t.id == over_id).map(|t| t.rect)
+                    .or_else(|| pane_snaps.iter().find(|p| p.id == over_id).map(|p| p.rect))
+            } else {
+                pane_snaps.iter().find(|p| p.id == over_id).map(|p| p.rect)
+                    .or_else(|| term_snaps.iter().find(|t| t.id == over_id).map(|t| t.rect))
+            };
+            if let Some(r) = target_rect {
                 let th = tab_h;
                 let zone_rect = match zone {
                     DropZone::Center => Rect { x: r.x + r.w/4,       y: r.y + th + (r.h-th)/4,       w: r.w/2,     h: (r.h-th)/2 },

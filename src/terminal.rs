@@ -308,6 +308,7 @@ pub struct TermPane {
     pub pty_fd:  i32,
     pub _reader: std::thread::JoinHandle<()>,
     pub title:   String,
+    pub shell:   String,
 }
 
 impl Drop for TermPane {
@@ -334,12 +335,22 @@ pub fn resize_pty(pane: &mut TermPane, cols: usize, rows: usize) {
     pane.grid.resize(cols, rows);
 }
 
-/// Fork a PTY, exec $SHELL in the child, and start a reader thread for the parent.
+/// Fork a PTY, exec $SHELL (or shell_override) in the child, and start a reader thread.
 #[cfg(unix)]
 pub fn spawn_terminal(pane_id: usize, cols: usize, rows: usize,
     proxy: EventLoopProxy<UserEvent>) -> TermPane {
+    spawn_terminal_with_shell(pane_id, cols, rows, proxy, None)
+}
+
+#[cfg(unix)]
+pub fn spawn_terminal_with_shell(pane_id: usize, cols: usize, rows: usize,
+    proxy: EventLoopProxy<UserEvent>, shell_override: Option<String>) -> TermPane {
     use std::env;
     use std::ptr;
+
+    let shell = shell_override
+        .or_else(|| env::var("SHELL").ok())
+        .unwrap_or_else(|| "/bin/sh".to_owned());
 
     let mut ws = libc::winsize {
         ws_col: cols as u16,
@@ -355,9 +366,7 @@ pub fn spawn_terminal(pane_id: usize, cols: usize, rows: usize,
     assert!(pid >= 0, "forkpty failed: {}", std::io::Error::last_os_error());
 
     if pid == 0 {
-        // Child process: set TERM and exec $SHELL
-        let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned());
-        let shell_c = CString::new(shell).unwrap();
+        let shell_c = CString::new(shell.as_str()).unwrap();
         unsafe {
             libc::setenv(
                 b"TERM\0".as_ptr().cast(),
@@ -390,6 +399,7 @@ pub fn spawn_terminal(pane_id: usize, cols: usize, rows: usize,
         pty_fd: master_fd,
         _reader: reader,
         title: "Terminal".to_owned(),
+        shell,
     }
 }
 
