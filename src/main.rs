@@ -2315,7 +2315,10 @@ impl ApplicationHandler<UserEvent> for App {
                 match pane_kind {
                     PaneKind::Terminal => {
                         if dy != 0 {
-                            let tp = s.term_panes.get_mut(&s.active_pane).unwrap();
+                            let tid = s.panes.get(&s.active_pane)
+                                .and_then(|p| p.term_ids.get(p.active).copied());
+                            let Some(tid) = tid else { return; };
+                            let tp = s.term_panes.get_mut(&tid).unwrap();
                             let sb = tp.grid.scrollback.len();
                             if dy < 0 {
                                 tp.grid.scroll_offset = (tp.grid.scroll_offset + (-dy) as usize).min(sb);
