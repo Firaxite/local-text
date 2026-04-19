@@ -719,12 +719,56 @@ struct State {
     mouse_y:    f32,
     mouse_down:       bool,
     term_buttons_held: u8,  // bitmask: bit0=left, bit1=mid, bit2=right
+    term_sel:    Option<TermSel>,  // text selection in the active terminal
+    term_selecting: bool,          // true while left-drag selecting in terminal
     last_click_time: Instant,
     last_click_char: usize,
     click_count:     u32,
 
     settings:     settings::Settings,
     needs_redraw: bool,
+}
+
+#[derive(Clone)]
+struct TermSel {
+    start_vi:  usize,  // visual row in visible_rows()
+    start_col: usize,
+    end_vi:    usize,
+    end_col:   usize,
+}
+
+impl TermSel {
+    /// Normalize so start <= end in reading order.
+    fn normalized(&self) -> (usize, usize, usize, usize) {
+        let (r0, c0, r1, c1) = (self.start_vi, self.start_col, self.end_vi, self.end_col);
+        if r0 < r1 || (r0 == r1 && c0 <= c1) { (r0, c0, r1, c1) } else { (r1, c1, r0, c0) }
+    }
+    fn contains(&self, vi: usize, col: usize) -> bool {
+        let (r0, c0, r1, c1) = self.normalized();
+        if vi < r0 || vi > r1 { return false; }
+        if vi == r0 && col < c0 { return false; }
+        if vi == r1 && col > c1 { return false; }
+        true
+    }
+    fn is_empty(&self) -> bool {
+        self.start_vi == self.end_vi && self.start_col == self.end_col
+    }
+}
+
+fn clipboard_write(text: &str) {
+    use std::io::Write;
+    if let Ok(mut child) = std::process::Command::new("pbcopy")
+        .stdin(std::process::Stdio::piped()).spawn()
+    {
+        if let Some(stdin) = child.stdin.as_mut() { let _ = stdin.write_all(text.as_bytes()); }
+        let _ = child.wait();
+    }
+}
+
+fn clipboard_read() -> String {
+    std::process::Command::new("pbpaste").output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default()
 }
 
 impl State {
@@ -1890,6 +1934,8 @@ impl ApplicationHandler<UserEvent> for App {
             mouse_y:    0.0,
             mouse_down:       false,
             term_buttons_held: 0,
+            term_sel:        None,
+            term_selecting:  false,
             last_click_time: Instant::now() - Duration::from_secs(1),
             last_click_char: usize::MAX,
             click_count:     0,
@@ -2010,13 +2056,33 @@ impl ApplicationHandler<UserEvent> for App {
                     s.ensure_visible();
                     { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                 }
-                // Terminal mouse motion reporting
+                // Terminal mouse motion: selection drag + mouse reporting
                 {
                     let pane_id = s.active_pane;
                     if s.panes.get(&pane_id).map_or(false, |p| p.kind == PaneKind::Terminal) {
                         let tid = s.panes[&pane_id].term_ids.get(s.panes[&pane_id].active).copied();
                         if let Some(tid) = tid {
                             if let Some(tp) = s.term_panes.get(&tid) {
+                                // Selection drag
+                                if s.term_selecting {
+                                    let area = s.pane_area();
+                                    let pane_rect = layout_tree(&s.pane_tree, area).into_iter()
+                                        .find(|(id, _)| *id == pane_id).map(|(_, r)| r).unwrap_or(area);
+                                    let tab_h = s.tab_h();
+                                    let content_y = pane_rect.y + tab_h;
+                                    let cw = s.glyphs.cw;
+                                    let lh = s.glyphs.lh;
+                                    let term_col = ((mx - pane_rect.x) / cw)
+                                        .clamp(0, tp.grid.cols as i32 - 1) as usize;
+                                    let term_row = ((my - content_y) / lh)
+                                        .clamp(0, tp.grid.rows as i32 - 1) as usize;
+                                    if let Some(ref mut sel) = s.term_sel {
+                                        sel.end_vi  = term_row;
+                                        sel.end_col = term_col;
+                                    }
+                                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                                }
+
                                 let should_report = match tp.grid.mouse_report {
                                     terminal::MouseReportMode::AnyEvent    => true,
                                     terminal::MouseReportMode::ButtonEvent => s.term_buttons_held != 0,
@@ -2066,6 +2132,7 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
                 s.mouse_down = false;
+                s.term_selecting = false;
                 s.drag_pending = None;
                 if let Some(drag) = s.drag.take() {
                     perform_drop(s, drag);
@@ -2269,27 +2336,35 @@ impl ApplicationHandler<UserEvent> for App {
                 if s.panes[&clicked_pane_id].kind == PaneKind::Terminal {
                     let content_y = pane_rect.y + tab_h;
                     if my >= content_y {
+                        let cw = s.glyphs.cw;
+                        let lh = s.glyphs.lh;
                         let tid = s.panes[&clicked_pane_id].term_ids
                             .get(s.panes[&clicked_pane_id].active).copied();
                         if let Some(tid) = tid {
                             if let Some(tp) = s.term_panes.get(&tid) {
-                                if tp.grid.mouse_report != terminal::MouseReportMode::None {
-                                    let cw = s.glyphs.cw;
-                                    let lh = s.glyphs.lh;
-                                    let term_col = ((mx - pane_rect.x) / cw)
-                                        .clamp(0, tp.grid.cols as i32 - 1) as usize;
-                                    let term_row = ((my - content_y) / lh)
-                                        .clamp(0, tp.grid.rows as i32 - 1) as usize;
+                                let term_col = ((mx - pane_rect.x) / cw)
+                                    .clamp(0, tp.grid.cols as i32 - 1) as usize;
+                                let term_row = ((my - content_y) / lh)
+                                    .clamp(0, tp.grid.rows as i32 - 1) as usize;
+                                let mouse_capture = tp.grid.mouse_report != terminal::MouseReportMode::None;
+                                if mouse_capture && !s.mods.shift_key() {
+                                    // Forward to PTY
                                     let mut mod_bits: u8 = 0;
                                     if s.mods.shift_key()   { mod_bits |= 4; }
                                     if s.mods.alt_key()     { mod_bits |= 8; }
                                     if s.mods.control_key() { mod_bits |= 16; }
-                                    let cb = mod_bits; // left button = 0
                                     let sgr = tp.grid.mouse_sgr;
                                     let pty_fd = tp.pty_fd;
-                                    let bytes = terminal::encode_mouse(term_col, term_row, cb, true, sgr);
+                                    let bytes = terminal::encode_mouse(term_col, term_row, mod_bits, true, sgr);
                                     unsafe { libc::write(pty_fd, bytes.as_ptr().cast(), bytes.len()); }
                                     s.term_buttons_held |= 1;
+                                } else {
+                                    // Start text selection
+                                    s.term_sel = Some(TermSel {
+                                        start_vi: term_row, start_col: term_col,
+                                        end_vi:   term_row, end_col:   term_col,
+                                    });
+                                    s.term_selecting = true;
                                 }
                             }
                         }
@@ -2470,6 +2545,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 } else {
                                     tp.grid.scroll_offset = tp.grid.scroll_offset.saturating_sub(dy as usize);
                                 }
+                                s.term_sel = None; // selection positions are visual-row relative
                             }
                             { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                         }
@@ -2567,6 +2643,52 @@ impl ApplicationHandler<UserEvent> for App {
                         s.pane_tree = insert_pane(old_tree, cur, pane_id, DropZone::Bottom);
                         s.active_pane = pane_id;
                         { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                        return;
+                    }
+                    // Cmd+C — copy terminal selection
+                    if cmd && matches!(&event.logical_key, Key::Character(c) if matches!(c.as_str(), "c" | "C")) {
+                        if let Some(sel) = s.term_sel.clone() {
+                            if !sel.is_empty() {
+                                let pane_id = s.active_pane;
+                                let tid = s.panes[&pane_id].term_ids.get(s.panes[&pane_id].active).copied();
+                                if let Some(tid) = tid {
+                                    if let Some(tp) = s.term_panes.get(&tid) {
+                                        let rows = tp.grid.visible_rows();
+                                        let mut text = String::new();
+                                        let (r0, c0, r1, c1) = sel.normalized();
+                                        for vi in r0..=r1 {
+                                            if vi >= rows.len() { break; }
+                                            let row = &rows[vi];
+                                            let col_start = if vi == r0 { c0 } else { 0 };
+                                            let col_end   = if vi == r1 { c1 + 1 } else { row.len() };
+                                            let col_end   = col_end.min(row.len());
+                                            // Trim trailing spaces from non-last rows
+                                            let slice: String = row[col_start..col_end].iter()
+                                                .map(|c| c.ch).collect();
+                                            let trimmed = if vi < r1 { slice.trim_end().to_owned() } else { slice };
+                                            text.push_str(&trimmed);
+                                            if vi < r1 { text.push('\n'); }
+                                        }
+                                        clipboard_write(&text);
+                                    }
+                                }
+                                return;
+                            }
+                        }
+                        // No selection: fall through to PTY (send Ctrl+C if not in selection mode)
+                    }
+                    // Cmd+V — paste from clipboard
+                    if cmd && matches!(&event.logical_key, Key::Character(c) if matches!(c.as_str(), "v" | "V")) {
+                        let text = clipboard_read();
+                        if !text.is_empty() {
+                            let p = &s.panes[&s.active_pane];
+                            if let Some(&tid) = p.term_ids.get(p.active) {
+                                if let Some(tp) = s.term_panes.get(&tid) {
+                                    let bytes = text.as_bytes();
+                                    unsafe { libc::write(tp.pty_fd, bytes.as_ptr().cast(), bytes.len()); }
+                                }
+                            }
+                        }
                         return;
                     }
                     // Forward all other key events to the active PTY
@@ -3132,6 +3254,7 @@ fn render(s: &mut State) {
     let active_pane_id = s.active_pane;
 
     // Build terminal pane snapshots
+    let active_term_sel = s.term_sel.clone();
     struct TermPaneSnap {
         id:             usize,
         rect:           Rect,
@@ -3142,6 +3265,7 @@ fn render(s: &mut State) {
         cursor_visible: bool,
         tabs:           Vec<String>,
         active_tab:     usize,
+        sel:            Option<TermSel>,
     }
     let term_snaps: Vec<TermPaneSnap> = layout.iter().filter_map(|&(pid, rect)| {
         let pane = s.panes.get(&pid)?;
@@ -3151,6 +3275,8 @@ fn render(s: &mut State) {
         let tabs: Vec<String> = pane.term_ids.iter()
             .filter_map(|&tid| s.term_panes.get(&tid).map(|t| t.title.clone()))
             .collect();
+        // Hide cursor when scrolled into history
+        let cur_vis = cursor_visible && tp.grid.scroll_offset == 0;
         Some(TermPaneSnap {
             id: pid,
             rect,
@@ -3158,9 +3284,10 @@ fn render(s: &mut State) {
             visible_rows: tp.grid.visible_rows(),
             cursor_col: tp.grid.cur_col,
             cursor_row: tp.grid.cur_row,
-            cursor_visible,
+            cursor_visible: cur_vis,
             tabs,
             active_tab: pane.active,
+            sel: if pid == active_pane_id { active_term_sel.clone() } else { None },
         })
     }).collect();
 
@@ -3620,7 +3747,9 @@ fn render(s: &mut State) {
                 for (ci, cell) in row.iter().enumerate() {
                     let cx = r.x + ci as i32 * cw;
                     if cx >= r.x + r.w { break; }
-                    if cell.bg != BG { fill(buf, w, h, cx, py, cw, lh, cell.bg); }
+                    let in_sel = snap.sel.as_ref().map_or(false, |s| s.contains(vi, ci));
+                    let bg = if in_sel { SEL_BG } else { cell.bg };
+                    if bg != BG { fill(buf, w, h, cx, py, cw, lh, bg); }
                     if cell.ch != ' ' {
                         if let Some((m, bmap)) = g.get(cell.ch) {
                             blit(buf, w, h, bmap, m, cx, baseline, cell.fg);

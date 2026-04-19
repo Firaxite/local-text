@@ -78,28 +78,62 @@ pub struct TermGrid {
     pub cur_visible: bool,
     pub mouse_report: MouseReportMode,
     pub mouse_sgr:    bool,
+    /// DECSTBM scrolling region (0-based, inclusive).
+    pub scroll_top: usize,
+    pub scroll_bot: usize,
+    /// Alternate screen state (?1047/?1049).
+    pub alt_cells:   Option<Vec<Cell>>,
+    pub alt_cur_col: usize,
+    pub alt_cur_row: usize,
+    pub alt_scroll_top: usize,
+    pub alt_scroll_bot: usize,
+    /// Saved cursor position (\x1b7 / \x1b[s).
+    pub saved_cur_col: usize,
+    pub saved_cur_row: usize,
 }
 
 impl TermGrid {
     pub fn new(cols: usize, rows: usize) -> Self {
         let cells = vec![Cell::default(); cols * rows];
-        TermGrid { cols, rows, cells, cur_col: 0, cur_row: 0, scrollback: Vec::new(),
-                   scroll_offset: 0, cur_fg: DEFAULT_FG, cur_bg: DEFAULT_BG,
-                   cur_bold: false, cur_visible: true,
-                   mouse_report: MouseReportMode::None, mouse_sgr: false }
+        let rows_m1 = rows.saturating_sub(1);
+        TermGrid {
+            cols, rows, cells, cur_col: 0, cur_row: 0,
+            scrollback: Vec::new(), scroll_offset: 0,
+            cur_fg: DEFAULT_FG, cur_bg: DEFAULT_BG, cur_bold: false, cur_visible: true,
+            mouse_report: MouseReportMode::None, mouse_sgr: false,
+            scroll_top: 0, scroll_bot: rows_m1,
+            alt_cells: None, alt_cur_col: 0, alt_cur_row: 0,
+            alt_scroll_top: 0, alt_scroll_bot: rows_m1,
+            saved_cur_col: 0, saved_cur_row: 0,
+        }
     }
 
-    fn cell(&self, row: usize, col: usize) -> &Cell { &self.cells[row * self.cols + col] }
     fn cell_mut(&mut self, row: usize, col: usize) -> &mut Cell { &mut self.cells[row * self.cols + col] }
 
-    /// Scroll the active screen up by one line; oldest line moves to scrollback.
+    /// Scroll the scroll region up by one line. Only adds to scrollback when region is full-screen.
     fn scroll_up(&mut self) {
-        let row: Vec<Cell> = self.cells[0..self.cols].to_vec();
-        if self.scrollback.len() >= 1000 { self.scrollback.remove(0); }
-        self.scrollback.push(row);
-        self.cells.copy_within(self.cols.., 0);
-        let last_row_start = (self.rows - 1) * self.cols;
-        for c in &mut self.cells[last_row_start..] { *c = Cell::default(); }
+        if self.scroll_top == 0 && self.scroll_bot == self.rows - 1 {
+            let row: Vec<Cell> = self.cells[0..self.cols].to_vec();
+            if self.scrollback.len() >= 1000 { self.scrollback.remove(0); }
+            self.scrollback.push(row);
+        }
+        let top = self.scroll_top * self.cols;
+        let bot = (self.scroll_bot + 1) * self.cols;
+        if bot > top + self.cols {
+            self.cells.copy_within(top + self.cols..bot, top);
+        }
+        let last = self.scroll_bot * self.cols;
+        for c in &mut self.cells[last..last + self.cols] { *c = Cell::default(); }
+    }
+
+    /// Scroll the scroll region down by one line (for insert-line / reverse-index).
+    fn scroll_down(&mut self) {
+        let top = self.scroll_top * self.cols;
+        let bot = (self.scroll_bot + 1) * self.cols;
+        if bot > top + self.cols {
+            self.cells.copy_within(top..bot - self.cols, top + self.cols);
+        }
+        for c in &mut self.cells[top..top + self.cols] { *c = Cell::default(); }
     }
 
     pub fn resize(&mut self, new_cols: usize, new_rows: usize) {
@@ -109,7 +143,7 @@ impl TermGrid {
         let copy_cols = self.cols.min(new_cols);
         for r in 0..copy_rows {
             for c in 0..copy_cols {
-                new_cells[r * new_cols + c] = self.cells[r * self.cols + c].clone();
+                new_cells[r * new_cols + c] = self.cells[r * self.cols + c];
             }
         }
         self.cells = new_cells;
@@ -117,10 +151,12 @@ impl TermGrid {
         self.rows = new_rows;
         self.cur_row = self.cur_row.min(new_rows.saturating_sub(1));
         self.cur_col = self.cur_col.min(new_cols.saturating_sub(1));
+        self.scroll_top = 0;
+        self.scroll_bot = new_rows.saturating_sub(1);
+        self.alt_cells = None; // discard alt screen on resize
     }
 
     /// Return the visible rows accounting for scroll_offset.
-    /// Returns (scrollback rows...) + (live screen rows...) sliced to `rows` total.
     pub fn visible_rows(&self) -> Vec<Vec<Cell>> {
         let offset = self.scroll_offset;
         if offset == 0 {
@@ -130,12 +166,12 @@ impl TermGrid {
             let start = sb_len.saturating_sub(offset);
             let mut result: Vec<Vec<Cell>> = Vec::with_capacity(self.rows);
             for i in start..sb_len {
-                result.push(self.scrollback[i].clone());
                 if result.len() == self.rows { return result; }
+                result.push(self.scrollback[i].clone());
             }
             for r in 0..self.rows {
-                result.push(self.cells[r*self.cols..(r+1)*self.cols].to_vec());
                 if result.len() == self.rows { return result; }
+                result.push(self.cells[r*self.cols..(r+1)*self.cols].to_vec());
             }
             result
         }
@@ -150,8 +186,14 @@ struct VteHandler<'a> {
 impl<'a> Perform for VteHandler<'a> {
     fn print(&mut self, c: char) {
         let g = &mut *self.grid;
-        if g.cur_col >= g.cols { g.cur_col = 0; g.cur_row += 1; }
-        if g.cur_row >= g.rows { g.scroll_up(); g.cur_row = g.rows - 1; }
+        if g.cur_col >= g.cols {
+            g.cur_col = 0;
+            if g.cur_row == g.scroll_bot {
+                g.scroll_up();
+            } else {
+                g.cur_row = (g.cur_row + 1).min(g.rows - 1);
+            }
+        }
         let (r, co) = (g.cur_row, g.cur_col);
         let (fg, bg, bold) = (g.cur_fg, g.cur_bg, g.cur_bold);
         let cell = g.cell_mut(r, co);
@@ -167,8 +209,11 @@ impl<'a> Perform for VteHandler<'a> {
         match byte {
             b'\r' => { g.cur_col = 0; }
             b'\n' => {
-                g.cur_row += 1;
-                if g.cur_row >= g.rows { g.scroll_up(); g.cur_row = g.rows - 1; }
+                if g.cur_row == g.scroll_bot {
+                    g.scroll_up();
+                } else {
+                    g.cur_row = (g.cur_row + 1).min(g.rows - 1);
+                }
             }
             0x08 => { // backspace
                 if g.cur_col > 0 { g.cur_col -= 1; }
@@ -276,10 +321,32 @@ impl<'a> Perform for VteHandler<'a> {
                 if intermediates.first() == Some(&0x3F) {
                     for &p in ps.iter() {
                         match p {
+                            25   => g.cur_visible = enable,
                             1000 => g.mouse_report = if enable { MouseReportMode::X10 } else { MouseReportMode::None },
                             1002 => g.mouse_report = if enable { MouseReportMode::ButtonEvent } else { MouseReportMode::None },
                             1003 => g.mouse_report = if enable { MouseReportMode::AnyEvent } else { MouseReportMode::None },
                             1006 => g.mouse_sgr = enable,
+                            47 | 1047 | 1049 => {
+                                if enable {
+                                    if g.alt_cells.is_none() {
+                                        g.alt_cells = Some(g.cells.clone());
+                                        g.alt_cur_col = g.cur_col;
+                                        g.alt_cur_row = g.cur_row;
+                                        g.alt_scroll_top = g.scroll_top;
+                                        g.alt_scroll_bot = g.scroll_bot;
+                                        for c in g.cells.iter_mut() { *c = Cell::default(); }
+                                        g.cur_col = 0; g.cur_row = 0;
+                                        g.scroll_top = 0;
+                                        g.scroll_bot = g.rows.saturating_sub(1);
+                                    }
+                                } else if let Some(saved) = g.alt_cells.take() {
+                                    g.cells = saved;
+                                    g.cur_col = g.alt_cur_col;
+                                    g.cur_row = g.alt_cur_row;
+                                    g.scroll_top = g.alt_scroll_top;
+                                    g.scroll_bot = g.alt_scroll_bot;
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -288,21 +355,109 @@ impl<'a> Perform for VteHandler<'a> {
             // Column/line position
             'G' => { g.cur_col = p0.saturating_sub(1).min(g.cols - 1); }
             'd' => { g.cur_row = p0.saturating_sub(1).min(g.rows - 1); }
-            // Scroll up/down
+            // Scroll up / down N lines within scroll region
             'S' => { let n = p0.max(1); for _ in 0..n { g.scroll_up(); } }
+            'T' => { let n = p0.max(1); for _ in 0..n { g.scroll_down(); } }
+            // DECSTBM — set scrolling region
+            'r' => {
+                let top = p0.saturating_sub(1).min(g.rows - 1);
+                let bot = if p1 == 0 { g.rows - 1 } else { (p1 - 1).min(g.rows - 1) };
+                if top < bot {
+                    g.scroll_top = top;
+                    g.scroll_bot = bot;
+                } else {
+                    g.scroll_top = 0;
+                    g.scroll_bot = g.rows.saturating_sub(1);
+                }
+                g.cur_row = 0; g.cur_col = 0;
+            }
+            // Insert / delete lines at cursor
+            'L' => {
+                let n = p0.max(1).min(g.scroll_bot.saturating_sub(g.cur_row) + 1);
+                let src_end = g.scroll_bot.saturating_sub(n - 1) * g.cols;
+                let dst_start = (g.cur_row + n) * g.cols;
+                let src_start = g.cur_row * g.cols;
+                if src_end > src_start {
+                    g.cells.copy_within(src_start..src_end, dst_start);
+                }
+                for r in g.cur_row..g.cur_row + n {
+                    let s = r * g.cols;
+                    for c in &mut g.cells[s..s + g.cols] { *c = Cell::default(); }
+                }
+            }
+            'M' => {
+                let n = p0.max(1).min(g.scroll_bot.saturating_sub(g.cur_row) + 1);
+                let src_start = (g.cur_row + n) * g.cols;
+                let src_end = (g.scroll_bot + 1) * g.cols;
+                let dst_start = g.cur_row * g.cols;
+                if src_end > src_start {
+                    g.cells.copy_within(src_start..src_end, dst_start);
+                }
+                let clear_start = (g.scroll_bot + 1 - n) * g.cols;
+                let clear_end = (g.scroll_bot + 1) * g.cols;
+                for c in &mut g.cells[clear_start..clear_end] { *c = Cell::default(); }
+            }
+            // Delete / erase / insert characters in current line
+            'P' => {
+                let n = p0.max(1).min(g.cols.saturating_sub(g.cur_col));
+                let row = g.cur_row * g.cols;
+                let src = row + g.cur_col + n;
+                if src < row + g.cols {
+                    g.cells.copy_within(src..row + g.cols, row + g.cur_col);
+                }
+                let clear = row + g.cols - n;
+                for c in &mut g.cells[clear..row + g.cols] { *c = Cell::default(); }
+            }
+            'X' => {
+                let n = p0.max(1).min(g.cols.saturating_sub(g.cur_col));
+                let start = g.cur_row * g.cols + g.cur_col;
+                for c in &mut g.cells[start..start + n] { *c = Cell::default(); }
+            }
+            '@' => {
+                let n = p0.max(1).min(g.cols.saturating_sub(g.cur_col));
+                let row = g.cur_row * g.cols;
+                let src_end = row + g.cols - n;
+                if src_end > row + g.cur_col {
+                    g.cells.copy_within(row + g.cur_col..src_end, row + g.cur_col + n);
+                }
+                for c in &mut g.cells[row + g.cur_col..row + g.cur_col + n] { *c = Cell::default(); }
+            }
+            // Cursor save / restore
+            's' => { g.saved_cur_col = g.cur_col; g.saved_cur_row = g.cur_row; }
+            'u' => {
+                g.cur_col = g.saved_cur_col.min(g.cols.saturating_sub(1));
+                g.cur_row = g.saved_cur_row.min(g.rows.saturating_sub(1));
+            }
             _ => {}
         }
     }
 
     fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
-        // OSC 0;title ST or OSC 2;title ST — handled by TermPane.title via feed_bytes
-        let _ = params; // will be handled at TermPane level
+        let _ = params;
     }
 
     fn hook(&mut self, _params: &vte::Params, _intermediates: &[u8], _ignore: bool, _action: char) {}
     fn put(&mut self, _byte: u8) {}
     fn unhook(&mut self) {}
-    fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, _byte: u8) {}
+
+    fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, byte: u8) {
+        let g = &mut *self.grid;
+        match byte {
+            b'7' => { g.saved_cur_col = g.cur_col; g.saved_cur_row = g.cur_row; }
+            b'8' => {
+                g.cur_col = g.saved_cur_col.min(g.cols.saturating_sub(1));
+                g.cur_row = g.saved_cur_row.min(g.rows.saturating_sub(1));
+            }
+            b'M' => { // reverse index — scroll down if at top of scroll region
+                if g.cur_row == g.scroll_top {
+                    g.scroll_down();
+                } else if g.cur_row > 0 {
+                    g.cur_row -= 1;
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn rgb(r: u8, g: u8, b: u8) -> u32 { ((r as u32) << 16) | ((g as u32) << 8) | b as u32 }
