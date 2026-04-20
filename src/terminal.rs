@@ -592,7 +592,9 @@ pub fn encode_key(key: &Key, mods: ModifiersState, text: Option<&str>) -> Option
         Key::Named(NamedKey::Enter)      => Some(b"\r".to_vec()),
         Key::Named(NamedKey::Backspace)  => Some(b"\x7f".to_vec()),
         Key::Named(NamedKey::Escape)     => Some(b"\x1b".to_vec()),
-        Key::Named(NamedKey::Tab)        => Some(b"\t".to_vec()),
+        Key::Named(NamedKey::Tab)        => {
+            if mods.shift_key() { Some(b"\x1b[Z".to_vec()) } else { Some(b"\t".to_vec()) }
+        }
         Key::Named(NamedKey::ArrowUp)    => Some(b"\x1b[A".to_vec()),
         Key::Named(NamedKey::ArrowDown)  => Some(b"\x1b[B".to_vec()),
         Key::Named(NamedKey::ArrowRight) => Some(b"\x1b[C".to_vec()),

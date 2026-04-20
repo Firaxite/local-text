@@ -2639,6 +2639,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 .map(|p| p.term_ids.clone()).unwrap_or_default();
                             for tid in tids { s.term_panes.remove(&tid); }
                             s.panes.remove(&pane_id);
+                            if s.panes.is_empty() { el.exit(); return; }
                             let old_tree = std::mem::replace(&mut s.pane_tree, PaneTree::Leaf(0));
                             if let Some(t) = remove_pane_from_tree(old_tree, pane_id) { s.pane_tree = t; }
                             let new_active = layout_tree(&s.pane_tree, s.pane_area())
@@ -2888,11 +2889,6 @@ impl ApplicationHandler<UserEvent> for App {
                                 let new_active = layout_tree(&s.pane_tree, s.pane_area())
                                     .first().map(|(id, _)| *id).unwrap_or(0);
                                 s.active_pane = new_active;
-                            } else if s.explorer.is_some() {
-                                // Directory open: reset to empty tab rather than exiting
-                                let new_buf_id = s.next_buf_id; s.next_buf_id += 1;
-                                let active = s.pane().active;
-                                s.pane_mut().tabs[active] = Tab::untitled(new_buf_id);
                             } else {
                                 el.exit();
                             }
