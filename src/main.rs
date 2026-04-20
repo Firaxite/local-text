@@ -111,6 +111,7 @@ impl Glyphs {
         let paths = [
             "/System/Library/Fonts/Apple Symbols.ttf",
             "/System/Library/Fonts/Symbol.ttf",
+            "/System/Library/Fonts/Supplemental/STIXTwoMath.otf",
         ];
         paths.iter().filter_map(|p| {
             std::fs::read(p).ok()
