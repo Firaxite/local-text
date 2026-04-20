@@ -89,9 +89,10 @@ const SB_THUMB:   u32 = 0x414868;
 
 // ── Glyph cache ───────────────────────────────────────────────────────────────
 struct Glyphs {
-    font: Font,
-    px:   f32,
-    map:  HashMap<char, (Metrics, Vec<u8>)>,
+    font:      Font,
+    fallbacks: Vec<Font>,
+    px:        f32,
+    map:       HashMap<char, (Metrics, Vec<u8>)>,
     pub cw: i32,
     pub lh: i32,
     pub asc: i32,
@@ -100,9 +101,21 @@ struct Glyphs {
 impl Glyphs {
     fn new(bytes: &[u8], px: f32) -> Self {
         let font = Font::from_bytes(bytes, FontSettings::default()).unwrap();
-        let mut s = Self { font, px, map: HashMap::new(), cw: 0, lh: 0, asc: 0 };
+        let fallbacks = Self::load_fallbacks();
+        let mut s = Self { font, fallbacks, px, map: HashMap::new(), cw: 0, lh: 0, asc: 0 };
         s.rebuild_cache(px);
         s
+    }
+
+    fn load_fallbacks() -> Vec<Font> {
+        let paths = [
+            "/System/Library/Fonts/Apple Symbols.ttf",
+            "/System/Library/Fonts/Symbol.ttf",
+        ];
+        paths.iter().filter_map(|p| {
+            std::fs::read(p).ok()
+                .and_then(|b| Font::from_bytes(b, FontSettings::default()).ok())
+        }).collect()
     }
 
     fn resize(&mut self, px: f32) {
@@ -121,7 +134,22 @@ impl Glyphs {
     }
 
     fn load(&mut self, ch: char) {
-        self.map.entry(ch).or_insert_with(|| self.font.rasterize(ch, self.px));
+        if self.map.contains_key(&ch) { return; }
+        // Try primary font first
+        if self.font.lookup_glyph_index(ch) != 0 {
+            let (m, b) = self.font.rasterize(ch, self.px);
+            self.map.insert(ch, (m, b));
+            return;
+        }
+        // Try fallback fonts for characters not in primary
+        for fb in &self.fallbacks {
+            if fb.lookup_glyph_index(ch) != 0 {
+                let (m, b) = fb.rasterize(ch, self.px);
+                self.map.insert(ch, (m, b));
+                return;
+            }
+        }
+        // Character not found in any font — leave absent so render skips it
     }
 
     fn get(&self, ch: char) -> Option<(&Metrics, &[u8])> {
@@ -3290,6 +3318,17 @@ fn render(s: &mut State) {
             sel: if pid == active_pane_id { active_term_sel.clone() } else { None },
         })
     }).collect();
+
+    // Preload glyphs for all visible terminal characters before entering render closure
+    for snap in &term_snaps {
+        for row in &snap.visible_rows {
+            for cell in row {
+                if cell.ch > ' ' {
+                    s.glyphs.load(cell.ch);
+                }
+            }
+        }
+    }
 
     // Build LSP output pane snapshots
     struct OutPaneSnap {
