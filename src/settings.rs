@@ -10,18 +10,23 @@ pub enum RendererBackend { Cpu, Gpu }
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Settings {
-    pub renderer:  RendererBackend,
-    pub vsync:     bool,
+    pub renderer:         RendererBackend,
+    pub vsync:            bool,
     #[serde(default = "Settings::default_font_size")]
-    pub font_size: f32,
+    pub font_size:        f32,
+    #[serde(default)]
+    pub rainbow_brackets: bool,
+    #[serde(default = "Settings::default_undo_limit")]
+    pub undo_limit:       Option<usize>,
 }
 
 impl Default for Settings {
-    fn default() -> Self { Settings { renderer: RendererBackend::Cpu, vsync: true, font_size: Self::default_font_size() } }
+    fn default() -> Self { Settings { renderer: RendererBackend::Cpu, vsync: true, font_size: Self::default_font_size(), rainbow_brackets: false, undo_limit: Self::default_undo_limit() } }
 }
 
 impl Settings {
     pub fn default_font_size() -> f32 { 14.0 }
+    pub fn default_undo_limit() -> Option<usize> { Some(200) }
 
     fn config_path() -> Option<PathBuf> {
         let home = std::env::var("HOME").ok()?;

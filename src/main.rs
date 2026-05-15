@@ -56,6 +56,9 @@ const HL_FUNC:    u32 = 0x7AA2F7;
 const HL_MATCH:        u32 = 0x3D3557; // subtle purple — inactive find matches
 const HL_MATCH_ACTIVE: u32 = 0x524175; // brighter purple — active match
 
+// ── Rainbow bracket colors (depth-cycled) ────────────────────────────────────
+const RAINBOW: [u32; 6] = [0xFF79C6, 0xFFB86C, 0xF1FA8C, 0x50FA7B, 0x8BE9FD, 0xBD93F9];
+
 // ── Language detection ────────────────────────────────────────────────────────
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Lang { None, Rust, Python, TypeScript }
@@ -131,7 +134,7 @@ impl Glyphs {
         self.lh  = (px * 1.5).ceil() as i32;
         self.asc = (px * 1.1).ceil() as i32;
         for ch in ' '..='~' { self.load(ch); }
-        for ch in ['▶', '▼', '•', '×'] { self.load(ch); }
+        for ch in ['▶', '▼', '•', '×', '⚙'] { self.load(ch); }
     }
 
     fn load(&mut self, ch: char) {
@@ -210,6 +213,81 @@ impl FindBar {
     }
 }
 
+// ── Left panel / activity bar ─────────────────────────────────────────────────
+#[derive(Clone, Copy, PartialEq)]
+enum LeftView { FileTree, GlobalSearch }
+
+struct ContextMenu {
+    x:       i32,
+    y:       i32,
+    items:   Vec<&'static str>,
+    hovered: usize,
+}
+
+// ── Quick file finder ─────────────────────────────────────────────────────────
+struct QuickFinder {
+    open:     bool,
+    query:    String,
+    entries:  Vec<std::path::PathBuf>,
+    filtered: Vec<usize>,
+    selected: usize,
+}
+
+// ── Command palette ───────────────────────────────────────────────────────────
+#[derive(Clone, Copy)]
+enum CommandAction {
+    Save, CloseTab, SplitRight, SplitDown, OpenTerminal, GoToSettings,
+    ToggleFind, ToggleReplace, ToggleExplorer, IncreaseFontSize, DecreaseFontSize,
+}
+
+struct CommandEntry { name: &'static str, shortcut: &'static str, action: CommandAction }
+
+const COMMANDS: &[CommandEntry] = &[
+    CommandEntry { name: "Save File",             shortcut: "Cmd+S",         action: CommandAction::Save },
+    CommandEntry { name: "Close Tab",             shortcut: "Cmd+W",         action: CommandAction::CloseTab },
+    CommandEntry { name: "Open Settings",         shortcut: "Cmd+,",         action: CommandAction::GoToSettings },
+    CommandEntry { name: "Open Terminal",         shortcut: "Ctrl+`",        action: CommandAction::OpenTerminal },
+    CommandEntry { name: "Split Right",           shortcut: "",              action: CommandAction::SplitRight },
+    CommandEntry { name: "Split Down",            shortcut: "",              action: CommandAction::SplitDown },
+    CommandEntry { name: "Toggle Find",           shortcut: "Cmd+F",         action: CommandAction::ToggleFind },
+    CommandEntry { name: "Toggle Find+Replace",   shortcut: "Cmd+H",         action: CommandAction::ToggleReplace },
+    CommandEntry { name: "Toggle File Explorer",  shortcut: "",              action: CommandAction::ToggleExplorer },
+    CommandEntry { name: "Increase Font Size",    shortcut: "Cmd+=",         action: CommandAction::IncreaseFontSize },
+    CommandEntry { name: "Decrease Font Size",    shortcut: "Cmd+-",         action: CommandAction::DecreaseFontSize },
+];
+
+struct CommandPalette {
+    open:     bool,
+    query:    String,
+    filtered: Vec<usize>,
+    selected: usize,
+}
+
+// ── Global find/replace ───────────────────────────────────────────────────────
+#[derive(Clone, Copy, PartialEq)]
+enum GlobalFindFocus { Query, Replace, Include, Exclude, Results }
+
+#[derive(Clone)]
+struct GlobalFindResult {
+    path:      std::path::PathBuf,
+    line_num:  usize,
+    line_text: String,
+    match_col: usize,
+    match_len: usize,
+}
+
+struct GlobalFind {
+    query:          String,
+    replace:        String,
+    include_glob:   String,
+    exclude_glob:   String,
+    results:        Vec<GlobalFindResult>,
+    scroll:         usize,
+    selected:       usize,
+    focus:          GlobalFindFocus,
+    case_sensitive: bool,
+}
+
 // ── Tab (per-file state) ──────────────────────────────────────────────────────
 #[derive(Clone, PartialEq)]
 enum TabKind { Editor, Settings }
@@ -227,20 +305,25 @@ struct Tab {
     undo_stack:   Vec<UndoEntry>,
     redo_stack:   Vec<UndoEntry>,
     last_typing:  bool, // for coalescing consecutive single-char inserts
+    hl_cache:     Vec<(MlState, i32)>, // (state, bracket_depth) at start of each line
+    hl_dirty_from: usize,              // first line index needing hl_cache recompute
+    max_line_len:  Option<usize>, // cached max line length (chars), None = needs recompute
 }
 
 impl Tab {
     fn untitled(buf_id: usize) -> Self {
         Tab { kind: TabKind::Editor, buf_id, text: Rope::new(), path: None, dirty: false,
               cursors: vec![Cursor::new(0)], scroll: 0, hscroll: 0,
-              undo_stack: Vec::new(), redo_stack: Vec::new(), last_typing: false }
+              undo_stack: Vec::new(), redo_stack: Vec::new(), last_typing: false,
+              hl_cache: Vec::new(), hl_dirty_from: 0, max_line_len: Some(0) }
     }
 
     fn settings() -> Self {
         Tab { kind: TabKind::Settings, buf_id: usize::MAX, text: Rope::new(),
               path: None, dirty: false, cursors: vec![Cursor::new(0)],
               scroll: 0, hscroll: 0,
-              undo_stack: Vec::new(), redo_stack: Vec::new(), last_typing: false }
+              undo_stack: Vec::new(), redo_stack: Vec::new(), last_typing: false,
+              hl_cache: Vec::new(), hl_dirty_from: 0, max_line_len: Some(0) }
     }
 
     fn display_name(&self) -> &str {
@@ -257,8 +340,14 @@ impl Tab {
         self.kind == TabKind::Editor && self.path.is_none() && self.text.len_chars() == 0
     }
 
-    fn primary(&self) -> &Cursor { self.cursors.last().unwrap() }
-    fn primary_mut(&mut self) -> &mut Cursor { self.cursors.last_mut().unwrap() }
+    fn primary(&self) -> &Cursor {
+        debug_assert!(!self.cursors.is_empty(), "cursors must never be empty");
+        self.cursors.last().unwrap()
+    }
+    fn primary_mut(&mut self) -> &mut Cursor {
+        if self.cursors.is_empty() { self.cursors.push(Cursor::new(0)); }
+        self.cursors.last_mut().unwrap()
+    }
 
     fn sel(&self) -> Option<(usize, usize)> { self.primary().sel() }
 
@@ -266,7 +355,11 @@ impl Tab {
         self.sel().map(|(lo, hi)| self.text.slice(lo..hi).chars().collect())
     }
 
-    fn load_file(&mut self, path: PathBuf) {
+    fn load_file(&mut self, path: PathBuf) -> bool {
+        const MAX_FILE_BYTES: u64 = 256 * 1024 * 1024;
+        if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > MAX_FILE_BYTES {
+            return false;
+        }
         match std::fs::read_to_string(&path) {
             Ok(content) => {
                 self.text       = Rope::from_str(&content);
@@ -278,8 +371,12 @@ impl Tab {
                 self.undo_stack = Vec::new();
                 self.redo_stack = Vec::new();
                 self.last_typing = false;
+                self.hl_cache.clear();
+                self.hl_dirty_from = 0;
+                self.max_line_len = None;
+                true
             }
-            Err(e) => eprintln!("open error: {e}"),
+            Err(e) => { eprintln!("open error: {e}"); false }
         }
     }
 
@@ -597,6 +694,9 @@ fn perform_drop(s: &mut State, drag: DragState) {
                 s.panes.remove(&src_pid);
                 let old_tree = std::mem::replace(&mut s.pane_tree, PaneTree::Leaf(0));
                 if let Some(t) = remove_pane_from_tree(old_tree, src_pid) { s.pane_tree = t; }
+                if !s.panes.contains_key(&s.active_pane) {
+                    s.active_pane = s.panes.keys().copied().next().unwrap_or(0);
+                }
             }
         }
         PaneKind::Terminal => {
@@ -631,6 +731,9 @@ fn perform_drop(s: &mut State, drag: DragState) {
                 s.panes.remove(&src_pid);
                 let old_tree = std::mem::replace(&mut s.pane_tree, PaneTree::Leaf(0));
                 if let Some(t) = remove_pane_from_tree(old_tree, src_pid) { s.pane_tree = t; }
+                if !s.panes.contains_key(&s.active_pane) {
+                    s.active_pane = s.panes.keys().copied().next().unwrap_or(0);
+                }
             }
         }
         _ => {}
@@ -750,12 +853,24 @@ struct State {
     term_buttons_held: u8,  // bitmask: bit0=left, bit1=mid, bit2=right
     term_sel:    Option<TermSel>,  // text selection in the active terminal
     term_selecting: bool,          // true while left-drag selecting in terminal
+    term_click_count:     u32,
+    term_last_click_time: Instant,
+    term_last_click_row:  usize,
+    term_last_click_col:  usize,
     last_click_time: Instant,
     last_click_char: usize,
     click_count:     u32,
 
     settings:     settings::Settings,
     needs_redraw: bool,
+
+    left_view:       LeftView,
+    context_menu:    Option<ContextMenu>,
+    quick_finder:    QuickFinder,
+    command_palette: CommandPalette,
+    global_find:     GlobalFind,
+
+    status_msg: Option<String>,
 }
 
 #[derive(Clone)]
@@ -808,6 +923,10 @@ impl State {
     fn find(&self)         -> &FindBar  { &self.pane().find }
     fn find_mut(&mut self) -> &mut FindBar { let id = self.active_pane; &mut self.panes.get_mut(&id).unwrap().find }
 
+    fn activity_bar_w(&self) -> i32 {
+        if self.explorer.is_some() { self.glyphs.cw * 4 + 8 } else { 0 }
+    }
+
     fn explorer_w(&self) -> i32 {
         if self.explorer.is_some() { self.explorer_w } else { 0 }
     }
@@ -837,8 +956,9 @@ impl State {
     fn find_h(&self) -> i32 { Self::pane_find_h(self.pane(), self.glyphs.lh) }
 
     fn pane_area(&self) -> Rect {
-        let ew = self.explorer_w();
-        Rect { x: ew, y: 0, w: self.w as i32 - ew, h: self.h as i32 - self.status_h() }
+        let act_w = self.activity_bar_w();
+        let ew    = self.explorer_w();
+        Rect { x: act_w + ew, y: 0, w: self.w as i32 - act_w - ew, h: self.h as i32 - self.status_h() }
     }
 
     fn active_pane_rect(&self) -> Rect {
@@ -891,9 +1011,9 @@ impl State {
         let id = self.active_pane;
         let t = self.panes.get_mut(&id).unwrap().tab_mut();
         if line < t.scroll              { t.scroll  = line; }
-        if line >= t.scroll  + vis_v   { t.scroll  = line + 1 - vis_v; }
+        if line >= t.scroll  + vis_v   { t.scroll  = (line + 1).saturating_sub(vis_v); }
         if col  < t.hscroll             { t.hscroll = col; }
-        if col  >= t.hscroll + vis_h   { t.hscroll = col + 1 - vis_h; }
+        if col  >= t.hscroll + vis_h   { t.hscroll = (col  + 1).saturating_sub(vis_h); }
     }
 
     // ── Multi-cursor helpers ──────────────────────────────────────────────────
@@ -929,9 +1049,14 @@ impl State {
     // Call before every edit. coalesce=true merges with the previous entry when
     // that entry was also coalesced (used for consecutive single-char typing).
     fn push_undo(&mut self, coalesce: bool) {
+        let limit = self.settings.undo_limit;
         let tab = self.tab_mut();
+        tab.max_line_len = None;
+        tab.hl_dirty_from = 0;
         if !coalesce || !tab.last_typing {
-            if tab.undo_stack.len() >= 1000 { tab.undo_stack.remove(0); }
+            if let Some(lim) = limit {
+                if tab.undo_stack.len() >= lim { tab.undo_stack.remove(0); }
+            }
             tab.undo_stack.push(UndoEntry { text: tab.text.clone(), cursors: tab.cursors.clone() });
             tab.redo_stack.clear();
         }
@@ -939,26 +1064,34 @@ impl State {
     }
 
     fn undo(&mut self) {
+        let limit = self.settings.undo_limit;
         let Some(entry) = self.tab_mut().undo_stack.pop() else { return };
         let cur = UndoEntry { text: self.tab().text.clone(), cursors: self.tab().cursors.clone() };
         let tab = self.tab_mut();
+        if let Some(lim) = limit { if tab.redo_stack.len() >= lim { tab.redo_stack.remove(0); } }
         tab.redo_stack.push(cur);
         tab.text    = entry.text;
         tab.cursors = entry.cursors;
         tab.dirty   = true;
         tab.last_typing = false;
+        tab.max_line_len = None;
+        tab.hl_dirty_from = 0;
         self.ensure_visible();
     }
 
     fn redo(&mut self) {
+        let limit = self.settings.undo_limit;
         let Some(entry) = self.tab_mut().redo_stack.pop() else { return };
         let cur = UndoEntry { text: self.tab().text.clone(), cursors: self.tab().cursors.clone() };
         let tab = self.tab_mut();
+        if let Some(lim) = limit { if tab.undo_stack.len() >= lim { tab.undo_stack.remove(0); } }
         tab.undo_stack.push(cur);
         tab.text    = entry.text;
         tab.cursors = entry.cursors;
         tab.dirty   = true;
         tab.last_typing = false;
+        tab.max_line_len = None;
+        tab.hl_dirty_from = 0;
         self.ensure_visible();
     }
 
@@ -985,6 +1118,30 @@ impl State {
             }
             let pos = lo.min(self.tab().text.len_chars());
             self.tab_mut().text.insert(pos, text);
+            self.tab_mut().cursors[i] = Cursor::new(pos + n_chars);
+            delta += n_chars as isize;
+            self.tab_mut().dirty = true;
+        }
+        self.dedup_cursors();
+        self.ensure_visible();
+    }
+
+    fn insert_str_per_cursor(&mut self, texts: &[String]) {
+        self.push_undo(false);
+        let order = self.cursor_order_ltr();
+        let mut delta: isize = 0;
+        for (k, &i) in order.iter().enumerate() {
+            let text = texts.get(k).map(|s| s.as_str()).unwrap_or("");
+            let n_chars = text.chars().count();
+            let (orig_lo, orig_hi) = { let c = &self.tab().cursors[i]; (c.lo(), c.hi()) };
+            let lo = (orig_lo as isize + delta) as usize;
+            let hi = (orig_hi as isize + delta) as usize;
+            if lo < hi {
+                self.tab_mut().text.remove(lo..hi);
+                delta -= (hi - lo) as isize;
+            }
+            let pos = lo.min(self.tab().text.len_chars());
+            if !text.is_empty() { self.tab_mut().text.insert(pos, text); }
             self.tab_mut().cursors[i] = Cursor::new(pos + n_chars);
             delta += n_chars as isize;
             self.tab_mut().dirty = true;
@@ -1429,17 +1586,48 @@ fn open_or_reuse_tab(s: &mut State, path: PathBuf) {
             return;
         }
     }
-    if pane.tab().is_empty_untitled() {
-        pane.tab_mut().load_file(path.clone());
+    let loaded = if pane.tab().is_empty_untitled() {
+        pane.tab_mut().load_file(path.clone())
     } else {
         let mut tab = Tab::untitled(s.next_buf_id);
         s.next_buf_id += 1;
-        tab.load_file(path.clone());
+        let ok = tab.load_file(path.clone());
         pane.tabs.push(tab);
         pane.active = pane.tabs.len() - 1;
+        ok
+    };
+    if !loaded {
+        s.status_msg = Some(format!("File too large to open (>256 MB): {}", path.display()));
+        return;
     }
     // Notify LSP of the opened file
     notify_lsp_open(s, &path);
+}
+
+fn term_token_bounds(row: &[terminal::Cell], col: usize) -> (usize, usize) {
+    if col >= row.len() || row[col].ch.is_whitespace() { return (col, col); }
+    let mut lo = col;
+    while lo > 0 && !row[lo - 1].ch.is_whitespace() { lo -= 1; }
+    let mut hi = col;
+    while hi + 1 < row.len() && !row[hi + 1].ch.is_whitespace() { hi += 1; }
+    (lo, hi)
+}
+
+fn open_token(s: &mut State, token: &str) {
+    if token.is_empty() { return; }
+    if token.starts_with("http://") || token.starts_with("https://") {
+        let _ = std::process::Command::new("open").arg(token).spawn();
+        return;
+    }
+    let expanded = if let Some(rest) = token.strip_prefix("~/") {
+        std::env::var("HOME").map(|h| format!("{}/{}", h, rest)).unwrap_or_else(|_| token.to_owned())
+    } else {
+        token.to_owned()
+    };
+    let path = std::path::Path::new(&expanded);
+    if path.exists() {
+        open_or_reuse_tab(s, path.to_path_buf());
+    }
 }
 
 fn notify_lsp_open(s: &mut State, path: &PathBuf) {
@@ -1549,7 +1737,7 @@ fn classify_word(word: &str, lang: Lang, is_call: bool) -> u32 {
     FG
 }
 
-fn highlight_line(chars: &[char], lang: Lang, mut state: MlState) -> (Vec<u32>, MlState) {
+fn highlight_line(chars: &[char], lang: Lang, mut state: MlState, rainbow: bool, mut bracket_depth: i32) -> (Vec<u32>, MlState, i32) {
     let len = chars.len();
     let mut out = vec![FG; len];
     let mut i = 0;
@@ -1720,12 +1908,25 @@ fn highlight_line(chars: &[char], lang: Lang, mut state: MlState) -> (Vec<u32>, 
                     continue;
                 }
 
+                if rainbow && matches!(chars[i], '(' | '[' | '{') {
+                    out[i] = RAINBOW[(bracket_depth.max(0) as usize) % RAINBOW.len()];
+                    bracket_depth += 1;
+                    i += 1;
+                    continue;
+                }
+                if rainbow && matches!(chars[i], ')' | ']' | '}') {
+                    bracket_depth = bracket_depth.saturating_sub(1);
+                    out[i] = RAINBOW[(bracket_depth.max(0) as usize) % RAINBOW.len()];
+                    i += 1;
+                    continue;
+                }
+
                 i += 1;
             }
         }
     }
 
-    (out, state)
+    (out, state, bracket_depth)
 }
 
 // ── Clipboard ─────────────────────────────────────────────────────────────────
@@ -1776,27 +1977,40 @@ fn open_file_dialog() -> Option<PathBuf> {
 
 fn find_matches(text: &Rope, query: &str, case_sensitive: bool, whole_word: bool) -> Vec<(usize, usize)> {
     if query.is_empty() { return vec![]; }
-    let content: Vec<char> = text.chars().collect();
-    let query_chars: Vec<char> = query.chars().collect();
-    let qlen = query_chars.len();
-    let total = content.len();
-    if qlen > total { return vec![]; }
+    let query_low: String = if case_sensitive { String::new() } else { query.to_lowercase() };
+    let qstr = if case_sensitive { query } else { &query_low };
+    let qlen = qstr.chars().count();
+    if qlen == 0 { return vec![]; }
+    let total = text.len_chars();
     let mut out = vec![];
-    let mut i = 0;
-    while i + qlen <= total {
-        let hit = content[i..i + qlen].iter().zip(query_chars.iter()).all(|(c, q)| {
-            if case_sensitive { c == q }
-            else { c.to_lowercase().eq(q.to_lowercase()) }
-        });
-        if hit {
-            let ok = !whole_word || {
-                let before = i == 0 || !State::is_word_char(content[i - 1]);
-                let after  = i + qlen >= total || !State::is_word_char(content[i + qlen]);
-                before && after
-            };
-            if ok { out.push((i, i + qlen)); }
+    let mut line_start_char: usize = 0;
+    let mut line_buf = String::new();
+    for line in text.lines() {
+        line_buf.clear();
+        if case_sensitive {
+            line_buf.extend(line.chars().take_while(|&c| c != '\n' && c != '\r'));
+        } else {
+            for ch in line.chars().take_while(|&c| c != '\n' && c != '\r') {
+                for lc in ch.to_lowercase() { line_buf.push(lc); }
+            }
         }
-        i += 1;
+        let line_chars: Vec<char> = line_buf.chars().collect();
+        let llen = line_chars.len();
+        let query_chars: Vec<char> = qstr.chars().collect();
+        let mut i = 0;
+        while i + qlen <= llen {
+            if line_chars[i..i + qlen] == query_chars[..] {
+                let abs = line_start_char + i;
+                let ok = !whole_word || {
+                    let before = abs == 0 || !State::is_word_char(text.char(abs - 1));
+                    let after  = abs + qlen >= total || !State::is_word_char(text.char(abs + qlen));
+                    before && after
+                };
+                if ok { out.push((abs, abs + qlen)); }
+            }
+            i += 1;
+        }
+        line_start_char += line.chars().count();
     }
     out
 }
@@ -1858,6 +2072,274 @@ fn replace_all(s: &mut State) {
     s.tab_mut().dirty = true;
     s.tab_mut().cursors = vec![Cursor::new(0)];
     s.ensure_visible();
+}
+
+// ── Quick finder helpers ──────────────────────────────────────────────────────
+
+fn fuzzy_score(query: &str, candidate: &str) -> Option<i32> {
+    if query.is_empty() { return Some(0); }
+    let qchars: Vec<char> = query.to_lowercase().chars().collect();
+    let cchars: Vec<char> = candidate.to_lowercase().chars().collect();
+    let mut qi = 0;
+    let mut score: i32 = 0;
+    let mut last_match: Option<usize> = None;
+    for (ci, &c) in cchars.iter().enumerate() {
+        if qi < qchars.len() && c == qchars[qi] {
+            if let Some(prev) = last_match {
+                if ci == prev + 1 { score += 5; } // consecutive bonus
+            }
+            // word boundary bonus
+            if ci == 0 || matches!(cchars[ci - 1], '/' | '_' | '-' | '.') { score += 3; }
+            score -= ci as i32 / 4; // earlier match = better
+            last_match = Some(ci);
+            qi += 1;
+        }
+    }
+    if qi < qchars.len() { None } else { Some(score) }
+}
+
+fn walk_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>, depth: usize) {
+    if depth > 12 { return; }
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let mut entries: Vec<_> = rd.flatten().collect();
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str.starts_with('.') { continue; }
+        if name_str == "target" && path.join("CACHEDIR.TAG").exists() { continue; }
+        if path.is_dir() { walk_files(&path, out, depth + 1); }
+        else if out.len() < 50_000 { out.push(path); }
+    }
+}
+
+fn open_quick_finder(s: &mut State) {
+    let root = s.explorer.as_ref().map(|e| e.root.clone())
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let mut entries = Vec::new();
+    walk_files(&root, &mut entries, 0);
+    let n = entries.len();
+    s.quick_finder.entries  = entries;
+    s.quick_finder.filtered = (0..n).collect();
+    s.quick_finder.query    = String::new();
+    s.quick_finder.selected = 0;
+    s.quick_finder.open     = true;
+}
+
+fn refilter_quick_finder(s: &mut State) {
+    let q = s.quick_finder.query.clone();
+    if q.is_empty() {
+        let n = s.quick_finder.entries.len();
+        s.quick_finder.filtered = (0..n).collect();
+    } else {
+        let mut scored: Vec<(usize, i32)> = s.quick_finder.entries.iter().enumerate()
+            .filter_map(|(i, p)| {
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                fuzzy_score(&q, name).map(|sc| (i, sc))
+            })
+            .collect();
+        scored.sort_by(|a, b| b.1.cmp(&a.1));
+        s.quick_finder.filtered = scored.into_iter().map(|(i, _)| i).collect();
+    }
+    s.quick_finder.selected = 0;
+}
+
+fn refilter_command_palette(s: &mut State) {
+    let q = s.command_palette.query.clone();
+    if q.is_empty() {
+        s.command_palette.filtered = (0..COMMANDS.len()).collect();
+    } else {
+        let mut scored: Vec<(usize, i32)> = COMMANDS.iter().enumerate()
+            .filter_map(|(i, cmd)| fuzzy_score(&q, cmd.name).map(|sc| (i, sc)))
+            .collect();
+        scored.sort_by(|a, b| b.1.cmp(&a.1));
+        s.command_palette.filtered = scored.into_iter().map(|(i, _)| i).collect();
+    }
+    s.command_palette.selected = 0;
+}
+
+fn execute_command(s: &mut State, action: CommandAction) {
+    match action {
+        CommandAction::Save           => { let id = s.active_pane; if s.panes.get(&id).map_or(false, |p| p.kind == PaneKind::Editor) { s.tab_mut().save(); } }
+        CommandAction::CloseTab       => { /* handled by Cmd+W */ }
+        CommandAction::GoToSettings   => open_settings_tab(s),
+        CommandAction::OpenTerminal   => open_terminal_pane(s),
+        CommandAction::SplitRight     => {
+            let active = s.active_pane;
+            let new_id = s.next_pane_id; s.next_pane_id += 1;
+            let bid    = s.next_buf_id;  s.next_buf_id += 1;
+            let mut p  = Pane::new(new_id, bid);
+            p.tabs[0].text = s.tab().text.clone();
+            p.tabs[0].path = s.tab().path.clone();
+            p.tabs[0].buf_id = s.tab().buf_id;
+            s.panes.insert(new_id, p);
+            let old = std::mem::replace(&mut s.pane_tree, PaneTree::Leaf(0));
+            s.pane_tree = insert_pane(old, active, new_id, DropZone::Right);
+            s.active_pane = new_id;
+        }
+        CommandAction::SplitDown      => {
+            let active = s.active_pane;
+            let new_id = s.next_pane_id; s.next_pane_id += 1;
+            let bid    = s.next_buf_id;  s.next_buf_id += 1;
+            let mut p  = Pane::new(new_id, bid);
+            p.tabs[0].text = s.tab().text.clone();
+            p.tabs[0].path = s.tab().path.clone();
+            p.tabs[0].buf_id = s.tab().buf_id;
+            s.panes.insert(new_id, p);
+            let old = std::mem::replace(&mut s.pane_tree, PaneTree::Leaf(0));
+            s.pane_tree = insert_pane(old, active, new_id, DropZone::Bottom);
+            s.active_pane = new_id;
+        }
+        CommandAction::ToggleFind     => { s.find_mut().open = !s.find().open; }
+        CommandAction::ToggleReplace  => {
+            let open = s.find().open;
+            s.find_mut().open = true;
+            s.find_mut().replace_open = !open || !s.find().replace_open;
+        }
+        CommandAction::ToggleExplorer => {
+            if s.explorer.is_none() {
+                let root = std::env::current_dir().unwrap_or_default();
+                s.explorer = Some(FileExplorer::new(root));
+            } else {
+                s.explorer = None;
+            }
+        }
+        CommandAction::IncreaseFontSize => {
+            s.font_size = (s.font_size + 1.0).min(40.0);
+            s.glyphs.resize(s.font_size);
+            s.settings.font_size = s.font_size;
+            s.settings.save();
+        }
+        CommandAction::DecreaseFontSize => {
+            s.font_size = (s.font_size - 1.0).max(6.0);
+            s.glyphs.resize(s.font_size);
+            s.settings.font_size = s.font_size;
+            s.settings.save();
+        }
+    }
+}
+
+// ── Global find/replace ───────────────────────────────────────────────────────
+
+fn glob_match(pattern: &str, path_str: &str) -> bool {
+    if pattern.is_empty() { return true; }
+    let pat: Vec<char> = pattern.chars().collect();
+    let txt: Vec<char> = path_str.chars().collect();
+    glob_match_impl(&pat, &txt)
+}
+
+fn glob_match_impl(pat: &[char], txt: &[char]) -> bool {
+    if pat.is_empty() { return txt.is_empty(); }
+    if pat.len() >= 2 && pat[0] == '*' && pat[1] == '*' {
+        let rest = &pat[2..];
+        let rest = if rest.first() == Some(&'/') { &rest[1..] } else { rest };
+        for i in 0..=txt.len() {
+            if glob_match_impl(rest, &txt[i..]) { return true; }
+            if i < txt.len() && txt[i] == '/' && rest.is_empty() { return true; }
+        }
+        return false;
+    }
+    if pat[0] == '*' {
+        for i in 0..=txt.len() {
+            if i > 0 && txt[i - 1] == '/' { break; }
+            if glob_match_impl(&pat[1..], &txt[i..]) { return true; }
+        }
+        return false;
+    }
+    if pat[0] == '?' {
+        return !txt.is_empty() && txt[0] != '/' && glob_match_impl(&pat[1..], &txt[1..]);
+    }
+    if pat[0] == '{' {
+        if let Some(end) = pat.iter().position(|&c| c == '}') {
+            let alts: Vec<&[char]> = pat[1..end].split(|&c| c == ',').collect();
+            for alt in alts {
+                if txt.starts_with(alt) && glob_match_impl(&pat[end+1..], &txt[alt.len()..]) {
+                    return true;
+                }
+            }
+            return false;
+        }
+    }
+    if !txt.is_empty() && (pat[0] == txt[0] || pat[0] == '?') {
+        return glob_match_impl(&pat[1..], &txt[1..]);
+    }
+    false
+}
+
+fn global_search(root: &std::path::Path, query: &str, include: &str, exclude: &str, case_sensitive: bool) -> Vec<GlobalFindResult> {
+    let mut all_files = Vec::new();
+    walk_files(root, &mut all_files, 0);
+    let mut results = Vec::new();
+    for path in &all_files {
+        let rel = path.strip_prefix(root).unwrap_or(path).to_string_lossy().to_string();
+        if !include.is_empty() && !glob_match(include, &rel) { continue; }
+        if !exclude.is_empty() && glob_match(exclude, &rel) { continue; }
+        if std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) > 64 * 1024 * 1024 { continue; }
+        let Ok(content) = std::fs::read_to_string(path) else { continue };
+        for (line_num, line) in content.lines().enumerate() {
+            let search_in = if case_sensitive { line.to_string() } else { line.to_lowercase() };
+            let pattern   = if case_sensitive { query.to_string() } else { query.to_lowercase() };
+            let mut start = 0;
+            while let Some(pos) = search_in[start..].find(&pattern) {
+                let match_col = start + pos;
+                results.push(GlobalFindResult {
+                    path:      path.clone(),
+                    line_num,
+                    line_text: line.chars().take(200).collect(),
+                    match_col,
+                    match_len: query.len(),
+                });
+                start += pos + pattern.len().max(1);
+                if results.len() >= 1000 { return results; }
+            }
+        }
+    }
+    results
+}
+
+fn global_replace(results: &[GlobalFindResult], query: &str, replace: &str, case_sensitive: bool, open_tabs: &mut HashMap<usize, Pane>) {
+    let mut by_path: HashMap<&std::path::Path, Vec<&GlobalFindResult>> = HashMap::new();
+    for r in results { by_path.entry(r.path.as_path()).or_default().push(r); }
+    for (path, mut matches) in by_path {
+        let Ok(content) = std::fs::read_to_string(path) else { continue };
+        let lines: Vec<&str> = content.lines().collect();
+        let mut new_lines: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
+        // sort by line descending, then col descending for safe replacement
+        matches.sort_by(|a, b| b.line_num.cmp(&a.line_num).then(b.match_col.cmp(&a.match_col)));
+        for m in &matches {
+            if m.line_num >= new_lines.len() { continue; }
+            let line = &new_lines[m.line_num];
+            let col = m.match_col;
+            let qlen = if case_sensitive { query.len() } else { query.len() };
+            if col + qlen > line.len() { continue; }
+            let new_line = format!("{}{}{}", &line[..col], replace, &line[col+qlen..]);
+            new_lines[m.line_num] = new_line;
+        }
+        let new_content = new_lines.join("\n");
+        let _ = std::fs::write(path, &new_content);
+        // Refresh any open tabs matching this path
+        let path_buf = path.to_path_buf();
+        for pane in open_tabs.values_mut() {
+            for tab in pane.tabs.iter_mut() {
+                if tab.path.as_deref() == Some(path) {
+                    tab.text = Rope::from_str(&new_content);
+                    tab.dirty = false;
+                    let _ = &path_buf;
+                }
+            }
+        }
+    }
+}
+
+fn darken_buffer(buf: &mut [u32], w: u32, h: u32) {
+    let len = (w as usize).saturating_mul(h as usize).min(buf.len());
+    for p in buf[..len].iter_mut() {
+        let r = (*p >> 16 & 0xFF) * 100 / 255;
+        let g = (*p >>  8 & 0xFF) * 100 / 255;
+        let b = (*p       & 0xFF) * 100 / 255;
+        *p = (r << 16) | (g << 8) | b;
+    }
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -1924,8 +2406,11 @@ impl ApplicationHandler<UserEvent> for App {
         let glyphs = Glyphs::new(include_bytes!("../assets/JetBrainsMono-Regular.ttf"), font_size);
 
         let mut initial_pane = Pane::new(0, 0); // pane 0, buf 0
+        let mut startup_status: Option<String> = None;
         if let Some(path) = self.file_arg.take() {
-            initial_pane.tabs[0].load_file(path);
+            if !initial_pane.tabs[0].load_file(path.clone()) {
+                startup_status = Some(format!("File too large to open (>256 MB): {}", path.display()));
+            }
         }
         let mut panes = HashMap::new();
         panes.insert(0usize, initial_pane);
@@ -1965,12 +2450,35 @@ impl ApplicationHandler<UserEvent> for App {
             term_buttons_held: 0,
             term_sel:        None,
             term_selecting:  false,
+            term_click_count:     0,
+            term_last_click_time: Instant::now() - Duration::from_secs(1),
+            term_last_click_row:  0,
+            term_last_click_col:  0,
             last_click_time: Instant::now() - Duration::from_secs(1),
             last_click_char: usize::MAX,
             click_count:     0,
 
             settings:     loaded_settings,
             needs_redraw: false,
+
+            left_view:    LeftView::FileTree,
+            context_menu: None,
+            quick_finder: QuickFinder {
+                open: false, query: String::new(),
+                entries: vec![], filtered: vec![], selected: 0,
+            },
+            command_palette: CommandPalette {
+                open: false, query: String::new(),
+                filtered: (0..COMMANDS.len()).collect(),
+                selected: 0,
+            },
+            global_find: GlobalFind {
+                query: String::new(), replace: String::new(),
+                include_glob: String::new(), exclude_glob: String::new(),
+                results: vec![], scroll: 0, selected: 0,
+                focus: GlobalFindFocus::Query, case_sensitive: false,
+            },
+            status_msg: startup_status,
         };
 
         s.win.request_redraw();
@@ -2009,9 +2517,24 @@ impl ApplicationHandler<UserEvent> for App {
 
                 // Explorer border drag
                 if s.explorer_drag {
-                    s.explorer_w = mx.clamp(80, 600);
+                    let act_w = s.activity_bar_w();
+                    s.explorer_w = (mx - act_w).clamp(80, 600);
                     { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                     return;
+                }
+
+                // Update context menu hover
+                if let Some(ref mut cm) = s.context_menu {
+                    let item_h = s.glyphs.lh + 2;
+                    let menu_w = cm.items.iter().map(|s| s.chars().count()).max().unwrap_or(10) as i32 * s.glyphs.cw + s.glyphs.cw * 2;
+                    let menu_h = cm.items.len() as i32 * item_h + 4;
+                    let menu_x = cm.x.min(s.w as i32 - menu_w);
+                    let menu_y = (cm.y - menu_h).max(0);
+                    let rel = (my - menu_y - 2) / item_h;
+                    if mx >= menu_x && mx < menu_x + menu_w && my >= menu_y && my < menu_y + menu_h && rel >= 0 {
+                        cm.hovered = rel as usize;
+                    }
+                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                 }
 
                 // Active pane-resize drag
@@ -2139,7 +2662,7 @@ impl ApplicationHandler<UserEvent> for App {
                                     let sgr = tp.grid.mouse_sgr;
                                     let pty_fd = tp.pty_fd;
                                     let bytes = terminal::encode_mouse(term_col, term_row, cb, true, sgr);
-                                    unsafe { libc::write(pty_fd, bytes.as_ptr().cast(), bytes.len()); }
+                                    if pty_fd >= 0 { let _ = unsafe { libc::write(pty_fd, bytes.as_ptr().cast(), bytes.len()) }; }
                                 }
                             }
                         }
@@ -2162,6 +2685,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 s.mouse_down = false;
                 s.term_selecting = false;
+                if s.term_sel.as_ref().map_or(false, |sel| sel.is_empty()) { s.term_sel = None; }
                 s.drag_pending = None;
                 if let Some(drag) = s.drag.take() {
                     perform_drop(s, drag);
@@ -2197,7 +2721,7 @@ impl ApplicationHandler<UserEvent> for App {
                                     let pty_fd = tp.pty_fd;
                                     let bytes = terminal::encode_mouse(term_col, term_row,
                                         if sgr { mod_bits } else { 3 | mod_bits }, false, sgr);
-                                    unsafe { libc::write(pty_fd, bytes.as_ptr().cast(), bytes.len()); }
+                                    if pty_fd >= 0 { let _ = unsafe { libc::write(pty_fd, bytes.as_ptr().cast(), bytes.len()) }; }
                                 }
                             }
                         }
@@ -2212,10 +2736,63 @@ impl ApplicationHandler<UserEvent> for App {
                 let mx  = s.mouse_x as i32;
                 let my  = s.mouse_y as i32;
                 let alt = s.mods.alt_key();
+                let cmd = s.mods.super_key();
+
+                // Dismiss context menu on any click outside it
+                if let Some(ref cm) = s.context_menu {
+                    let item_h = s.glyphs.lh + 2;
+                    let menu_w = cm.items.iter().map(|s| s.chars().count()).max().unwrap_or(10) as i32 * s.glyphs.cw + s.glyphs.cw * 2;
+                    let menu_h = cm.items.len() as i32 * item_h + 4;
+                    let menu_x = cm.x.min(s.w as i32 - menu_w);
+                    let menu_y = (cm.y - menu_h).max(0);
+                    let in_menu = mx >= menu_x && mx < menu_x + menu_w && my >= menu_y && my < menu_y + menu_h;
+                    if in_menu {
+                        let rel = (my - menu_y - 2) / item_h;
+                        if rel >= 0 && (rel as usize) < cm.items.len() {
+                            let item = cm.items[rel as usize];
+                            s.context_menu = None;
+                            if item == "Open Settings" { open_settings_tab(s); }
+                        } else {
+                            s.context_menu = None;
+                        }
+                        { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                        return;
+                    } else {
+                        s.context_menu = None;
+                        { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                    }
+                }
+
+                // Activity bar click
+                let act_w = s.activity_bar_w();
+                if s.explorer.is_some() && mx < act_w && my < s.h as i32 - s.status_h() {
+                    let lh = s.glyphs.lh;
+                    let file_icon_y = 8;
+                    let srch_icon_y = file_icon_y + lh + 4;
+                    let gear_y      = s.h as i32 - s.status_h() - lh - 8;
+                    if my >= file_icon_y && my < file_icon_y + lh {
+                        s.left_view = LeftView::FileTree;
+                    } else if my >= srch_icon_y && my < srch_icon_y + lh {
+                        s.left_view = LeftView::GlobalSearch;
+                        s.global_find.focus = GlobalFindFocus::Query;
+                    } else if my >= gear_y && my < gear_y + lh {
+                        if s.context_menu.is_some() {
+                            s.context_menu = None;
+                        } else {
+                            s.context_menu = Some(ContextMenu {
+                                x: act_w, y: gear_y,
+                                items: vec!["Open Settings"],
+                                hovered: 0,
+                            });
+                        }
+                    }
+                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                    return;
+                }
 
                 // Explorer border drag start (before pane border and explorer click)
                 if s.explorer.is_some() {
-                    let bx = s.explorer_w();
+                    let bx = act_w + s.explorer_w();
                     if (mx - bx).abs() <= BORDER_HIT && my < s.h as i32 - s.status_h() {
                         s.explorer_drag = true;
                         return;
@@ -2229,22 +2806,77 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
 
-                // Explorer panel click
-                if s.explorer.is_some() && mx < s.explorer_w() {
+                // Left panel click (file tree or global search)
+                if s.explorer.is_some() && mx >= act_w && mx < act_w + s.explorer_w() {
                     let lh  = s.glyphs.lh;
-                    let row = my / lh;
-                    if row == 0 {
-                        if let Some(ex) = s.explorer.as_mut() { ex.toggle_hidden(); }
-                    } else if row > 0 {
-                        let idx = (row - 1) as usize;
-                        let action = s.explorer.as_mut().and_then(|ex| {
-                            if idx < ex.entries.len() {
-                                ex.selected = idx;
-                                if ex.entries[idx].is_dir { ex.toggle(idx); None }
-                                else { Some(ex.entries[idx].path.clone()) }
-                            } else { None }
-                        });
-                        if let Some(path) = action { open_or_reuse_tab(s, path); }
+                    if s.left_view == LeftView::FileTree {
+                        let row = my / lh;
+                        if row == 0 {
+                            if let Some(ex) = s.explorer.as_mut() { ex.toggle_hidden(); }
+                        } else if row > 0 {
+                            let idx = (row - 1) as usize;
+                            let action = s.explorer.as_mut().and_then(|ex| {
+                                if idx < ex.entries.len() {
+                                    ex.selected = idx;
+                                    if ex.entries[idx].is_dir { ex.toggle(idx); None }
+                                    else { Some(ex.entries[idx].path.clone()) }
+                                } else { None }
+                            });
+                            if let Some(path) = action { open_or_reuse_tab(s, path); }
+                        }
+                    } else {
+                        // Global search panel click — determine which field was clicked
+                        let row_h = lh + 2;
+                        let field_label_w = 9 * s.glyphs.cw;
+                        let fields_start_y = 4;
+                        let fields = [GlobalFindFocus::Query, GlobalFindFocus::Replace, GlobalFindFocus::Include, GlobalFindFocus::Exclude];
+                        let search_btn_y = fields_start_y + 4 * row_h + 2;
+                        let results_start_y = search_btn_y + row_h + 4 + lh;
+                        if my >= fields_start_y && my < fields_start_y + 4 * row_h {
+                            let fi = ((my - fields_start_y) / row_h).clamp(0, 3) as usize;
+                            if mx >= act_w + field_label_w {
+                                s.global_find.focus = fields[fi];
+                            }
+                        } else if my >= search_btn_y && my < search_btn_y + lh {
+                            // Search button
+                            let root = s.explorer.as_ref().map(|e| e.root.clone())
+                                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                            let query   = s.global_find.query.clone();
+                            let include = s.global_find.include_glob.clone();
+                            let exclude = s.global_find.exclude_glob.clone();
+                            let cs      = s.global_find.case_sensitive;
+                            if !query.is_empty() {
+                                let results = global_search(&root, &query, &include, &exclude, cs);
+                                s.global_find.results  = results;
+                                s.global_find.selected = 0;
+                                s.global_find.scroll   = 0;
+                                s.global_find.focus    = GlobalFindFocus::Results;
+                            }
+                            // Also check Replace All button
+                            let search_label_w = "[Search]".chars().count() as i32 * s.glyphs.cw;
+                            let ra_x = act_w + field_label_w + search_label_w + s.glyphs.cw;
+                            if mx >= ra_x && !s.global_find.replace.is_empty() && !s.global_find.results.is_empty() {
+                                let results = s.global_find.results.clone();
+                                let query   = s.global_find.query.clone();
+                                let replace = s.global_find.replace.clone();
+                                let cs      = s.global_find.case_sensitive;
+                                global_replace(&results, &query, &replace, cs, &mut s.panes);
+                                s.global_find.results.clear();
+                            }
+                        } else if my >= results_start_y {
+                            let ri = ((my - results_start_y) / lh) as usize + s.global_find.scroll;
+                            if ri < s.global_find.results.len() {
+                                s.global_find.selected = ri;
+                                s.global_find.focus    = GlobalFindFocus::Results;
+                                let r = s.global_find.results[ri].clone();
+                                open_or_reuse_tab(s, r.path.clone());
+                                let line = r.line_num;
+                                let col  = r.match_col;
+                                let pos  = s.tab().text.line_to_char(line) + col;
+                                s.tab_mut().cursors = vec![Cursor::new(pos)];
+                                s.ensure_visible();
+                            }
+                        }
                     }
                     { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                     return;
@@ -2385,15 +3017,47 @@ impl ApplicationHandler<UserEvent> for App {
                                     let sgr = tp.grid.mouse_sgr;
                                     let pty_fd = tp.pty_fd;
                                     let bytes = terminal::encode_mouse(term_col, term_row, mod_bits, true, sgr);
-                                    unsafe { libc::write(pty_fd, bytes.as_ptr().cast(), bytes.len()); }
+                                    if pty_fd >= 0 { let _ = unsafe { libc::write(pty_fd, bytes.as_ptr().cast(), bytes.len()) }; }
                                     s.term_buttons_held |= 1;
                                 } else {
-                                    // Start text selection
-                                    s.term_sel = Some(TermSel {
-                                        start_vi: term_row, start_col: term_col,
-                                        end_vi:   term_row, end_col:   term_col,
-                                    });
-                                    s.term_selecting = true;
+                                    // Track click count for double-click detection
+                                    let now  = Instant::now();
+                                    let fast = now.duration_since(s.term_last_click_time) < Duration::from_millis(500);
+                                    let same = term_row == s.term_last_click_row && term_col == s.term_last_click_col;
+                                    s.term_click_count = if fast && same { s.term_click_count + 1 } else { 1 };
+                                    s.term_last_click_time = now;
+                                    s.term_last_click_row  = term_row;
+                                    s.term_last_click_col  = term_col;
+
+                                    // Collect rows before releasing the borrow on tp
+                                    let rows = tp.grid.visible_rows();
+
+                                    if cmd {
+                                        // Cmd+Click: open token under cursor
+                                        if term_row < rows.len() {
+                                            let (lo, hi) = term_token_bounds(&rows[term_row], term_col);
+                                            let token: String = rows[term_row][lo..=hi].iter().map(|c| c.ch).collect();
+                                            drop(rows);
+                                            open_token(s, &token);
+                                        }
+                                    } else if s.term_click_count == 2 {
+                                        // Double-click: select non-whitespace token on this row
+                                        if term_row < rows.len() {
+                                            let (lo, hi) = term_token_bounds(&rows[term_row], term_col);
+                                            s.term_sel = Some(TermSel {
+                                                start_vi: term_row, start_col: lo,
+                                                end_vi:   term_row, end_col:   hi,
+                                            });
+                                            s.term_selecting = false;
+                                        }
+                                    } else {
+                                        // Single click: start drag selection
+                                        s.term_sel = Some(TermSel {
+                                            start_vi: term_row, start_col: term_col,
+                                            end_vi:   term_row, end_col:   term_col,
+                                        });
+                                        s.term_selecting = true;
+                                    }
                                 }
                             }
                         }
@@ -2416,6 +3080,10 @@ impl ApplicationHandler<UserEvent> for App {
                     let btn_x     = pane_rect.x + 14 * cw;
                     let ry        = content_y + lh + 8;
                     let vy        = ry + lh + 4;
+                    let sy        = vy + lh + 4;
+                    let rb_y      = sy + lh + 4;
+                    let ul_y      = rb_y + lh + 4;
+                    let ul_num_y  = ul_y + lh + 4;
                     if my >= ry && my < ry + lh {
                         if mx >= btn_x && mx < btn_x + 5 * cw && s.renderer.is_gpu() {
                             s.settings.renderer = settings::RendererBackend::Cpu;
@@ -2437,6 +3105,21 @@ impl ApplicationHandler<UserEvent> for App {
                         s.needs_redraw = true;
                         self.dirty.store(true, Ordering::Release);
                         return;
+                    } else if my >= rb_y && my < rb_y + lh && mx >= btn_x && mx < btn_x + 8 * cw {
+                        s.settings.rainbow_brackets = !s.settings.rainbow_brackets;
+                        s.settings.save();
+                    } else if my >= ul_y && my < ul_y + lh && mx >= btn_x && mx < btn_x + 12 * cw {
+                        s.settings.undo_limit = if s.settings.undo_limit.is_none() { settings::Settings::default_undo_limit() } else { None };
+                        s.settings.save();
+                    } else if s.settings.undo_limit.is_some() && my >= ul_num_y && my < ul_num_y + lh {
+                        let lim = s.settings.undo_limit.unwrap_or(200);
+                        if mx >= btn_x && mx < btn_x + 3 * cw {
+                            s.settings.undo_limit = Some((lim.saturating_sub(50)).max(50));
+                            s.settings.save();
+                        } else if mx >= btn_x + 4 * cw {
+                            s.settings.undo_limit = Some((lim + 50).min(10_000));
+                            s.settings.save();
+                        }
                     }
                     { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                     return;
@@ -2478,7 +3161,18 @@ impl ApplicationHandler<UserEvent> for App {
 
                 // Editor area click
                 let pos = s.xy_to_char(mx, my);
-                if alt {
+                if cmd {
+                    // Cmd+Click: extract whitespace-delimited token and open it
+                    let len = s.tab().text.len_chars();
+                    if pos < len && !s.tab().text.char(pos).is_whitespace() {
+                        let mut lo = pos;
+                        while lo > 0 && !s.tab().text.char(lo - 1).is_whitespace() { lo -= 1; }
+                        let mut hi = pos + 1;
+                        while hi < len && !s.tab().text.char(hi).is_whitespace() { hi += 1; }
+                        let token: String = s.tab().text.slice(lo..hi).chars().collect();
+                        open_token(s, &token);
+                    }
+                } else if alt {
                     s.tab_mut().cursors.push(Cursor::new(pos));
                     s.dedup_cursors();
                     s.mouse_down = false;
@@ -2524,6 +3218,21 @@ impl ApplicationHandler<UserEvent> for App {
                         (-(p.x as i32) / cw, -(p.y as i32) / lh)
                     }
                 };
+                // Scroll global find results when hovering over the left panel
+                let act_w = s.activity_bar_w();
+                let mx = s.mouse_x as i32;
+                if s.explorer.is_some() && s.left_view == LeftView::GlobalSearch
+                    && mx >= act_w && mx < act_w + s.explorer_w() && dy != 0
+                {
+                    let n = s.global_find.results.len();
+                    if dy < 0 {
+                        s.global_find.scroll = (s.global_find.scroll + (-dy) as usize).min(n.saturating_sub(1));
+                    } else {
+                        s.global_find.scroll = s.global_find.scroll.saturating_sub(dy as usize);
+                    }
+                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                    return;
+                }
                 let pane_kind = s.panes.get(&s.active_pane).map(|p| p.kind.clone()).unwrap_or(PaneKind::Editor);
                 match pane_kind {
                     PaneKind::Terminal => {
@@ -2564,7 +3273,7 @@ impl ApplicationHandler<UserEvent> for App {
                                     .clamp(0, tp.grid.rows as i32 - 1) as usize;
                                 for _ in 0..n {
                                     let bytes = terminal::encode_mouse(term_col, term_row, cb, true, sgr);
-                                    unsafe { libc::write(pty_fd, bytes.as_ptr().cast(), bytes.len()); }
+                                    if pty_fd >= 0 { let _ = unsafe { libc::write(pty_fd, bytes.as_ptr().cast(), bytes.len()) }; }
                                 }
                             } else {
                                 let tp = s.term_panes.get_mut(&tid).unwrap();
@@ -2601,6 +3310,7 @@ impl ApplicationHandler<UserEvent> for App {
 
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 dlog!("[input] {:?}", event.logical_key);
+                s.status_msg = None;
                 let ctrl  = s.mods.control_key();
                 let cmd   = s.mods.super_key();
                 let alt   = s.mods.alt_key();
@@ -2616,6 +3326,199 @@ impl ApplicationHandler<UserEvent> for App {
                 // Ctrl+` — open a new terminal pane (works from any pane kind)
                 if ctrl && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "`") {
                     open_terminal_pane(s);
+                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                    return;
+                }
+
+                // Cmd+P — quick file finder
+                if cmd && !shift && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "p") {
+                    open_quick_finder(s);
+                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                    return;
+                }
+
+                // Cmd+Shift+P — command palette
+                if cmd && shift && matches!(&event.logical_key, Key::Character(c) if matches!(c.as_str(), "p" | "P")) {
+                    s.command_palette.open = true;
+                    s.command_palette.query.clear();
+                    refilter_command_palette(s);
+                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                    return;
+                }
+
+                // Cmd+Shift+F — global find panel
+                if cmd && shift && matches!(&event.logical_key, Key::Character(c) if matches!(c.as_str(), "f" | "F")) {
+                    if s.explorer.is_none() {
+                        let root = std::env::current_dir().unwrap_or_default();
+                        s.explorer = Some(FileExplorer::new(root));
+                        s.explorer_w = ((200.0 * s.font_size / FONT_PX).round() as i32).clamp(80, 600);
+                    }
+                    s.left_view = LeftView::GlobalSearch;
+                    s.global_find.focus = GlobalFindFocus::Query;
+                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                    return;
+                }
+
+                // Quick finder input routing
+                if s.quick_finder.open {
+                    match &event.logical_key {
+                        Key::Named(NamedKey::Escape) => { s.quick_finder.open = false; }
+                        Key::Named(NamedKey::ArrowUp) => {
+                            s.quick_finder.selected = s.quick_finder.selected.saturating_sub(1);
+                        }
+                        Key::Named(NamedKey::ArrowDown) => {
+                            let n = s.quick_finder.filtered.len();
+                            if n > 0 { s.quick_finder.selected = (s.quick_finder.selected + 1).min(n - 1); }
+                        }
+                        Key::Named(NamedKey::Enter) => {
+                            let idx = s.quick_finder.selected;
+                            if let Some(&fi) = s.quick_finder.filtered.get(idx) {
+                                let path = s.quick_finder.entries[fi].clone();
+                                s.quick_finder.open = false;
+                                open_or_reuse_tab(s, path);
+                            }
+                        }
+                        Key::Named(NamedKey::Backspace) => {
+                            s.quick_finder.query.pop();
+                            refilter_quick_finder(s);
+                        }
+                        Key::Character(c) => {
+                            s.quick_finder.query.push_str(c.as_str());
+                            for ch in c.chars() { s.glyphs.load(ch); }
+                            refilter_quick_finder(s);
+                        }
+                        _ => {}
+                    }
+                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                    return;
+                }
+
+                // Command palette input routing
+                if s.command_palette.open {
+                    match &event.logical_key {
+                        Key::Named(NamedKey::Escape) => { s.command_palette.open = false; }
+                        Key::Named(NamedKey::ArrowUp) => {
+                            s.command_palette.selected = s.command_palette.selected.saturating_sub(1);
+                        }
+                        Key::Named(NamedKey::ArrowDown) => {
+                            let n = s.command_palette.filtered.len();
+                            if n > 0 { s.command_palette.selected = (s.command_palette.selected + 1).min(n - 1); }
+                        }
+                        Key::Named(NamedKey::Enter) => {
+                            let idx = s.command_palette.selected;
+                            if let Some(&fi) = s.command_palette.filtered.get(idx) {
+                                let action = COMMANDS[fi].action;
+                                s.command_palette.open = false;
+                                execute_command(s, action);
+                            }
+                        }
+                        Key::Named(NamedKey::Backspace) => {
+                            s.command_palette.query.pop();
+                            refilter_command_palette(s);
+                        }
+                        Key::Character(c) => {
+                            s.command_palette.query.push_str(c.as_str());
+                            for ch in c.chars() { s.glyphs.load(ch); }
+                            refilter_command_palette(s);
+                        }
+                        _ => {}
+                    }
+                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                    return;
+                }
+
+                // Context menu keyboard (Escape to close)
+                if s.context_menu.is_some() {
+                    if matches!(&event.logical_key, Key::Named(NamedKey::Escape)) {
+                        s.context_menu = None;
+                    }
+                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                    return;
+                }
+
+                // Global find panel input routing (when a field has focus)
+                if s.explorer.is_some() && s.left_view == LeftView::GlobalSearch
+                    && !matches!(s.global_find.focus, GlobalFindFocus::Results)
+                {
+                    let focus = s.global_find.focus;
+                    match &event.logical_key {
+                        Key::Named(NamedKey::Escape) => { s.global_find.focus = GlobalFindFocus::Results; }
+                        Key::Named(NamedKey::Tab) => {
+                            s.global_find.focus = match focus {
+                                GlobalFindFocus::Query   => if shift { GlobalFindFocus::Exclude } else { GlobalFindFocus::Replace },
+                                GlobalFindFocus::Replace => if shift { GlobalFindFocus::Query }   else { GlobalFindFocus::Include },
+                                GlobalFindFocus::Include => if shift { GlobalFindFocus::Replace } else { GlobalFindFocus::Exclude },
+                                GlobalFindFocus::Exclude => if shift { GlobalFindFocus::Include } else { GlobalFindFocus::Query },
+                                GlobalFindFocus::Results => GlobalFindFocus::Query,
+                            };
+                        }
+                        Key::Named(NamedKey::Enter) if focus == GlobalFindFocus::Query => {
+                            let root = s.explorer.as_ref().map(|e| e.root.clone())
+                                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                            let query   = s.global_find.query.clone();
+                            let include = s.global_find.include_glob.clone();
+                            let exclude = s.global_find.exclude_glob.clone();
+                            let cs      = s.global_find.case_sensitive;
+                            if !query.is_empty() {
+                                let results = global_search(&root, &query, &include, &exclude, cs);
+                                s.global_find.results  = results;
+                                s.global_find.selected = 0;
+                                s.global_find.scroll   = 0;
+                                s.global_find.focus    = GlobalFindFocus::Results;
+                            }
+                        }
+                        Key::Named(NamedKey::Backspace) => {
+                            let field = match focus {
+                                GlobalFindFocus::Query   => &mut s.global_find.query,
+                                GlobalFindFocus::Replace => &mut s.global_find.replace,
+                                GlobalFindFocus::Include => &mut s.global_find.include_glob,
+                                GlobalFindFocus::Exclude => &mut s.global_find.exclude_glob,
+                                GlobalFindFocus::Results => unreachable!(),
+                            };
+                            field.pop();
+                        }
+                        Key::Character(c) => {
+                            for ch in c.chars() { s.glyphs.load(ch); }
+                            let cs = c.to_string();
+                            let field = match focus {
+                                GlobalFindFocus::Query   => &mut s.global_find.query,
+                                GlobalFindFocus::Replace => &mut s.global_find.replace,
+                                GlobalFindFocus::Include => &mut s.global_find.include_glob,
+                                GlobalFindFocus::Exclude => &mut s.global_find.exclude_glob,
+                                GlobalFindFocus::Results => unreachable!(),
+                            };
+                            field.push_str(&cs);
+                        }
+                        _ => {}
+                    }
+                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                    return;
+                }
+
+                // Global find results navigation
+                if s.explorer.is_some() && s.left_view == LeftView::GlobalSearch
+                    && s.global_find.focus == GlobalFindFocus::Results
+                    && !s.global_find.results.is_empty()
+                {
+                    match &event.logical_key {
+                        Key::Named(NamedKey::ArrowUp) => {
+                            s.global_find.selected = s.global_find.selected.saturating_sub(1);
+                        }
+                        Key::Named(NamedKey::ArrowDown) => {
+                            let n = s.global_find.results.len();
+                            s.global_find.selected = (s.global_find.selected + 1).min(n.saturating_sub(1));
+                        }
+                        Key::Named(NamedKey::Enter) => {
+                            let r = s.global_find.results[s.global_find.selected].clone();
+                            open_or_reuse_tab(s, r.path.clone());
+                            let line = r.line_num;
+                            let col  = r.match_col;
+                            let pos  = s.tab().text.line_to_char(line) + col;
+                            s.tab_mut().cursors = vec![Cursor::new(pos)];
+                            s.ensure_visible();
+                        }
+                        _ => {}
+                    }
                     { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                     return;
                 }
@@ -2709,25 +3612,27 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     // Cmd+V — paste from clipboard
                     if cmd && matches!(&event.logical_key, Key::Character(c) if matches!(c.as_str(), "v" | "V")) {
+                        s.term_sel = None;
                         let text = clipboard_read();
                         if !text.is_empty() {
                             let p = &s.panes[&s.active_pane];
                             if let Some(&tid) = p.term_ids.get(p.active) {
                                 if let Some(tp) = s.term_panes.get(&tid) {
                                     let bytes = text.as_bytes();
-                                    unsafe { libc::write(tp.pty_fd, bytes.as_ptr().cast(), bytes.len()); }
+                                    if tp.pty_fd >= 0 { let _ = unsafe { libc::write(tp.pty_fd, bytes.as_ptr().cast(), bytes.len()) }; }
                                 }
                             }
                         }
                         return;
                     }
                     // Forward all other key events to the active PTY
+                    s.term_sel = None;
                     let bytes = terminal::encode_key(&event.logical_key, s.mods, event.text.as_deref());
                     if let Some(bytes) = bytes {
                         let p = &s.panes[&s.active_pane];
                         if let Some(&tid) = p.term_ids.get(p.active) {
                             if let Some(tp) = s.term_panes.get(&tid) {
-                                unsafe { libc::write(tp.pty_fd, bytes.as_ptr().cast(), bytes.len()); }
+                                if tp.pty_fd >= 0 { let _ = unsafe { libc::write(tp.pty_fd, bytes.as_ptr().cast(), bytes.len()) }; }
                             }
                         }
                     }
@@ -2796,26 +3701,39 @@ impl ApplicationHandler<UserEvent> for App {
                             s.tab_mut().cursors = vec![Cursor { head: len, tail: 0 }];
                             true
                         } else if cmd && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "c") {
-                            if let Some(text) = s.tab().sel_text() { clipboard_set(&text); }
+                            {
+                                let order = s.cursor_order_ltr();
+                                let texts: Vec<String> = order.iter()
+                                    .filter(|&&i| s.tab().cursors[i].has_sel())
+                                    .map(|&i| { let lo = s.tab().cursors[i].lo(); let hi = s.tab().cursors[i].hi(); s.tab().text.slice(lo..hi).chars().collect() })
+                                    .collect();
+                                if !texts.is_empty() { clipboard_set(&texts.join("\n")); }
+                            }
                             true
                         } else if cmd && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "x") {
-                            if let Some(text) = s.tab().sel_text() {
-                                clipboard_set(&text);
-                                s.push_undo(false);
+                            {
                                 let order = s.cursor_order_ltr();
-                                let mut delta: isize = 0;
-                                for &i in &order {
-                                    if s.tab().cursors[i].has_sel() {
-                                        let lo = (s.tab().cursors[i].lo() as isize + delta) as usize;
-                                        let hi = (s.tab().cursors[i].hi() as isize + delta) as usize;
-                                        s.tab_mut().text.remove(lo..hi);
-                                        s.tab_mut().cursors[i] = Cursor::new(lo);
-                                        delta -= (hi - lo) as isize;
-                                        s.tab_mut().dirty = true;
+                                let texts: Vec<String> = order.iter()
+                                    .filter(|&&i| s.tab().cursors[i].has_sel())
+                                    .map(|&i| { let lo = s.tab().cursors[i].lo(); let hi = s.tab().cursors[i].hi(); s.tab().text.slice(lo..hi).chars().collect() })
+                                    .collect();
+                                if !texts.is_empty() {
+                                    clipboard_set(&texts.join("\n"));
+                                    s.push_undo(false);
+                                    let mut delta: isize = 0;
+                                    for &i in &order {
+                                        if s.tab().cursors[i].has_sel() {
+                                            let lo = (s.tab().cursors[i].lo() as isize + delta) as usize;
+                                            let hi = (s.tab().cursors[i].hi() as isize + delta) as usize;
+                                            s.tab_mut().text.remove(lo..hi);
+                                            s.tab_mut().cursors[i] = Cursor::new(lo);
+                                            delta -= (hi - lo) as isize;
+                                            s.tab_mut().dirty = true;
+                                        }
                                     }
+                                    s.dedup_cursors();
+                                    s.ensure_visible();
                                 }
-                                s.dedup_cursors();
-                                s.ensure_visible();
                             }
                             true
                         } else if cmd && !shift && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "z") {
@@ -2827,7 +3745,14 @@ impl ApplicationHandler<UserEvent> for App {
                         } else if cmd && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "v") {
                             if let Some(text) = clipboard_get() {
                                 for ch in text.chars() { s.glyphs.load(ch); }
-                                s.insert_str(&text);
+                                let n_cursors = s.tab().cursors.len();
+                                let lines: Vec<&str> = text.split('\n').collect();
+                                if n_cursors > 1 && lines.len() == n_cursors {
+                                    let owned: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+                                    s.insert_str_per_cursor(&owned);
+                                } else {
+                                    s.insert_str(&text);
+                                }
                             }
                             true
                         } else if cmd && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "o") {
@@ -3355,6 +4280,52 @@ fn render(s: &mut State) {
         })
     }).collect();
 
+    let rainbow = s.settings.rainbow_brackets;
+
+    // Pre-pass: update hl_cache and max_line_len for all visible editor panes (mutable pass)
+    for &(pid, rect) in &layout {
+        let Some(pane) = s.panes.get_mut(&pid) else { continue };
+        if pane.kind != PaneKind::Editor { continue; }
+        let active = pane.active;
+        let Some(tab) = pane.tabs.get_mut(active) else { continue };
+        if tab.kind == TabKind::Settings { continue; }
+        let lang = tab.path.as_deref().map(Lang::from_path).unwrap_or(Lang::None);
+        let fh  = if pane.find.open { lh + 4 + if pane.find.replace_open { lh + 4 } else { 0 } } else { 0 };
+        let vis = ((rect.h - tab_h - fh).max(0) / lh).max(1) as usize;
+        let scroll = tab.scroll;
+        let total  = tab.text.len_lines();
+
+        // Cache max_line_len on demand
+        if tab.max_line_len.is_none() {
+            tab.max_line_len = Some((0..total).map(|li| State::line_len(&tab.text, li)).max().unwrap_or(0));
+        }
+
+        // Rebuild hl_cache from hl_dirty_from up through scroll + vis
+        if lang != Lang::None {
+            let need_up_to = (scroll + vis).min(total);
+            let current_len = tab.hl_cache.len();
+            if current_len < total { tab.hl_cache.resize(total, (MlState::Normal, 0)); }
+            if tab.hl_dirty_from < need_up_to {
+                let (start_state, start_depth) = if tab.hl_dirty_from == 0 {
+                    (MlState::Normal, 0i32)
+                } else {
+                    tab.hl_cache.get(tab.hl_dirty_from - 1).copied().unwrap_or((MlState::Normal, 0))
+                };
+                let mut state = start_state;
+                let mut depth = start_depth;
+                for li in tab.hl_dirty_from..need_up_to {
+                    tab.hl_cache[li] = (state, depth);
+                    let chars: Vec<char> = tab.text.line(li)
+                        .chars().take_while(|&c| c != '\n' && c != '\r').collect();
+                    let (_, ns, nd) = highlight_line(&chars, lang, state, rainbow, depth);
+                    state = ns;
+                    depth = nd;
+                }
+                tab.hl_dirty_from = need_up_to;
+            }
+        }
+    }
+
     // Build per-pane snapshots (editor panes only)
     let pane_snaps: Vec<PaneSnap> = layout.iter().filter_map(|&(pid, rect)| {
         let pane = s.panes.get(&pid)?;
@@ -3402,34 +4373,32 @@ fn render(s: &mut State) {
             find_matches(&tab.text, &fq, pane.find.case_sensitive, pane.find.whole_word)
         } else { vec![] };
 
-        // Syntax highlight lines
-        let mut hl_state = MlState::Normal;
-        if lang != Lang::None {
-            for li in 0..scroll {
-                let chars: Vec<char> = tab.text.line(li)
-                    .chars().take_while(|&c| c != '\n' && c != '\r').collect();
-                let (_, ns) = highlight_line(&chars, lang, hl_state);
-                hl_state = ns;
-            }
-        }
+        // Syntax highlight lines — use hl_cache for pre-scroll state (populated in pre-pass above)
+        let (mut hl_state, mut bracket_depth) = if lang != Lang::None {
+            tab.hl_cache.get(scroll).copied().unwrap_or((MlState::Normal, 0))
+        } else {
+            (MlState::Normal, 0i32)
+        };
         let line_count = vis.min(total.saturating_sub(scroll));
         let mut lines: Vec<(String, usize, Vec<u32>)> = Vec::with_capacity(line_count);
+        let mut char_buf: Vec<char> = Vec::with_capacity(256);
         for vi in 0..line_count {
             let li         = scroll + vi;
             let line_start = tab.text.line_to_char(li);
-            let chars: Vec<char> = tab.text.line(li)
-                .chars().take_while(|&c| c != '\n' && c != '\r').collect();
-            let text: String = chars.iter().collect();
-            let (colors, ns) = if lang != Lang::None {
-                highlight_line(&chars, lang, hl_state)
+            char_buf.clear();
+            char_buf.extend(tab.text.line(li).chars().take_while(|&c| c != '\n' && c != '\r'));
+            let text: String = char_buf.iter().collect();
+            let (colors, ns, bd) = if lang != Lang::None {
+                highlight_line(&char_buf, lang, hl_state, rainbow, bracket_depth)
             } else {
-                (vec![FG; chars.len()], hl_state)
+                (vec![FG; char_buf.len()], hl_state, bracket_depth)
             };
             hl_state = ns;
+            bracket_depth = bd;
             lines.push((text, line_start, colors));
         }
 
-        let max_line_len = (0..total).map(|li| State::line_len(&tab.text, li)).max().unwrap_or(0);
+        let max_line_len = tab.max_line_len.unwrap_or(0);
         let ln_digits = State::line_num_digits(total);
         let gutter_w  = State::gutter_w(total, cw);
         let tab_info: Vec<(String, bool)> = pane.tabs.iter()
@@ -3472,11 +4441,87 @@ fn render(s: &mut State) {
             }).collect()
         });
 
-    let renderer_is_gpu = s.renderer.is_gpu();
-    let vsync_on        = s.settings.vsync;
-    let explorer_drag   = s.explorer_drag;
-    let ui_scale        = s.font_size / FONT_PX;
+    let renderer_is_gpu  = s.renderer.is_gpu();
+    let vsync_on         = s.settings.vsync;
+    let rainbow_brackets = s.settings.rainbow_brackets;
+    let undo_limit       = s.settings.undo_limit;
+    let explorer_drag    = s.explorer_drag;
+    let ui_scale         = s.font_size / FONT_PX;
+    let left_view        = s.left_view;
+    let act_w            = s.activity_bar_w();
+    let status_msg       = s.status_msg.clone();
 
+    // Quick finder snapshot
+    let qf_open     = s.quick_finder.open;
+    let qf_query    = s.quick_finder.query.clone();
+    let qf_selected = s.quick_finder.selected;
+    let qf_items: Vec<(String, String)> = if qf_open {
+        let n = s.quick_finder.filtered.len();
+        let view_start = qf_selected.saturating_sub(4).min(n.saturating_sub(10));
+        let view_end   = (view_start + 10).min(n);
+        s.quick_finder.filtered[view_start..view_end].iter().map(|&idx| {
+            let p = &s.quick_finder.entries[idx];
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_owned();
+            let dir  = p.parent().and_then(|d| d.to_str()).unwrap_or("").to_owned();
+            (name, dir)
+        }).collect()
+    } else { vec![] };
+    let qf_sel_in_view = if qf_open {
+        let n = s.quick_finder.filtered.len();
+        let view_start = qf_selected.saturating_sub(4).min(n.saturating_sub(10));
+        qf_selected.saturating_sub(view_start)
+    } else { 0 };
+
+    // Command palette snapshot
+    let cp_open     = s.command_palette.open;
+    let cp_query    = s.command_palette.query.clone();
+    let cp_selected = s.command_palette.selected;
+    let cp_items: Vec<(String, String)> = if cp_open {
+        let n = s.command_palette.filtered.len();
+        let view_start = cp_selected.saturating_sub(4).min(n.saturating_sub(10));
+        let view_end   = (view_start + 10).min(n);
+        s.command_palette.filtered[view_start..view_end].iter().map(|&idx| {
+            (COMMANDS[idx].name.to_owned(), COMMANDS[idx].shortcut.to_owned())
+        }).collect()
+    } else { vec![] };
+    let cp_sel_in_view = if cp_open {
+        let n = s.command_palette.filtered.len();
+        let view_start = cp_selected.saturating_sub(4).min(n.saturating_sub(10));
+        cp_selected.saturating_sub(view_start)
+    } else { 0 };
+
+    // Global find snapshot
+    struct GlobalFindSnap {
+        query:    String, replace: String,
+        include:  String, exclude: String,
+        focus:    GlobalFindFocus,
+        case_sensitive: bool,
+        results:  Vec<(String, usize, String, usize, usize)>,
+        selected: usize, scroll: usize,
+    }
+    let gf_snap = if s.explorer.is_some() && left_view == LeftView::GlobalSearch {
+        Some(GlobalFindSnap {
+            query:   s.global_find.query.clone(),
+            replace: s.global_find.replace.clone(),
+            include: s.global_find.include_glob.clone(),
+            exclude: s.global_find.exclude_glob.clone(),
+            focus:   s.global_find.focus,
+            case_sensitive: s.global_find.case_sensitive,
+            results: s.global_find.results.iter().map(|r| {
+                let name = r.path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_owned();
+                (name, r.line_num, r.line_text.clone(), r.match_col, r.match_len)
+            }).collect(),
+            selected: s.global_find.selected,
+            scroll:   s.global_find.scroll,
+        })
+    } else { None };
+
+    // Context menu snapshot
+    let ctx_menu_snap: Option<(i32, i32, Vec<&'static str>, usize)> =
+        s.context_menu.as_ref().map(|m| (m.x, m.y, m.items.clone(), m.hovered));
+
+    // SAFETY: render_frame takes FnOnce and calls it synchronously before returning.
+    // s.glyphs is alive for the entire duration, and renderer does not alias glyphs.
     let glyphs = &s.glyphs as *const Glyphs;
 
     s.renderer.render_frame(move |buf, w, h| {
@@ -3484,26 +4529,124 @@ fn render(s: &mut State) {
 
         for p in buf.iter_mut() { *p = BG; }
 
-        // ── Explorer panel ────────────────────────────────────────────────
+        // ── Activity bar + left panel ─────────────────────────────────────
         if let Some(entries) = &explorer_snap {
             let panel_h = h as i32 - status_h;
-            fill(buf, w, h, 0, 0, explorer_w, panel_h, BG2);
+
+            // Activity bar (narrow strip at x=0)
+            fill(buf, w, h, 0, 0, act_w, panel_h, BG);
+            fill(buf, w, h, act_w - 1, 0, 1, panel_h, BORDER);
+
+            let icon_size = lh;
+            let file_icon_y = 8;
+            let srch_icon_y = file_icon_y + icon_size + 4;
+            let gear_y      = panel_h - icon_size - 8;
+
+            // File tree icon
+            let ft_active = left_view == LeftView::FileTree;
+            if ft_active { fill(buf, w, h, 0, file_icon_y, 2, icon_size, ACCENT); }
+            let ft_bg = if ft_active { SEL_BG } else { BG };
+            fill(buf, w, h, 2, file_icon_y, act_w - 3, icon_size, ft_bg);
+            draw_str(buf, w, h, g, " [F]", 2, file_icon_y + asc, if ft_active { ACCENT } else { FG_DIM }, act_w - 1);
+
+            // Search icon
+            let gs_active = left_view == LeftView::GlobalSearch;
+            if gs_active { fill(buf, w, h, 0, srch_icon_y, 2, icon_size, ACCENT); }
+            let gs_bg = if gs_active { SEL_BG } else { BG };
+            fill(buf, w, h, 2, srch_icon_y, act_w - 3, icon_size, gs_bg);
+            draw_str(buf, w, h, g, " [S]", 2, srch_icon_y + asc, if gs_active { ACCENT } else { FG_DIM }, act_w - 1);
+
+            // Gear icon — centered, full-width
+            fill(buf, w, h, 2, gear_y, act_w - 3, icon_size, SEL_BG);
+            let gear_x = 2 + (act_w - 3 - cw) / 2;
+            draw_str(buf, w, h, g, "⚙", gear_x, gear_y + asc, FG, act_w - 1);
+
+            // Left panel area (file tree or global search)
+            let px = act_w; // panel x
+            let pw = explorer_w; // panel width
+            fill(buf, w, h, px, 0, pw, panel_h, BG2);
             let border_col = if explorer_drag { ACCENT } else { BORDER };
-            fill(buf, w, h, explorer_w - 1, 0, 1, panel_h, border_col);
+            fill(buf, w, h, px + pw - 1, 0, 1, panel_h, border_col);
 
-            let toggle_label = if show_hidden { "  [x] .hidden" } else { "  [ ] .hidden" };
-            draw_str(buf, w, h, g, toggle_label, 0, asc, FG_DIM, explorer_w - 1);
-            fill(buf, w, h, 0, lh - 1, explorer_w - 1, 1, BORDER);
+            if left_view == LeftView::FileTree {
+                let toggle_label = if show_hidden { " [x] .hidden" } else { " [ ] .hidden" };
+                draw_str(buf, w, h, g, toggle_label, px, asc, FG_DIM, px + pw - 1);
+                fill(buf, w, h, px, lh - 1, pw - 1, 1, BORDER);
+                for (i, (name, is_dir, expanded, depth, selected)) in entries.iter().enumerate() {
+                    let ey = lh + i as i32 * lh;
+                    if ey + lh > h as i32 - status_h { break; }
+                    let baseline = ey + asc;
+                    if *selected { fill(buf, w, h, px, ey, pw - 1, lh, SEL_BG); }
+                    let prefix = if *is_dir { if *expanded { "▼ " } else { "▶ " } } else { "  " };
+                    let indent = px + *depth as i32 * 10 + 4;
+                    let label  = format!("{prefix}{name}");
+                    draw_str(buf, w, h, g, &label, indent, baseline, FG, px + pw - 1);
+                }
+            } else if let Some(ref gf) = gf_snap {
+                // Global search panel
+                let row_h = lh + 2;
+                let field_label_w = 9 * cw;
+                let field_x = px + field_label_w;
+                let field_w = pw - field_label_w - 4;
 
-            for (i, (name, is_dir, expanded, depth, selected)) in entries.iter().enumerate() {
-                let ey = lh + i as i32 * lh;
-                if ey + lh > h as i32 - status_h { break; }
-                let baseline = ey + asc;
-                if *selected { fill(buf, w, h, 0, ey, explorer_w - 1, lh, SEL_BG); }
-                let prefix = if *is_dir { if *expanded { "▼ " } else { "▶ " } } else { "  " };
-                let indent = *depth as i32 * 10 + 4;
-                let label  = format!("{prefix}{name}");
-                draw_str(buf, w, h, g, &label, indent, baseline, FG, explorer_w - 1);
+                // Helper: draw a labeled input field row
+                let mut fy = 4;
+                let fields = [
+                    ("Query:   ", &gf.query,   GlobalFindFocus::Query),
+                    ("Replace: ", &gf.replace, GlobalFindFocus::Replace),
+                    ("Include: ", &gf.include, GlobalFindFocus::Include),
+                    ("Exclude: ", &gf.exclude, GlobalFindFocus::Exclude),
+                ];
+                for (label, value, foc) in &fields {
+                    draw_str(buf, w, h, g, label, px + 2, fy + asc, FG_DIM, field_x);
+                    let is_active = gf.focus == *foc;
+                    let bg = if is_active { SEL_BG } else { BG };
+                    fill(buf, w, h, field_x, fy, field_w, lh, bg);
+                    if is_active { fill(buf, w, h, field_x, fy + lh - 1, field_w, 1, ACCENT); }
+                    let disp: String = value.chars().rev().take((field_w / cw).max(0) as usize).collect::<String>().chars().rev().collect();
+                    draw_str(buf, w, h, g, &disp, field_x + 2, fy + asc, FG, field_x + field_w);
+                    if is_active {
+                        let cx = field_x + 2 + disp.chars().count() as i32 * cw;
+                        fill(buf, w, h, cx.min(field_x + field_w - 2), fy, 1, lh, ACCENT);
+                    }
+                    fy += row_h;
+                }
+
+                // Buttons row
+                fy += 2;
+                let search_label = "[Search]";
+                let sl = search_label.chars().count() as i32 * cw;
+                fill(buf, w, h, field_x, fy, sl, lh, SEL_BG);
+                draw_str(buf, w, h, g, search_label, field_x, fy + asc, ACCENT, field_x + sl);
+                if !gf.replace.is_empty() && !gf.results.is_empty() {
+                    let ra_label = "[Repl All]";
+                    let rl = ra_label.chars().count() as i32 * cw;
+                    let rx = field_x + sl + cw;
+                    fill(buf, w, h, rx, fy, rl, lh, SEL_BG);
+                    draw_str(buf, w, h, g, ra_label, rx, fy + asc, ACCENT, rx + rl);
+                }
+                fy += row_h + 4;
+                fill(buf, w, h, px, fy - 1, pw - 1, 1, BORDER);
+
+                // Results
+                let res_h = (h as i32 - status_h - fy).max(0);
+                let vis_count = (res_h / lh).max(0) as usize;
+                let start = gf.scroll.min(gf.results.len());
+                let end   = (start + vis_count).min(gf.results.len());
+                let count_str = format!(" {} match(es)", gf.results.len());
+                draw_str(buf, w, h, g, &count_str, px, fy + asc, FG_DIM, px + pw - 1);
+                fy += lh;
+                for (ri, (name, line_num, line_text, _match_col, _match_len)) in gf.results[start..end].iter().enumerate() {
+                    let ry = fy + ri as i32 * lh;
+                    if ry + lh > h as i32 - status_h { break; }
+                    let is_sel = start + ri == gf.selected;
+                    if is_sel { fill(buf, w, h, px, ry, pw - 1, lh, SEL_BG); }
+                    let header = format!("{}:{}", name, line_num + 1);
+                    draw_str(buf, w, h, g, &header, px + 2, ry + asc, ACCENT, px + pw - 1);
+                    let hlen = header.chars().count() as i32 * cw + 4;
+                    let preview: String = line_text.trim().chars().take(((pw - hlen) / cw).max(0) as usize).collect();
+                    draw_str(buf, w, h, g, &preview, px + 2 + hlen, ry + asc, FG_DIM, px + pw - 1);
+                }
             }
         }
 
@@ -3567,13 +4710,38 @@ fn render(s: &mut State) {
                 draw_str(buf, w, h, g, "  UI Scale", r.x, sy + asc, FG, btn_x - cw);
                 let scale_str = format!("  {:.0}%  (Cmd+= / Cmd+-)", ui_scale * 100.0);
                 draw_str(buf, w, h, g, &scale_str, btn_x, sy + asc, FG_DIM, r.x + r.w);
+                // Rainbow Brackets row
+                let rb_y = sy + lh + 4;
+                draw_str(buf, w, h, g, "  Rainbow Brackets", r.x, rb_y + asc, FG, btn_x - cw);
+                let (rb_bg, rb_fg) = if rainbow_brackets { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
+                fill(buf, w, h, btn_x, rb_y, 8 * cw, lh, rb_bg);
+                draw_str(buf, w, h, g, if rainbow_brackets { " [x] On " } else { " [ ] Off" }, btn_x, rb_y + asc, rb_fg, btn_x + 8 * cw);
+                // Undo History toggle row
+                let ul_y = rb_y + lh + 4;
+                draw_str(buf, w, h, g, "  Undo History", r.x, ul_y + asc, FG, btn_x - cw);
+                let unlimited = undo_limit.is_none();
+                let (ul_bg, ul_fg) = if unlimited { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
+                fill(buf, w, h, btn_x, ul_y, 12 * cw, lh, ul_bg);
+                draw_str(buf, w, h, g, if unlimited { " [x] Unlimited" } else { " [ ] Unlimited" }, btn_x, ul_y + asc, ul_fg, btn_x + 12 * cw);
+                // Undo Limit spinner row (only when limit is Some)
+                if let Some(lim) = undo_limit {
+                    let ul_num_y = ul_y + lh + 4;
+                    draw_str(buf, w, h, g, "  Undo Limit", r.x, ul_num_y + asc, FG, btn_x - cw);
+                    fill(buf, w, h, btn_x, ul_num_y, 3 * cw, lh, SEL_BG);
+                    draw_str(buf, w, h, g, " - ", btn_x, ul_num_y + asc, FG, btn_x + 3 * cw);
+                    let lim_str = format!("  {}  ", lim);
+                    draw_str(buf, w, h, g, &lim_str, btn_x + 3 * cw, ul_num_y + asc, FG_DIM, btn_x + 11 * cw);
+                    fill(buf, w, h, btn_x + 11 * cw, ul_num_y, 3 * cw, lh, SEL_BG);
+                    draw_str(buf, w, h, g, " + ", btn_x + 11 * cw, ul_num_y + asc, FG, btn_x + 14 * cw);
+                }
                 // Info row
                 let info = if renderer_is_gpu {
                     "  GPU (+~66 MB at 4K) — no tearing at any size"
                 } else {
                     "  CPU (no extra RAM) — coalesced + vsync-aligned"
                 };
-                draw_str(buf, w, h, g, info, r.x, sy + lh + 4 + asc, FG_DIM, r.x + r.w);
+                let info_y = if undo_limit.is_some() { ul_y + lh * 2 + 8 } else { ul_y + lh + 4 };
+                draw_str(buf, w, h, g, info, r.x, info_y + asc, FG_DIM, r.x + r.w);
                 continue;
             }
 
@@ -3880,12 +5048,88 @@ fn render(s: &mut State) {
         fill(buf, w, h, 0, sy, w as i32, 1, BORDER);
 
         let sbase = sy + status_h * 3 / 4;
-        if let Some(snap) = pane_snaps.iter().find(|p| p.is_active) {
+        if let Some(msg) = &status_msg {
+            draw_str(buf, w, h, g, &format!("  {msg}"), 0, sbase, 0xFFB86C, w as i32);
+        } else if let Some(snap) = pane_snaps.iter().find(|p| p.is_active) {
             let dirty_mark = if snap.dirty { " *" } else { "" };
             draw_str(buf, w, h, g, &format!("  {}{dirty_mark}", snap.path_name), 0, sbase, FG, w as i32);
             let lc_str = format!("Ln {}, Col {}  ", snap.cur_line + 1, snap.cur_col + 1);
             let lc_w   = lc_str.chars().count() as i32 * cw;
             draw_str(buf, w, h, g, &lc_str, w as i32 - lc_w, sbase, FG_DIM, w as i32);
+        }
+
+        // ── Context menu ──────────────────────────────────────────────────
+        if let Some((mx, my, items, hovered)) = &ctx_menu_snap {
+            let item_h = lh + 2;
+            let menu_w = items.iter().map(|s| s.chars().count()).max().unwrap_or(10) as i32 * cw + cw * 2;
+            let menu_h = items.len() as i32 * item_h + 4;
+            let menu_x = (*mx).min(w as i32 - menu_w);
+            let menu_y = (*my - menu_h).max(0);
+            fill(buf, w, h, menu_x, menu_y, menu_w, menu_h, BG2);
+            fill(buf, w, h, menu_x, menu_y, menu_w, 1, BORDER);
+            fill(buf, w, h, menu_x, menu_y + menu_h - 1, menu_w, 1, BORDER);
+            fill(buf, w, h, menu_x, menu_y, 1, menu_h, BORDER);
+            fill(buf, w, h, menu_x + menu_w - 1, menu_y, 1, menu_h, BORDER);
+            for (i, item) in items.iter().enumerate() {
+                let iy = menu_y + 2 + i as i32 * item_h;
+                if i == *hovered { fill(buf, w, h, menu_x + 1, iy, menu_w - 2, item_h, SEL_BG); }
+                draw_str(buf, w, h, g, item, menu_x + cw, iy + asc, FG, menu_x + menu_w - 1);
+            }
+        }
+
+        // ── Quick file finder overlay ─────────────────────────────────────
+        if qf_open {
+            darken_buffer(buf, w, h);
+            let ow = (w as i32 * 2 / 3).min(w as i32 - 40);
+            let oh = lh * (qf_items.len() as i32 + 2) + 8;
+            let ox = (w as i32 - ow) / 2;
+            let oy = h as i32 / 4;
+            fill(buf, w, h, ox, oy, ow, oh, BG2);
+            fill(buf, w, h, ox, oy, ow, 1, BORDER);
+            fill(buf, w, h, ox, oy + oh - 1, ow, 1, BORDER);
+            fill(buf, w, h, ox, oy, 1, oh, BORDER);
+            fill(buf, w, h, ox + ow - 1, oy, 1, oh, BORDER);
+            // Query row
+            draw_str(buf, w, h, g, "> ", ox + 4, oy + 4 + asc, ACCENT, ox + ow - 4);
+            draw_str(buf, w, h, g, &qf_query, ox + 4 + 2 * cw, oy + 4 + asc, FG, ox + ow - 4);
+            let cur_x = ox + 4 + 2 * cw + qf_query.chars().count() as i32 * cw;
+            fill(buf, w, h, cur_x.min(ox + ow - 4), oy + 4, 1, lh, ACCENT);
+            // Result rows
+            for (i, (name, dir)) in qf_items.iter().enumerate() {
+                let ry = oy + 4 + lh + 4 + i as i32 * lh;
+                if i == qf_sel_in_view { fill(buf, w, h, ox + 1, ry, ow - 2, lh, SEL_BG); }
+                draw_str(buf, w, h, g, name, ox + 6, ry + asc, FG, ox + ow - 4 - dir.chars().count() as i32 * cw - cw);
+                draw_str(buf, w, h, g, dir, ox + ow - 4 - dir.chars().count() as i32 * cw, ry + asc, FG_DIM, ox + ow - 2);
+            }
+        }
+
+        // ── Command palette overlay ───────────────────────────────────────
+        if cp_open {
+            darken_buffer(buf, w, h);
+            let ow = (w as i32 / 2).min(w as i32 - 40).max(300);
+            let oh = lh * (cp_items.len() as i32 + 2) + 8;
+            let ox = (w as i32 - ow) / 2;
+            let oy = h as i32 / 4;
+            fill(buf, w, h, ox, oy, ow, oh, BG2);
+            fill(buf, w, h, ox, oy, ow, 1, BORDER);
+            fill(buf, w, h, ox, oy + oh - 1, ow, 1, BORDER);
+            fill(buf, w, h, ox, oy, 1, oh, BORDER);
+            fill(buf, w, h, ox + ow - 1, oy, 1, oh, BORDER);
+            // Query row
+            draw_str(buf, w, h, g, "> ", ox + 4, oy + 4 + asc, ACCENT, ox + ow - 4);
+            draw_str(buf, w, h, g, &cp_query, ox + 4 + 2 * cw, oy + 4 + asc, FG, ox + ow - 4);
+            let cur_x = ox + 4 + 2 * cw + cp_query.chars().count() as i32 * cw;
+            fill(buf, w, h, cur_x.min(ox + ow - 4), oy + 4, 1, lh, ACCENT);
+            // Command rows
+            for (i, (name, shortcut)) in cp_items.iter().enumerate() {
+                let ry = oy + 4 + lh + 4 + i as i32 * lh;
+                if i == cp_sel_in_view { fill(buf, w, h, ox + 1, ry, ow - 2, lh, SEL_BG); }
+                draw_str(buf, w, h, g, name, ox + 6, ry + asc, FG, ox + ow - 4);
+                if !shortcut.is_empty() {
+                    let sw = shortcut.chars().count() as i32 * cw;
+                    draw_str(buf, w, h, g, shortcut, ox + ow - 4 - sw, ry + asc, FG_DIM, ox + ow - 2);
+                }
+            }
         }
     });
 }

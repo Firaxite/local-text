@@ -1,0 +1,1 @@
+/Users/clauder/projects/local-text/CLAUDE.md
