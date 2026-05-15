@@ -199,6 +199,8 @@ struct FindBar {
     focus:          FindFocus,
     cursor_query:   usize,
     cursor_replace: usize,
+    sel_anchor_q:   Option<usize>,
+    sel_anchor_r:   Option<usize>,
 }
 
 impl FindBar {
@@ -209,6 +211,7 @@ impl FindBar {
             case_sensitive: false, whole_word: false,
             focus: FindFocus::Query,
             cursor_query: 0, cursor_replace: 0,
+            sel_anchor_q: None, sel_anchor_r: None,
         }
     }
 }
@@ -229,6 +232,7 @@ struct QuickFinder {
     open:              bool,
     query:             String,
     cursor:            usize,
+    sel_anchor:        Option<usize>,
     entries:           Vec<std::path::PathBuf>,
     filtered:          Vec<usize>,
     filtered_commands: Vec<usize>,
@@ -285,6 +289,10 @@ struct GlobalFind {
     cursor_replace: usize,
     cursor_include: usize,
     cursor_exclude: usize,
+    sel_anchor_q:   Option<usize>,
+    sel_anchor_r:   Option<usize>,
+    sel_anchor_inc: Option<usize>,
+    sel_anchor_exc: Option<usize>,
 }
 
 // ── Tab (per-file state) ──────────────────────────────────────────────────────
@@ -399,17 +407,18 @@ struct FileEntry {
 }
 
 struct FileExplorer {
-    root:                PathBuf,
-    entries:             Vec<FileEntry>,
-    selected:            usize,
-    show_hidden:         bool,
-    tree_search:         String,
-    tree_search_cursor:  usize,
-    tree_search_focused: bool,
-    tree_search_fuzzy:   bool,
-    tree_search_entries: Vec<std::path::PathBuf>,
-    tree_search_results: Vec<std::path::PathBuf>,
-    tree_search_sel:     usize,
+    root:                    PathBuf,
+    entries:                 Vec<FileEntry>,
+    selected:                usize,
+    show_hidden:             bool,
+    tree_search:             String,
+    tree_search_cursor:      usize,
+    tree_search_sel_anchor:  Option<usize>,
+    tree_search_focused:     bool,
+    tree_search_fuzzy:       bool,
+    tree_search_entries:     Vec<std::path::PathBuf>,
+    tree_search_results:     Vec<std::path::PathBuf>,
+    tree_search_sel:         usize,
 }
 
 impl FileExplorer {
@@ -417,7 +426,7 @@ impl FileExplorer {
         let entries = load_dir_entries(&root, 0, false);
         FileExplorer {
             root, entries, selected: 0, show_hidden: false,
-            tree_search: String::new(), tree_search_cursor: 0,
+            tree_search: String::new(), tree_search_cursor: 0, tree_search_sel_anchor: None,
             tree_search_focused: false, tree_search_fuzzy: true,
             tree_search_entries: vec![], tree_search_results: vec![], tree_search_sel: 0,
         }
@@ -2171,30 +2180,88 @@ fn qf_next_word(s: &str, cursor: usize) -> usize {
     i
 }
 
-fn input_field_edit(field: &mut String, cursor: &mut usize, key: &Key, cmd: bool, alt: bool, ctrl: bool) -> bool {
+/// Given a monospaced field, compute the byte offset from a pixel x click.
+/// text_start_x: pixel where text begins; cw: char width; current_cursor_chars and
+/// vis_chars determine the current scroll position.
+fn field_click_to_byte(field: &str, mx: i32, text_start_x: i32, cw: i32,
+                       current_cursor_chars: usize, vis_chars: usize) -> usize {
+    let hscroll = current_cursor_chars.saturating_sub(vis_chars.saturating_sub(1));
+    let clicked_char = ((mx - text_start_x) / cw + hscroll as i32).max(0) as usize;
+    field.char_indices().nth(clicked_char).map(|(b, _)| b).unwrap_or(field.len())
+}
+
+fn input_field_edit(
+    field:  &mut String,
+    cursor: &mut usize,
+    sel:    &mut Option<usize>,
+    key:    &Key,
+    cmd:    bool,
+    alt:    bool,
+    ctrl:   bool,
+    shift:  bool,
+) -> bool {
+    // Snapshot selection range before any mutation to avoid borrow conflicts
+    let sel_range: Option<(usize, usize)> = sel.and_then(|a| {
+        let mn = a.min(*cursor);
+        let mx = a.max(*cursor);
+        if mn < mx { Some((mn, mx)) } else { None }
+    });
+
     match key {
         Key::Named(NamedKey::ArrowLeft) => {
+            if !shift {
+                if let Some((mn, _)) = sel_range {
+                    *cursor = mn; *sel = None; return true;
+                }
+                *sel = None;
+            } else if sel.is_none() {
+                *sel = Some(*cursor);
+            }
             *cursor = if alt { qf_prev_word(field, *cursor) }
                       else if cmd { 0 }
                       else { qf_prev_char(field, *cursor) };
             true
         }
         Key::Named(NamedKey::ArrowRight) => {
+            if !shift {
+                if let Some((_, mx)) = sel_range {
+                    *cursor = mx; *sel = None; return true;
+                }
+                *sel = None;
+            } else if sel.is_none() {
+                *sel = Some(*cursor);
+            }
             *cursor = if alt { qf_next_word(field, *cursor) }
                       else if cmd { field.len() }
                       else { qf_next_char(field, *cursor) };
             true
         }
-        Key::Named(NamedKey::Home) => { *cursor = 0; true }
-        Key::Named(NamedKey::End)  => { *cursor = field.len(); true }
+        Key::Named(NamedKey::Home) => {
+            if shift && sel.is_none() { *sel = Some(*cursor); }
+            *cursor = 0;
+            if !shift { *sel = None; }
+            true
+        }
+        Key::Named(NamedKey::End) => {
+            if shift && sel.is_none() { *sel = Some(*cursor); }
+            *cursor = field.len();
+            if !shift { *sel = None; }
+            true
+        }
         Key::Named(NamedKey::Delete) => {
-            let next = qf_next_char(field, *cursor);
-            if next > *cursor { field.drain(*cursor..next); }
+            if let Some((mn, mx)) = sel_range {
+                field.drain(mn..mx); *cursor = mn; *sel = None;
+            } else {
+                let next = qf_next_char(field, *cursor);
+                if next > *cursor { field.drain(*cursor..next); }
+            }
             true
         }
         Key::Named(NamedKey::Backspace) => {
-            if cmd {
-                field.clear(); *cursor = 0;
+            if let Some((mn, mx)) = sel_range {
+                field.drain(mn..mx); *cursor = mn; *sel = None;
+            } else if cmd {
+                field.clear(); *cursor = 0; *sel = None;
             } else if alt {
                 let nc = qf_prev_word(field, *cursor);
                 field.drain(nc..*cursor); *cursor = nc;
@@ -2204,16 +2271,42 @@ fn input_field_edit(field: &mut String, cursor: &mut usize, key: &Key, cmd: bool
             }
             true
         }
-        Key::Character(c) => {
-            if cmd && c.as_str() == "a" {
-                *cursor = field.len(); true
-            } else if !cmd && !ctrl {
-                let s = c.as_str();
-                field.insert_str(*cursor, s);
-                *cursor += s.len();
+        Key::Character(c) => match c.as_str() {
+            "a" if cmd => {
+                *sel = Some(0); *cursor = field.len(); true
+            }
+            "c" if cmd => {
+                if let Some((mn, mx)) = sel_range { clipboard_write(&field[mn..mx]); }
                 true
-            } else { false }
-        }
+            }
+            "x" if cmd => {
+                if let Some((mn, mx)) = sel_range {
+                    let text = field[mn..mx].to_owned();
+                    clipboard_write(&text);
+                    field.drain(mn..mx); *cursor = mn; *sel = None;
+                }
+                true
+            }
+            "v" if cmd => {
+                let text = clipboard_read();
+                if !text.is_empty() {
+                    if let Some((mn, mx)) = sel_range {
+                        field.drain(mn..mx); *cursor = mn; *sel = None;
+                    }
+                    field.insert_str(*cursor, &text);
+                    *cursor += text.len();
+                }
+                true
+            }
+            s if !cmd && !ctrl => {
+                if let Some((mn, mx)) = sel_range {
+                    field.drain(mn..mx); *cursor = mn; *sel = None;
+                }
+                field.insert_str(*cursor, s); *cursor += s.len();
+                true
+            }
+            _ => false,
+        },
         _ => false,
     }
 }
@@ -2245,8 +2338,11 @@ fn open_quick_finder(s: &mut State) {
     s.quick_finder.filtered_commands = vec![];
     s.quick_finder.query             = String::new();
     s.quick_finder.cursor            = 0;
+    s.quick_finder.sel_anchor        = None;
     s.quick_finder.selected          = 0;
     s.quick_finder.open              = true;
+    // Unfocus tree search so it doesn't swallow subsequent keystrokes
+    if let Some(ex) = s.explorer.as_mut() { ex.tree_search_focused = false; }
 }
 
 fn refilter_quick_finder(s: &mut State) {
@@ -2610,7 +2706,7 @@ impl ApplicationHandler<UserEvent> for App {
             left_view:    LeftView::FileTree,
             context_menu: None,
             quick_finder: QuickFinder {
-                open: false, query: String::new(), cursor: 0,
+                open: false, query: String::new(), cursor: 0, sel_anchor: None,
                 entries: vec![], filtered: vec![], filtered_commands: vec![], selected: 0,
             },
             global_find: GlobalFind {
@@ -2619,6 +2715,7 @@ impl ApplicationHandler<UserEvent> for App {
                 results: vec![], scroll: 0, selected: 0,
                 focus: GlobalFindFocus::Query, case_sensitive: false,
                 cursor_query: 0, cursor_replace: 0, cursor_include: 0, cursor_exclude: 0,
+                sel_anchor_q: None, sel_anchor_r: None, sel_anchor_inc: None, sel_anchor_exc: None,
             },
             status_msg: startup_status,
         };
@@ -2879,6 +2976,39 @@ impl ApplicationHandler<UserEvent> for App {
                 let my  = s.mouse_y as i32;
                 let alt = s.mods.alt_key();
                 let cmd = s.mods.super_key();
+                let shift = s.mods.shift_key();
+
+                // Quick finder overlay click (must run before other handlers)
+                if s.quick_finder.open {
+                    let cw = s.glyphs.cw;
+                    let lh = s.glyphs.lh;
+                    let ow = (s.w as i32 * 2 / 3).min(s.w as i32 - 40).max(360);
+                    let ox = (s.w as i32 - ow) / 2;
+                    let oy = s.h as i32 / 4;
+                    let item_count = if s.quick_finder.query.starts_with('>') {
+                        s.quick_finder.filtered_commands.len()
+                    } else { s.quick_finder.filtered.len() };
+                    let oh = lh * (item_count as i32 + 2) + 8;
+                    if mx >= ox && mx < ox + ow && my >= oy && my < oy + oh {
+                        // Click in input row
+                        if my < oy + 4 + lh {
+                            let is_cmd = s.quick_finder.query.starts_with('>');
+                            let text_start_x = if is_cmd { ox + 4 + cw } else { ox + 4 + 2 * cw };
+                            let field_clip = ox + ow - 4;
+                            let vis = ((field_clip - text_start_x) / cw).max(0) as usize;
+                            let cur_chars = s.quick_finder.query[..s.quick_finder.cursor].chars().count();
+                            let new_byte = field_click_to_byte(&s.quick_finder.query, mx, text_start_x, cw, cur_chars, vis);
+                            if shift && s.quick_finder.sel_anchor.is_none() {
+                                s.quick_finder.sel_anchor = Some(s.quick_finder.cursor);
+                            } else if !shift {
+                                s.quick_finder.sel_anchor = None;
+                            }
+                            s.quick_finder.cursor = new_byte;
+                        }
+                        { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                        return;
+                    }
+                }
 
                 // Dismiss context menu on any click outside it
                 if let Some(ref cm) = s.context_menu {
@@ -2949,7 +3079,8 @@ impl ApplicationHandler<UserEvent> for App {
                 }
 
                 // Left panel click (file tree or global search)
-                if s.explorer.is_some() && mx >= act_w && mx < act_w + s.explorer_w() {
+                let explorer_w = s.explorer_w();
+                if s.explorer.is_some() && mx >= act_w && mx < act_w + explorer_w {
                     let lh  = s.glyphs.lh;
                     if s.left_view == LeftView::FileTree {
                         let cw  = s.glyphs.cw;
@@ -2971,6 +3102,16 @@ impl ApplicationHandler<UserEvent> for App {
                                     let root = ex.root.clone();
                                     walk_files(&root, &mut ex.tree_search_entries, 0);
                                 }
+                                // Position cursor at click point
+                                let fuzzy_toggle_w = 3 * cw + 6;
+                                let sx = act_w + fuzzy_toggle_w;
+                                let pw = explorer_w;
+                                let sw = (pw - fuzzy_toggle_w - 2).max(0);
+                                let vis = ((sw - 4) / cw).max(0) as usize;
+                                let cur_chars = ex.tree_search[..ex.tree_search_cursor].chars().count();
+                                let new_byte = field_click_to_byte(&ex.tree_search, mx, sx + 2, cw, cur_chars, vis);
+                                ex.tree_search_cursor = new_byte;
+                                ex.tree_search_sel_anchor = None;
                             }
                         } else if row >= 2 {
                             let idx = (row - 2) as usize;
@@ -3003,7 +3144,28 @@ impl ApplicationHandler<UserEvent> for App {
                         if my >= fields_start_y && my < fields_start_y + 4 * row_h {
                             let fi = ((my - fields_start_y) / row_h).clamp(0, 3) as usize;
                             if mx >= act_w + field_label_w {
+                                let gf_field_w = s.explorer_w() - field_label_w - 4;
+                                let field_x    = act_w + field_label_w;
+                                let cw_g       = s.glyphs.cw;
+                                let vis = ((gf_field_w - 4) / cw_g).max(0) as usize;
                                 s.global_find.focus = fields[fi];
+                                // Compute new cursor position from click (need field text + prev cursor)
+                                let (field_text, prev_cursor) = match fields[fi] {
+                                    GlobalFindFocus::Query   => (s.global_find.query.clone(),        s.global_find.cursor_query),
+                                    GlobalFindFocus::Replace => (s.global_find.replace.clone(),      s.global_find.cursor_replace),
+                                    GlobalFindFocus::Include => (s.global_find.include_glob.clone(), s.global_find.cursor_include),
+                                    GlobalFindFocus::Exclude => (s.global_find.exclude_glob.clone(), s.global_find.cursor_exclude),
+                                    _ => unreachable!(),
+                                };
+                                let cur_chars = field_text[..prev_cursor].chars().count();
+                                let new_byte = field_click_to_byte(&field_text, mx, field_x + 2, cw_g, cur_chars, vis);
+                                match fields[fi] {
+                                    GlobalFindFocus::Query   => { s.global_find.cursor_query   = new_byte; s.global_find.sel_anchor_q   = None; }
+                                    GlobalFindFocus::Replace => { s.global_find.cursor_replace = new_byte; s.global_find.sel_anchor_r   = None; }
+                                    GlobalFindFocus::Include => { s.global_find.cursor_include = new_byte; s.global_find.sel_anchor_inc = None; }
+                                    GlobalFindFocus::Exclude => { s.global_find.cursor_exclude = new_byte; s.global_find.sel_anchor_exc = None; }
+                                    _ => {}
+                                }
                             }
                         } else if my >= search_btn_y && my < search_btn_y + lh {
                             // Search button
@@ -3312,9 +3474,20 @@ impl ApplicationHandler<UserEvent> for App {
                         let wl_x     = aa_x + (aa_len + 1) as i32 * cw;
                         if mx >= aa_x && mx < wl_x { s.find_mut().case_sensitive = !s.find().case_sensitive; }
                         else if mx >= wl_x         { s.find_mut().whole_word     = !s.find().whole_word; }
-                        else                       { s.find_mut().focus = FindFocus::Query; }
+                        else {
+                            // Click in query field — focus and position cursor
+                            let lw = "Find: ".len() as i32 * cw;
+                            let qx = pane_rect.x + 4 + lw;
+                            let qclip = aa_x - cw;
+                            let q_vis = ((qclip - qx) / cw).max(0) as usize;
+                            let f = s.find_mut();
+                            f.focus = FindFocus::Query;
+                            let cur_chars = f.query[..f.cursor_query].chars().count();
+                            let new_byte = field_click_to_byte(&f.query, mx, qx, cw, cur_chars, q_vis);
+                            f.cursor_query = new_byte;
+                            f.sel_anchor_q = None;
+                        }
                     } else if rel_row == 1 && s.find().replace_open {
-                        s.find_mut().focus = FindFocus::Replace;
                         let repl_len = 6usize;
                         let all_len  = 5usize;
                         let btn_w    = (repl_len + 1 + all_len) as i32 * cw + 8;
@@ -3322,6 +3495,19 @@ impl ApplicationHandler<UserEvent> for App {
                         let all_x    = btn_x + (repl_len + 1) as i32 * cw;
                         if mx >= btn_x && mx < all_x { replace_current(s); }
                         else if mx >= all_x          { replace_all(s); }
+                        else {
+                            // Click in replace field — focus and position cursor
+                            let rlw = "Replace: ".len() as i32 * cw;
+                            let rx = pane_rect.x + 4 + rlw;
+                            let rclip = btn_x - cw;
+                            let r_vis = ((rclip - rx) / cw).max(0) as usize;
+                            let f = s.find_mut();
+                            f.focus = FindFocus::Replace;
+                            let cur_chars = f.replace[..f.cursor_replace].chars().count();
+                            let new_byte = field_click_to_byte(&f.replace, mx, rx, cw, cur_chars, r_vis);
+                            f.cursor_replace = new_byte;
+                            f.sel_anchor_r = None;
+                        }
                     }
                     { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                     return;
@@ -3563,10 +3749,12 @@ impl ApplicationHandler<UserEvent> for App {
                                 if !cmd && !ctrl { for ch in c.chars() { s.glyphs.load(ch); } }
                             }
                             if let Some(ex) = s.explorer.as_mut() {
-                                let changed = input_field_edit(
+                                let prev = ex.tree_search.clone();
+                                input_field_edit(
                                     &mut ex.tree_search, &mut ex.tree_search_cursor,
-                                    key, cmd, alt, ctrl);
-                                if changed { refilter_tree_search(ex); }
+                                    &mut ex.tree_search_sel_anchor,
+                                    key, cmd, alt, ctrl, shift);
+                                if ex.tree_search != prev { refilter_tree_search(ex); }
                             }
                         }
                     }
@@ -3604,64 +3792,18 @@ impl ApplicationHandler<UserEvent> for App {
                                 open_or_reuse_tab(s, path);
                             }
                         }
-                        Key::Named(NamedKey::ArrowLeft) => {
-                            s.quick_finder.cursor = if alt {
-                                qf_prev_word(&s.quick_finder.query, s.quick_finder.cursor)
-                            } else if cmd {
-                                0
-                            } else {
-                                qf_prev_char(&s.quick_finder.query, s.quick_finder.cursor)
-                            };
-                        }
-                        Key::Named(NamedKey::ArrowRight) => {
-                            s.quick_finder.cursor = if alt {
-                                qf_next_word(&s.quick_finder.query, s.quick_finder.cursor)
-                            } else if cmd {
-                                s.quick_finder.query.len()
-                            } else {
-                                qf_next_char(&s.quick_finder.query, s.quick_finder.cursor)
-                            };
-                        }
-                        Key::Named(NamedKey::Home) => {
-                            s.quick_finder.cursor = 0;
-                        }
-                        Key::Named(NamedKey::End) => {
-                            s.quick_finder.cursor = s.quick_finder.query.len();
-                        }
-                        Key::Named(NamedKey::Delete) => {
-                            let next = qf_next_char(&s.quick_finder.query, s.quick_finder.cursor);
-                            if next > s.quick_finder.cursor {
-                                s.quick_finder.query.drain(s.quick_finder.cursor..next);
-                                refilter_quick_finder(s);
+                        key => {
+                            if let Key::Character(c) = key {
+                                if !cmd && !ctrl { for ch in c.chars() { s.glyphs.load(ch); } }
                             }
-                        }
-                        Key::Named(NamedKey::Backspace) => {
-                            if cmd {
-                                s.quick_finder.query.clear();
-                                s.quick_finder.cursor = 0;
-                            } else if alt {
-                                let new_cur = qf_prev_word(&s.quick_finder.query, s.quick_finder.cursor);
-                                s.quick_finder.query.drain(new_cur..s.quick_finder.cursor);
-                                s.quick_finder.cursor = new_cur;
-                            } else if s.quick_finder.cursor > 0 {
-                                let new_cur = qf_prev_char(&s.quick_finder.query, s.quick_finder.cursor);
-                                s.quick_finder.query.drain(new_cur..s.quick_finder.cursor);
-                                s.quick_finder.cursor = new_cur;
+                            let prev = s.quick_finder.query.clone();
+                            {
+                                let qf = &mut s.quick_finder;
+                                input_field_edit(&mut qf.query, &mut qf.cursor, &mut qf.sel_anchor,
+                                                 key, cmd, alt, ctrl, shift);
                             }
-                            refilter_quick_finder(s);
+                            if s.quick_finder.query != prev { refilter_quick_finder(s); }
                         }
-                        Key::Character(c) => {
-                            if cmd && c.as_str() == "a" {
-                                s.quick_finder.cursor = s.quick_finder.query.len();
-                            } else if !cmd && !ctrl {
-                                let c_str = c.as_str();
-                                s.quick_finder.query.insert_str(s.quick_finder.cursor, c_str);
-                                s.quick_finder.cursor += c_str.len();
-                                for ch in c.chars() { s.glyphs.load(ch); }
-                                refilter_quick_finder(s);
-                            }
-                        }
-                        _ => {}
                     }
                     { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                     return;
@@ -3729,14 +3871,14 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                             let gf = &mut s.global_find;
                             let focus = gf.focus;
-                            let (field, cursor) = match focus {
-                                GlobalFindFocus::Query   => (&mut gf.query,        &mut gf.cursor_query),
-                                GlobalFindFocus::Replace => (&mut gf.replace,      &mut gf.cursor_replace),
-                                GlobalFindFocus::Include => (&mut gf.include_glob, &mut gf.cursor_include),
-                                GlobalFindFocus::Exclude => (&mut gf.exclude_glob, &mut gf.cursor_exclude),
+                            let (field, cursor, sel) = match focus {
+                                GlobalFindFocus::Query   => (&mut gf.query,        &mut gf.cursor_query,   &mut gf.sel_anchor_q),
+                                GlobalFindFocus::Replace => (&mut gf.replace,      &mut gf.cursor_replace, &mut gf.sel_anchor_r),
+                                GlobalFindFocus::Include => (&mut gf.include_glob, &mut gf.cursor_include, &mut gf.sel_anchor_inc),
+                                GlobalFindFocus::Exclude => (&mut gf.exclude_glob, &mut gf.cursor_exclude, &mut gf.sel_anchor_exc),
                                 GlobalFindFocus::Results => unreachable!(),
                             };
-                            input_field_edit(field, cursor, key, cmd, alt, ctrl);
+                            input_field_edit(field, cursor, sel, key, cmd, alt, ctrl, shift);
                         }
                     }
                     { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
@@ -3922,11 +4064,11 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                             let f = s.find_mut();
                             let focus = f.focus;
-                            let (field, cursor) = match focus {
-                                FindFocus::Query   => (&mut f.query,   &mut f.cursor_query),
-                                FindFocus::Replace => (&mut f.replace, &mut f.cursor_replace),
+                            let (field, cursor, sel) = match focus {
+                                FindFocus::Query   => (&mut f.query,   &mut f.cursor_query,   &mut f.sel_anchor_q),
+                                FindFocus::Replace => (&mut f.replace, &mut f.cursor_replace, &mut f.sel_anchor_r),
                             };
-                            input_field_edit(field, cursor, key, cmd, alt, ctrl)
+                            input_field_edit(field, cursor, sel, key, cmd, alt, ctrl, shift)
                         }
                     }
                 } else { false };
@@ -4415,6 +4557,8 @@ struct PaneSnap {
     find_repl:      String,
     find_cursor_q:  usize,
     find_cursor_r:  usize,
+    find_sel_q:     Option<usize>,
+    find_sel_r:     Option<usize>,
     lines:          Vec<(String, usize, Vec<u32>)>,
     total:          usize,
     max_line_len:   usize,
@@ -4610,6 +4754,7 @@ fn render(s: &mut State) {
                 find_focus: FindFocus::Query, case_sensitive: false, whole_word: false,
                 find_query: String::new(), find_repl: String::new(),
                 find_cursor_q: 0, find_cursor_r: 0,
+                find_sel_q: None, find_sel_r: None,
                 lines: vec![], total: 0, max_line_len: 0,
                 gutter_w: 0, ln_digits: 0,
                 path_name: String::from("Settings"), dirty: false,
@@ -4683,6 +4828,8 @@ fn render(s: &mut State) {
             find_query: fq, find_repl: pane.find.replace.clone(),
             find_cursor_q: pane.find.query[..pane.find.cursor_query].chars().count(),
             find_cursor_r: pane.find.replace[..pane.find.cursor_replace].chars().count(),
+            find_sel_q: pane.find.sel_anchor_q.map(|a| pane.find.query[..a].chars().count()),
+            find_sel_r: pane.find.sel_anchor_r.map(|a| pane.find.replace[..a].chars().count()),
             lines, total, max_line_len, gutter_w, ln_digits,
             tab_info, active_tab: pane.active,
             path_name: tab.display_name().to_owned(), dirty: tab.dirty,
@@ -4723,6 +4870,8 @@ fn render(s: &mut State) {
     let qf_open         = s.quick_finder.open;
     let qf_query        = s.quick_finder.query.clone();
     let qf_cursor_chars = s.quick_finder.query[..s.quick_finder.cursor].chars().count();
+    let qf_sel_anchor_chars: Option<usize> = s.quick_finder.sel_anchor.map(|a|
+        s.quick_finder.query[..a].chars().count());
     let qf_is_cmd_mode  = qf_query.starts_with('>');
     let qf_selected     = s.quick_finder.selected;
     let qf_items: Vec<(String, String)> = if qf_open && !qf_is_cmd_mode {
@@ -4756,7 +4905,7 @@ fn render(s: &mut State) {
     } else { 0 };
 
     // Tree search snapshot
-    let tree_search_snap: Option<(String, bool, bool, Vec<(String, String)>, usize, usize)> =
+    let tree_search_snap: Option<(String, bool, bool, Vec<(String, String)>, usize, usize, Option<usize>)> =
         s.explorer.as_ref().map(|ex| {
             let items: Vec<(String, String)> = ex.tree_search_results.iter().take(100).map(|p| {
                 let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_owned();
@@ -4764,7 +4913,8 @@ fn render(s: &mut State) {
                 (name, dir)
             }).collect();
             let cursor_chars = ex.tree_search[..ex.tree_search_cursor].chars().count();
-            (ex.tree_search.clone(), ex.tree_search_focused, ex.tree_search_fuzzy, items, ex.tree_search_sel, cursor_chars)
+            let sel_anchor_chars = ex.tree_search_sel_anchor.map(|a| ex.tree_search[..a].chars().count());
+            (ex.tree_search.clone(), ex.tree_search_focused, ex.tree_search_fuzzy, items, ex.tree_search_sel, cursor_chars, sel_anchor_chars)
         });
 
     // Global find snapshot
@@ -4777,6 +4927,8 @@ fn render(s: &mut State) {
         selected: usize, scroll: usize,
         cursor_query:   usize, cursor_replace: usize,
         cursor_include: usize, cursor_exclude: usize,
+        sel_q:   Option<usize>, sel_r:   Option<usize>,
+        sel_inc: Option<usize>, sel_exc: Option<usize>,
     }
     let gf_snap = if s.explorer.is_some() && left_view == LeftView::GlobalSearch {
         let gf = &s.global_find;
@@ -4797,6 +4949,10 @@ fn render(s: &mut State) {
             cursor_replace: gf.replace[..gf.cursor_replace].chars().count(),
             cursor_include: gf.include_glob[..gf.cursor_include].chars().count(),
             cursor_exclude: gf.exclude_glob[..gf.cursor_exclude].chars().count(),
+            sel_q:   gf.sel_anchor_q.map(|a| gf.query[..a].chars().count()),
+            sel_r:   gf.sel_anchor_r.map(|a| gf.replace[..a].chars().count()),
+            sel_inc: gf.sel_anchor_inc.map(|a| gf.include_glob[..a].chars().count()),
+            sel_exc: gf.sel_anchor_exc.map(|a| gf.exclude_glob[..a].chars().count()),
         })
     } else { None };
 
@@ -4861,9 +5017,9 @@ fn render(s: &mut State) {
                 // Row 1: tree search box
                 let ts_empty_str   = String::new();
                 let ts_empty_items: Vec<(String, String)> = vec![];
-                let (ts_query, ts_focused, ts_fuzzy, ts_items, ts_sel, ts_cursor) =
-                    tree_search_snap.as_ref().map(|s| (&s.0, s.1, s.2, &s.3, s.4, s.5))
-                    .unwrap_or((&ts_empty_str, false, true, &ts_empty_items, 0, 0));
+                let (ts_query, ts_focused, ts_fuzzy, ts_items, ts_sel, ts_cursor, ts_sel_anchor) =
+                    tree_search_snap.as_ref().map(|s| (&s.0, s.1, s.2, &s.3, s.4, s.5, s.6))
+                    .unwrap_or((&ts_empty_str, false, true, &ts_empty_items, 0, 0, None));
                 let fuzzy_label = if ts_fuzzy { "[~]" } else { "[=]" };
                 let toggle_w = fuzzy_label.chars().count() as i32 * cw + 4;
                 draw_str(buf, w, h, g, fuzzy_label, px + 2, lh + asc, FG_DIM, px + toggle_w);
@@ -4873,6 +5029,17 @@ fn render(s: &mut State) {
                 let ts_vis = ((sw - 4) / cw).max(0) as usize;
                 let ts_hscroll = ts_cursor.saturating_sub(ts_vis.saturating_sub(1));
                 let ts_disp: String = ts_query.chars().skip(ts_hscroll).take(ts_vis + 1).collect();
+                if ts_focused {
+                    if let Some(anc) = ts_sel_anchor {
+                        let mn = anc.min(ts_cursor);
+                        let mx = anc.max(ts_cursor);
+                        if mn < mx {
+                            let x0 = sx + 2 + (mn.saturating_sub(ts_hscroll)) as i32 * cw;
+                            let x1 = sx + 2 + ((mx - ts_hscroll).min(ts_vis + 1)) as i32 * cw;
+                            fill(buf, w, h, x0, lh, (x1 - x0).max(0), lh, SEL_BG);
+                        }
+                    }
+                }
                 draw_str(buf, w, h, g, &ts_disp, sx + 2, lh + asc, FG, sx + sw);
                 if ts_focused {
                     let cur_x = (sx + 2 + (ts_cursor - ts_hscroll) as i32 * cw).min(sx + sw - 1);
@@ -4915,12 +5082,12 @@ fn render(s: &mut State) {
                 // Helper: draw a labeled input field row
                 let mut fy = 4;
                 let fields = [
-                    ("Query:   ", &gf.query,   GlobalFindFocus::Query,   gf.cursor_query),
-                    ("Replace: ", &gf.replace, GlobalFindFocus::Replace, gf.cursor_replace),
-                    ("Include: ", &gf.include, GlobalFindFocus::Include, gf.cursor_include),
-                    ("Exclude: ", &gf.exclude, GlobalFindFocus::Exclude, gf.cursor_exclude),
+                    ("Query:   ", &gf.query,   GlobalFindFocus::Query,   gf.cursor_query,   gf.sel_q),
+                    ("Replace: ", &gf.replace, GlobalFindFocus::Replace, gf.cursor_replace, gf.sel_r),
+                    ("Include: ", &gf.include, GlobalFindFocus::Include, gf.cursor_include, gf.sel_inc),
+                    ("Exclude: ", &gf.exclude, GlobalFindFocus::Exclude, gf.cursor_exclude, gf.sel_exc),
                 ];
-                for (label, value, foc, cursor_chars) in &fields {
+                for (label, value, foc, cursor_chars, sel_anc) in &fields {
                     draw_str(buf, w, h, g, label, px + 2, fy + asc, FG_DIM, field_x);
                     let is_active = gf.focus == *foc;
                     let bg = if is_active { SEL_BG } else { BG };
@@ -4928,6 +5095,15 @@ fn render(s: &mut State) {
                     if is_active { fill(buf, w, h, field_x, fy + lh - 1, field_w, 1, ACCENT); }
                     let vis = ((field_w - 4) / cw).max(0) as usize;
                     let hscroll = cursor_chars.saturating_sub(vis.saturating_sub(1));
+                    if let Some(anc) = sel_anc {
+                        let mn = anc.min(cursor_chars);
+                        let mx = anc.max(cursor_chars);
+                        if mn < mx {
+                            let x0 = field_x + 2 + (mn.saturating_sub(hscroll)) as i32 * cw;
+                            let x1 = field_x + 2 + ((mx - hscroll).min(vis + 1)) as i32 * cw;
+                            fill(buf, w, h, x0, fy, (x1 - x0).max(0), lh, HL_MATCH);
+                        }
+                    }
                     let disp: String = value.chars().skip(hscroll).take(vis + 1).collect();
                     draw_str(buf, w, h, g, &disp, field_x + 2, fy + asc, FG, field_x + field_w);
                     if is_active {
@@ -5216,6 +5392,15 @@ fn render(s: &mut State) {
                 let qclip = mc_x - cw;
                 let q_vis = ((qclip - qx) / cw).max(0) as usize;
                 let q_hscroll = snap.find_cursor_q.saturating_sub(q_vis.saturating_sub(1));
+                if let Some(anc) = snap.find_sel_q {
+                    let mn = anc.min(snap.find_cursor_q);
+                    let mx = anc.max(snap.find_cursor_q);
+                    if mn < mx {
+                        let x0 = (qx + (mn.saturating_sub(q_hscroll)) as i32 * cw).min(qclip);
+                        let x1 = (qx + ((mx - q_hscroll).min(q_vis + 1)) as i32 * cw).min(qclip);
+                        fill(buf, w, h, x0, find_y + 2, (x1 - x0).max(0), lh, HL_MATCH);
+                    }
+                }
                 let q_disp: String = snap.find_query.chars().skip(q_hscroll).take(q_vis + 1).collect();
                 draw_str(buf, w, h, g, &q_disp, qx, row1_base, FG, qclip);
                 if snap.find_focus == FindFocus::Query {
@@ -5244,6 +5429,15 @@ fn render(s: &mut State) {
                     let rclip = btn_x - cw;
                     let r_vis = ((rclip - rx) / cw).max(0) as usize;
                     let r_hscroll = snap.find_cursor_r.saturating_sub(r_vis.saturating_sub(1));
+                    if let Some(anc) = snap.find_sel_r {
+                        let mn = anc.min(snap.find_cursor_r);
+                        let mx = anc.max(snap.find_cursor_r);
+                        if mn < mx {
+                            let x0 = (rx + (mn.saturating_sub(r_hscroll)) as i32 * cw).min(rclip);
+                            let x1 = (rx + ((mx - r_hscroll).min(r_vis + 1)) as i32 * cw).min(rclip);
+                            fill(buf, w, h, x0, row2_y + 2, (x1 - x0).max(0), lh, HL_MATCH);
+                        }
+                    }
                     let r_disp: String = snap.find_repl.chars().skip(r_hscroll).take(r_vis + 1).collect();
                     draw_str(buf, w, h, g, &r_disp, rx, row2_base, FG, rclip);
                     if snap.find_focus == FindFocus::Replace {
@@ -5423,6 +5617,16 @@ fn render(s: &mut State) {
             fill(buf, w, h, ox + ow - 1, oy, 1, oh, BORDER);
             // Query row
             if qf_is_cmd_mode {
+                // Selection highlight
+                if let Some(anc) = qf_sel_anchor_chars {
+                    let mn = anc.min(qf_cursor_chars);
+                    let mx = anc.max(qf_cursor_chars);
+                    if mn < mx {
+                        let x0 = ox + 4 + mn as i32 * cw;
+                        let x1 = (ox + 4 + mx as i32 * cw).min(ox + ow - 4);
+                        fill(buf, w, h, x0, oy + 4, (x1 - x0).max(0), lh, HL_MATCH);
+                    }
+                }
                 // Leading '>' in accent, rest of query in FG
                 draw_str(buf, w, h, g, ">", ox + 4, oy + 4 + asc, ACCENT, ox + 4 + cw);
                 if qf_query.len() > 1 {
@@ -5431,6 +5635,16 @@ fn render(s: &mut State) {
                 let cur_x = ox + 4 + qf_cursor_chars as i32 * cw;
                 fill(buf, w, h, cur_x.min(ox + ow - 4), oy + 4, 1, lh, ACCENT);
             } else {
+                // Selection highlight
+                if let Some(anc) = qf_sel_anchor_chars {
+                    let mn = anc.min(qf_cursor_chars);
+                    let mx = anc.max(qf_cursor_chars);
+                    if mn < mx {
+                        let x0 = ox + 4 + 2 * cw + mn as i32 * cw;
+                        let x1 = (ox + 4 + 2 * cw + mx as i32 * cw).min(ox + ow - 4);
+                        fill(buf, w, h, x0, oy + 4, (x1 - x0).max(0), lh, HL_MATCH);
+                    }
+                }
                 draw_str(buf, w, h, g, "> ", ox + 4, oy + 4 + asc, FG_DIM, ox + ow - 4);
                 draw_str(buf, w, h, g, &qf_query, ox + 4 + 2 * cw, oy + 4 + asc, FG, ox + ow - 4);
                 let cur_x = ox + 4 + 2 * cw + qf_cursor_chars as i32 * cw;
