@@ -197,6 +197,8 @@ struct FindBar {
     case_sensitive: bool,
     whole_word:     bool,
     focus:          FindFocus,
+    cursor_query:   usize,
+    cursor_replace: usize,
 }
 
 impl FindBar {
@@ -206,10 +208,8 @@ impl FindBar {
             query: String::new(), replace: String::new(),
             case_sensitive: false, whole_word: false,
             focus: FindFocus::Query,
+            cursor_query: 0, cursor_replace: 0,
         }
-    }
-    fn active_field_mut(&mut self) -> &mut String {
-        if self.focus == FindFocus::Query { &mut self.query } else { &mut self.replace }
     }
 }
 
@@ -281,6 +281,10 @@ struct GlobalFind {
     selected:       usize,
     focus:          GlobalFindFocus,
     case_sensitive: bool,
+    cursor_query:   usize,
+    cursor_replace: usize,
+    cursor_include: usize,
+    cursor_exclude: usize,
 }
 
 // ── Tab (per-file state) ──────────────────────────────────────────────────────
@@ -400,6 +404,7 @@ struct FileExplorer {
     selected:            usize,
     show_hidden:         bool,
     tree_search:         String,
+    tree_search_cursor:  usize,
     tree_search_focused: bool,
     tree_search_fuzzy:   bool,
     tree_search_entries: Vec<std::path::PathBuf>,
@@ -412,7 +417,8 @@ impl FileExplorer {
         let entries = load_dir_entries(&root, 0, false);
         FileExplorer {
             root, entries, selected: 0, show_hidden: false,
-            tree_search: String::new(), tree_search_focused: false, tree_search_fuzzy: true,
+            tree_search: String::new(), tree_search_cursor: 0,
+            tree_search_focused: false, tree_search_fuzzy: true,
             tree_search_entries: vec![], tree_search_results: vec![], tree_search_sel: 0,
         }
     }
@@ -2165,6 +2171,53 @@ fn qf_next_word(s: &str, cursor: usize) -> usize {
     i
 }
 
+fn input_field_edit(field: &mut String, cursor: &mut usize, key: &Key, cmd: bool, alt: bool, ctrl: bool) -> bool {
+    match key {
+        Key::Named(NamedKey::ArrowLeft) => {
+            *cursor = if alt { qf_prev_word(field, *cursor) }
+                      else if cmd { 0 }
+                      else { qf_prev_char(field, *cursor) };
+            true
+        }
+        Key::Named(NamedKey::ArrowRight) => {
+            *cursor = if alt { qf_next_word(field, *cursor) }
+                      else if cmd { field.len() }
+                      else { qf_next_char(field, *cursor) };
+            true
+        }
+        Key::Named(NamedKey::Home) => { *cursor = 0; true }
+        Key::Named(NamedKey::End)  => { *cursor = field.len(); true }
+        Key::Named(NamedKey::Delete) => {
+            let next = qf_next_char(field, *cursor);
+            if next > *cursor { field.drain(*cursor..next); }
+            true
+        }
+        Key::Named(NamedKey::Backspace) => {
+            if cmd {
+                field.clear(); *cursor = 0;
+            } else if alt {
+                let nc = qf_prev_word(field, *cursor);
+                field.drain(nc..*cursor); *cursor = nc;
+            } else if *cursor > 0 {
+                let nc = qf_prev_char(field, *cursor);
+                field.drain(nc..*cursor); *cursor = nc;
+            }
+            true
+        }
+        Key::Character(c) => {
+            if cmd && c.as_str() == "a" {
+                *cursor = field.len(); true
+            } else if !cmd && !ctrl {
+                let s = c.as_str();
+                field.insert_str(*cursor, s);
+                *cursor += s.len();
+                true
+            } else { false }
+        }
+        _ => false,
+    }
+}
+
 fn walk_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>, depth: usize) {
     if depth > 12 { return; }
     let Ok(rd) = std::fs::read_dir(dir) else { return };
@@ -2565,6 +2618,7 @@ impl ApplicationHandler<UserEvent> for App {
                 include_glob: String::new(), exclude_glob: String::new(),
                 results: vec![], scroll: 0, selected: 0,
                 focus: GlobalFindFocus::Query, case_sensitive: false,
+                cursor_query: 0, cursor_replace: 0, cursor_include: 0, cursor_exclude: 0,
             },
             status_msg: startup_status,
         };
@@ -3504,20 +3558,17 @@ impl ApplicationHandler<UserEvent> for App {
                                 open_or_reuse_tab(s, path);
                             }
                         }
-                        Key::Named(NamedKey::Backspace) => {
+                        key => {
+                            if let Key::Character(c) = key {
+                                if !cmd && !ctrl { for ch in c.chars() { s.glyphs.load(ch); } }
+                            }
                             if let Some(ex) = s.explorer.as_mut() {
-                                ex.tree_search.pop();
-                                refilter_tree_search(ex);
+                                let changed = input_field_edit(
+                                    &mut ex.tree_search, &mut ex.tree_search_cursor,
+                                    key, cmd, alt, ctrl);
+                                if changed { refilter_tree_search(ex); }
                             }
                         }
-                        Key::Character(c) => {
-                            for ch in c.chars() { s.glyphs.load(ch); }
-                            if let Some(ex) = s.explorer.as_mut() {
-                                ex.tree_search.push_str(c.as_str());
-                                refilter_tree_search(ex);
-                            }
-                        }
-                        _ => {}
                     }
                     { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                     return;
@@ -3633,13 +3684,29 @@ impl ApplicationHandler<UserEvent> for App {
                     match &event.logical_key {
                         Key::Named(NamedKey::Escape) => { s.global_find.focus = GlobalFindFocus::Results; }
                         Key::Named(NamedKey::Tab) => {
-                            s.global_find.focus = match focus {
+                            let nf = match focus {
                                 GlobalFindFocus::Query   => if shift { GlobalFindFocus::Exclude } else { GlobalFindFocus::Replace },
                                 GlobalFindFocus::Replace => if shift { GlobalFindFocus::Query }   else { GlobalFindFocus::Include },
                                 GlobalFindFocus::Include => if shift { GlobalFindFocus::Replace } else { GlobalFindFocus::Exclude },
                                 GlobalFindFocus::Exclude => if shift { GlobalFindFocus::Include } else { GlobalFindFocus::Query },
                                 GlobalFindFocus::Results => GlobalFindFocus::Query,
                             };
+                            s.global_find.focus = nf;
+                            // Reset cursor to end of newly focused field
+                            let new_len = match nf {
+                                GlobalFindFocus::Query   => s.global_find.query.len(),
+                                GlobalFindFocus::Replace => s.global_find.replace.len(),
+                                GlobalFindFocus::Include => s.global_find.include_glob.len(),
+                                GlobalFindFocus::Exclude => s.global_find.exclude_glob.len(),
+                                GlobalFindFocus::Results => 0,
+                            };
+                            *match nf {
+                                GlobalFindFocus::Query   => &mut s.global_find.cursor_query,
+                                GlobalFindFocus::Replace => &mut s.global_find.cursor_replace,
+                                GlobalFindFocus::Include => &mut s.global_find.cursor_include,
+                                GlobalFindFocus::Exclude => &mut s.global_find.cursor_exclude,
+                                GlobalFindFocus::Results => &mut s.global_find.cursor_query,
+                            } = new_len;
                         }
                         Key::Named(NamedKey::Enter) if focus == GlobalFindFocus::Query => {
                             let root = s.explorer.as_ref().map(|e| e.root.clone())
@@ -3656,29 +3723,21 @@ impl ApplicationHandler<UserEvent> for App {
                                 s.global_find.focus    = GlobalFindFocus::Results;
                             }
                         }
-                        Key::Named(NamedKey::Backspace) => {
-                            let field = match focus {
-                                GlobalFindFocus::Query   => &mut s.global_find.query,
-                                GlobalFindFocus::Replace => &mut s.global_find.replace,
-                                GlobalFindFocus::Include => &mut s.global_find.include_glob,
-                                GlobalFindFocus::Exclude => &mut s.global_find.exclude_glob,
+                        key => {
+                            if let Key::Character(c) = key {
+                                if !cmd && !ctrl { for ch in c.chars() { s.glyphs.load(ch); } }
+                            }
+                            let gf = &mut s.global_find;
+                            let focus = gf.focus;
+                            let (field, cursor) = match focus {
+                                GlobalFindFocus::Query   => (&mut gf.query,        &mut gf.cursor_query),
+                                GlobalFindFocus::Replace => (&mut gf.replace,      &mut gf.cursor_replace),
+                                GlobalFindFocus::Include => (&mut gf.include_glob, &mut gf.cursor_include),
+                                GlobalFindFocus::Exclude => (&mut gf.exclude_glob, &mut gf.cursor_exclude),
                                 GlobalFindFocus::Results => unreachable!(),
                             };
-                            field.pop();
+                            input_field_edit(field, cursor, key, cmd, alt, ctrl);
                         }
-                        Key::Character(c) => {
-                            for ch in c.chars() { s.glyphs.load(ch); }
-                            let cs = c.to_string();
-                            let field = match focus {
-                                GlobalFindFocus::Query   => &mut s.global_find.query,
-                                GlobalFindFocus::Replace => &mut s.global_find.replace,
-                                GlobalFindFocus::Include => &mut s.global_find.include_glob,
-                                GlobalFindFocus::Exclude => &mut s.global_find.exclude_glob,
-                                GlobalFindFocus::Results => unreachable!(),
-                            };
-                            field.push_str(&cs);
-                        }
-                        _ => {}
                     }
                     { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                     return;
@@ -3833,15 +3892,21 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
 
-                // Find bar: route non-cmd keys when open
-                if s.find().open && !cmd {
-                    match &event.logical_key {
-                        Key::Named(NamedKey::Escape) => { s.find_mut().open = false; }
+                // Find bar: intercept editing keys (including cmd variants) when open
+                let find_handled = if s.find().open {
+                    let key = &event.logical_key;
+                    match key {
+                        Key::Named(NamedKey::Escape) => { s.find_mut().open = false; true }
                         Key::Named(NamedKey::Tab) => {
                             if s.find().replace_open {
                                 let nf = if s.find().focus == FindFocus::Query { FindFocus::Replace } else { FindFocus::Query };
-                                s.find_mut().focus = nf;
+                                let new_len = if nf == FindFocus::Query { s.find().query.len() } else { s.find().replace.len() };
+                                let f = s.find_mut();
+                                f.focus = nf;
+                                if nf == FindFocus::Query { f.cursor_query = new_len; }
+                                else { f.cursor_replace = new_len; }
                             }
+                            true
                         }
                         Key::Named(NamedKey::Enter) => {
                             if s.find().focus == FindFocus::Replace && s.find().replace_open {
@@ -3849,14 +3914,23 @@ impl ApplicationHandler<UserEvent> for App {
                             } else {
                                 find_step(s, shift);
                             }
+                            true
                         }
-                        Key::Named(NamedKey::Backspace) => { s.find_mut().active_field_mut().pop(); }
-                        _ => {
-                            if let Some(txt) = event.text.as_deref() {
-                                s.find_mut().active_field_mut().push_str(txt);
+                        key => {
+                            if let Key::Character(c) = key {
+                                if !cmd && !ctrl { for ch in c.chars() { s.glyphs.load(ch); } }
                             }
+                            let f = s.find_mut();
+                            let focus = f.focus;
+                            let (field, cursor) = match focus {
+                                FindFocus::Query   => (&mut f.query,   &mut f.cursor_query),
+                                FindFocus::Replace => (&mut f.replace, &mut f.cursor_replace),
+                            };
+                            input_field_edit(field, cursor, key, cmd, alt, ctrl)
                         }
                     }
+                } else { false };
+                if find_handled {
                     { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                 } else {
                     // Cmd+W for settings tab: close the tab (never dirty, no LSP needed)
@@ -4339,6 +4413,8 @@ struct PaneSnap {
     whole_word:     bool,
     find_query:     String,
     find_repl:      String,
+    find_cursor_q:  usize,
+    find_cursor_r:  usize,
     lines:          Vec<(String, usize, Vec<u32>)>,
     total:          usize,
     max_line_len:   usize,
@@ -4533,6 +4609,7 @@ fn render(s: &mut State) {
                 find_open: false, find_repl_open: false,
                 find_focus: FindFocus::Query, case_sensitive: false, whole_word: false,
                 find_query: String::new(), find_repl: String::new(),
+                find_cursor_q: 0, find_cursor_r: 0,
                 lines: vec![], total: 0, max_line_len: 0,
                 gutter_w: 0, ln_digits: 0,
                 path_name: String::from("Settings"), dirty: false,
@@ -4604,6 +4681,8 @@ fn render(s: &mut State) {
             find_focus: pane.find.focus, case_sensitive: pane.find.case_sensitive,
             whole_word: pane.find.whole_word,
             find_query: fq, find_repl: pane.find.replace.clone(),
+            find_cursor_q: pane.find.query[..pane.find.cursor_query].chars().count(),
+            find_cursor_r: pane.find.replace[..pane.find.cursor_replace].chars().count(),
             lines, total, max_line_len, gutter_w, ln_digits,
             tab_info, active_tab: pane.active,
             path_name: tab.display_name().to_owned(), dirty: tab.dirty,
@@ -4677,14 +4756,15 @@ fn render(s: &mut State) {
     } else { 0 };
 
     // Tree search snapshot
-    let tree_search_snap: Option<(String, bool, bool, Vec<(String, String)>, usize)> =
+    let tree_search_snap: Option<(String, bool, bool, Vec<(String, String)>, usize, usize)> =
         s.explorer.as_ref().map(|ex| {
             let items: Vec<(String, String)> = ex.tree_search_results.iter().take(100).map(|p| {
                 let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_owned();
                 let dir  = p.parent().and_then(|d| d.to_str()).unwrap_or("").to_owned();
                 (name, dir)
             }).collect();
-            (ex.tree_search.clone(), ex.tree_search_focused, ex.tree_search_fuzzy, items, ex.tree_search_sel)
+            let cursor_chars = ex.tree_search[..ex.tree_search_cursor].chars().count();
+            (ex.tree_search.clone(), ex.tree_search_focused, ex.tree_search_fuzzy, items, ex.tree_search_sel, cursor_chars)
         });
 
     // Global find snapshot
@@ -4695,21 +4775,28 @@ fn render(s: &mut State) {
         case_sensitive: bool,
         results:  Vec<(String, usize, String, usize, usize)>,
         selected: usize, scroll: usize,
+        cursor_query:   usize, cursor_replace: usize,
+        cursor_include: usize, cursor_exclude: usize,
     }
     let gf_snap = if s.explorer.is_some() && left_view == LeftView::GlobalSearch {
+        let gf = &s.global_find;
         Some(GlobalFindSnap {
-            query:   s.global_find.query.clone(),
-            replace: s.global_find.replace.clone(),
-            include: s.global_find.include_glob.clone(),
-            exclude: s.global_find.exclude_glob.clone(),
-            focus:   s.global_find.focus,
-            case_sensitive: s.global_find.case_sensitive,
-            results: s.global_find.results.iter().map(|r| {
+            query:   gf.query.clone(),
+            replace: gf.replace.clone(),
+            include: gf.include_glob.clone(),
+            exclude: gf.exclude_glob.clone(),
+            focus:   gf.focus,
+            case_sensitive: gf.case_sensitive,
+            results: gf.results.iter().map(|r| {
                 let name = r.path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_owned();
                 (name, r.line_num, r.line_text.clone(), r.match_col, r.match_len)
             }).collect(),
-            selected: s.global_find.selected,
-            scroll:   s.global_find.scroll,
+            selected: gf.selected,
+            scroll:   gf.scroll,
+            cursor_query:   gf.query[..gf.cursor_query].chars().count(),
+            cursor_replace: gf.replace[..gf.cursor_replace].chars().count(),
+            cursor_include: gf.include_glob[..gf.cursor_include].chars().count(),
+            cursor_exclude: gf.exclude_glob[..gf.cursor_exclude].chars().count(),
         })
     } else { None };
 
@@ -4774,18 +4861,21 @@ fn render(s: &mut State) {
                 // Row 1: tree search box
                 let ts_empty_str   = String::new();
                 let ts_empty_items: Vec<(String, String)> = vec![];
-                let (ts_query, ts_focused, ts_fuzzy, ts_items, ts_sel) =
-                    tree_search_snap.as_ref().map(|s| (&s.0, s.1, s.2, &s.3, s.4))
-                    .unwrap_or((&ts_empty_str, false, true, &ts_empty_items, 0));
+                let (ts_query, ts_focused, ts_fuzzy, ts_items, ts_sel, ts_cursor) =
+                    tree_search_snap.as_ref().map(|s| (&s.0, s.1, s.2, &s.3, s.4, s.5))
+                    .unwrap_or((&ts_empty_str, false, true, &ts_empty_items, 0, 0));
                 let fuzzy_label = if ts_fuzzy { "[~]" } else { "[=]" };
                 let toggle_w = fuzzy_label.chars().count() as i32 * cw + 4;
                 draw_str(buf, w, h, g, fuzzy_label, px + 2, lh + asc, FG_DIM, px + toggle_w);
                 let sx = px + toggle_w;
                 let sw = (pw - toggle_w - 2).max(0);
                 if ts_focused { fill(buf, w, h, sx, lh, sw, lh, SEL_BG); }
-                draw_str(buf, w, h, g, ts_query, sx + 2, lh + asc, FG, sx + sw);
+                let ts_vis = ((sw - 4) / cw).max(0) as usize;
+                let ts_hscroll = ts_cursor.saturating_sub(ts_vis.saturating_sub(1));
+                let ts_disp: String = ts_query.chars().skip(ts_hscroll).take(ts_vis + 1).collect();
+                draw_str(buf, w, h, g, &ts_disp, sx + 2, lh + asc, FG, sx + sw);
                 if ts_focused {
-                    let cur_x = (sx + 2 + ts_query.chars().count() as i32 * cw).min(sx + sw - 1);
+                    let cur_x = (sx + 2 + (ts_cursor - ts_hscroll) as i32 * cw).min(sx + sw - 1);
                     fill(buf, w, h, cur_x, lh, 1, lh, ACCENT);
                     fill(buf, w, h, sx, 2 * lh - 1, sw, 1, ACCENT);
                 }
@@ -4825,21 +4915,23 @@ fn render(s: &mut State) {
                 // Helper: draw a labeled input field row
                 let mut fy = 4;
                 let fields = [
-                    ("Query:   ", &gf.query,   GlobalFindFocus::Query),
-                    ("Replace: ", &gf.replace, GlobalFindFocus::Replace),
-                    ("Include: ", &gf.include, GlobalFindFocus::Include),
-                    ("Exclude: ", &gf.exclude, GlobalFindFocus::Exclude),
+                    ("Query:   ", &gf.query,   GlobalFindFocus::Query,   gf.cursor_query),
+                    ("Replace: ", &gf.replace, GlobalFindFocus::Replace, gf.cursor_replace),
+                    ("Include: ", &gf.include, GlobalFindFocus::Include, gf.cursor_include),
+                    ("Exclude: ", &gf.exclude, GlobalFindFocus::Exclude, gf.cursor_exclude),
                 ];
-                for (label, value, foc) in &fields {
+                for (label, value, foc, cursor_chars) in &fields {
                     draw_str(buf, w, h, g, label, px + 2, fy + asc, FG_DIM, field_x);
                     let is_active = gf.focus == *foc;
                     let bg = if is_active { SEL_BG } else { BG };
                     fill(buf, w, h, field_x, fy, field_w, lh, bg);
                     if is_active { fill(buf, w, h, field_x, fy + lh - 1, field_w, 1, ACCENT); }
-                    let disp: String = value.chars().rev().take((field_w / cw).max(0) as usize).collect::<String>().chars().rev().collect();
+                    let vis = ((field_w - 4) / cw).max(0) as usize;
+                    let hscroll = cursor_chars.saturating_sub(vis.saturating_sub(1));
+                    let disp: String = value.chars().skip(hscroll).take(vis + 1).collect();
                     draw_str(buf, w, h, g, &disp, field_x + 2, fy + asc, FG, field_x + field_w);
                     if is_active {
-                        let cx = field_x + 2 + disp.chars().count() as i32 * cw;
+                        let cx = field_x + 2 + (cursor_chars - hscroll) as i32 * cw;
                         fill(buf, w, h, cx.min(field_x + field_w - 2), fy, 1, lh, ACCENT);
                     }
                     fy += row_h;
@@ -5122,9 +5214,12 @@ fn render(s: &mut State) {
 
                 let qx    = r.x + 4 + lw;
                 let qclip = mc_x - cw;
-                draw_str(buf, w, h, g, &snap.find_query, qx, row1_base, FG, qclip);
+                let q_vis = ((qclip - qx) / cw).max(0) as usize;
+                let q_hscroll = snap.find_cursor_q.saturating_sub(q_vis.saturating_sub(1));
+                let q_disp: String = snap.find_query.chars().skip(q_hscroll).take(q_vis + 1).collect();
+                draw_str(buf, w, h, g, &q_disp, qx, row1_base, FG, qclip);
                 if snap.find_focus == FindFocus::Query {
-                    let cx = qx + snap.find_query.chars().count() as i32 * cw;
+                    let cx = qx + (snap.find_cursor_q - q_hscroll) as i32 * cw;
                     if cx < qclip { fill(buf, w, h, cx, find_y + 2, 2, lh, ACCENT); }
                 }
 
@@ -5147,9 +5242,12 @@ fn render(s: &mut State) {
 
                     let rx    = r.x + 4 + rlw;
                     let rclip = btn_x - cw;
-                    draw_str(buf, w, h, g, &snap.find_repl, rx, row2_base, FG, rclip);
+                    let r_vis = ((rclip - rx) / cw).max(0) as usize;
+                    let r_hscroll = snap.find_cursor_r.saturating_sub(r_vis.saturating_sub(1));
+                    let r_disp: String = snap.find_repl.chars().skip(r_hscroll).take(r_vis + 1).collect();
+                    draw_str(buf, w, h, g, &r_disp, rx, row2_base, FG, rclip);
                     if snap.find_focus == FindFocus::Replace {
-                        let cx = rx + snap.find_repl.chars().count() as i32 * cw;
+                        let cx = rx + (snap.find_cursor_r - r_hscroll) as i32 * cw;
                         if cx < rclip { fill(buf, w, h, cx, row2_y + 2, 2, lh, ACCENT); }
                     }
                 }
