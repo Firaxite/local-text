@@ -226,11 +226,13 @@ struct ContextMenu {
 
 // ── Quick file finder ─────────────────────────────────────────────────────────
 struct QuickFinder {
-    open:     bool,
-    query:    String,
-    entries:  Vec<std::path::PathBuf>,
-    filtered: Vec<usize>,
-    selected: usize,
+    open:              bool,
+    query:             String,
+    cursor:            usize,
+    entries:           Vec<std::path::PathBuf>,
+    filtered:          Vec<usize>,
+    filtered_commands: Vec<usize>,
+    selected:          usize,
 }
 
 // ── Command palette ───────────────────────────────────────────────────────────
@@ -255,13 +257,6 @@ const COMMANDS: &[CommandEntry] = &[
     CommandEntry { name: "Increase Font Size",    shortcut: "Cmd+=",         action: CommandAction::IncreaseFontSize },
     CommandEntry { name: "Decrease Font Size",    shortcut: "Cmd+-",         action: CommandAction::DecreaseFontSize },
 ];
-
-struct CommandPalette {
-    open:     bool,
-    query:    String,
-    filtered: Vec<usize>,
-    selected: usize,
-}
 
 // ── Global find/replace ───────────────────────────────────────────────────────
 #[derive(Clone, Copy, PartialEq)]
@@ -400,16 +395,26 @@ struct FileEntry {
 }
 
 struct FileExplorer {
-    root:        PathBuf,
-    entries:     Vec<FileEntry>,
-    selected:    usize,
-    show_hidden: bool,
+    root:                PathBuf,
+    entries:             Vec<FileEntry>,
+    selected:            usize,
+    show_hidden:         bool,
+    tree_search:         String,
+    tree_search_focused: bool,
+    tree_search_fuzzy:   bool,
+    tree_search_entries: Vec<std::path::PathBuf>,
+    tree_search_results: Vec<std::path::PathBuf>,
+    tree_search_sel:     usize,
 }
 
 impl FileExplorer {
     fn new(root: PathBuf) -> Self {
         let entries = load_dir_entries(&root, 0, false);
-        FileExplorer { root, entries, selected: 0, show_hidden: false }
+        FileExplorer {
+            root, entries, selected: 0, show_hidden: false,
+            tree_search: String::new(), tree_search_focused: false, tree_search_fuzzy: true,
+            tree_search_entries: vec![], tree_search_results: vec![], tree_search_sel: 0,
+        }
     }
 
     fn toggle_hidden(&mut self) {
@@ -864,11 +869,10 @@ struct State {
     settings:     settings::Settings,
     needs_redraw: bool,
 
-    left_view:       LeftView,
-    context_menu:    Option<ContextMenu>,
-    quick_finder:    QuickFinder,
-    command_palette: CommandPalette,
-    global_find:     GlobalFind,
+    left_view:    LeftView,
+    context_menu: Option<ContextMenu>,
+    quick_finder: QuickFinder,
+    global_find:  GlobalFind,
 
     status_msg: Option<String>,
 }
@@ -2098,6 +2102,69 @@ fn fuzzy_score(query: &str, candidate: &str) -> Option<i32> {
     if qi < qchars.len() { None } else { Some(score) }
 }
 
+fn fuzzy_score_path(query: &str, path_str: &str) -> Option<i32> {
+    if query.contains('/') {
+        let qsegs: Vec<&str> = query.split('/').filter(|s| !s.is_empty()).collect();
+        let psegs: Vec<&str> = path_str.split('/').filter(|s| !s.is_empty()).collect();
+        if qsegs.len() > psegs.len() { return None; }
+        let mut total = 0i32;
+        let mut pi = 0usize;
+        for (qi, qseg) in qsegs.iter().enumerate() {
+            let remaining = qsegs.len() - qi;
+            let mut matched = false;
+            while pi + remaining <= psegs.len() {
+                if let Some(sc) = fuzzy_score(qseg, psegs[pi]) {
+                    total += sc;
+                    if qi == qsegs.len() - 1 { total += 15; }
+                    pi += 1;
+                    matched = true;
+                    break;
+                }
+                pi += 1;
+            }
+            if !matched { return None; }
+        }
+        Some(total)
+    } else {
+        let filename = path_str.rsplit('/').next().unwrap_or(path_str);
+        if let Some(sc) = fuzzy_score(query, filename) {
+            Some(sc + 20)
+        } else {
+            fuzzy_score(query, path_str)
+        }
+    }
+}
+
+fn qf_prev_char(s: &str, cursor: usize) -> usize {
+    if cursor == 0 { return 0; }
+    let mut i = cursor - 1;
+    while !s.is_char_boundary(i) { i -= 1; }
+    i
+}
+
+fn qf_next_char(s: &str, cursor: usize) -> usize {
+    if cursor >= s.len() { return s.len(); }
+    let mut i = cursor + 1;
+    while i < s.len() && !s.is_char_boundary(i) { i += 1; }
+    i
+}
+
+fn qf_prev_word(s: &str, cursor: usize) -> usize {
+    let b = s.as_bytes();
+    let mut i = cursor;
+    while i > 0 && b[i - 1] == b' ' { i -= 1; }
+    while i > 0 && b[i - 1] != b' ' { i -= 1; }
+    i
+}
+
+fn qf_next_word(s: &str, cursor: usize) -> usize {
+    let b = s.as_bytes();
+    let mut i = cursor;
+    while i < b.len() && b[i] != b' ' { i += 1; }
+    while i < b.len() && b[i] == b' ' { i += 1; }
+    i
+}
+
 fn walk_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>, depth: usize) {
     if depth > 12 { return; }
     let Ok(rd) = std::fs::read_dir(dir) else { return };
@@ -2120,43 +2187,69 @@ fn open_quick_finder(s: &mut State) {
     let mut entries = Vec::new();
     walk_files(&root, &mut entries, 0);
     let n = entries.len();
-    s.quick_finder.entries  = entries;
-    s.quick_finder.filtered = (0..n).collect();
-    s.quick_finder.query    = String::new();
-    s.quick_finder.selected = 0;
-    s.quick_finder.open     = true;
+    s.quick_finder.entries           = entries;
+    s.quick_finder.filtered          = (0..n).collect();
+    s.quick_finder.filtered_commands = vec![];
+    s.quick_finder.query             = String::new();
+    s.quick_finder.cursor            = 0;
+    s.quick_finder.selected          = 0;
+    s.quick_finder.open              = true;
 }
 
 fn refilter_quick_finder(s: &mut State) {
     let q = s.quick_finder.query.clone();
-    if q.is_empty() {
-        let n = s.quick_finder.entries.len();
-        s.quick_finder.filtered = (0..n).collect();
+    if q.starts_with('>') {
+        let cq = q[1..].trim().to_owned();
+        if cq.is_empty() {
+            s.quick_finder.filtered_commands = (0..COMMANDS.len()).collect();
+        } else {
+            let mut scored: Vec<(usize, i32)> = COMMANDS.iter().enumerate()
+                .filter_map(|(i, cmd)| fuzzy_score(&cq, cmd.name).map(|sc| (i, sc)))
+                .collect();
+            scored.sort_by(|a, b| b.1.cmp(&a.1));
+            s.quick_finder.filtered_commands = scored.into_iter().map(|(i, _)| i).collect();
+        }
+        s.quick_finder.filtered = vec![];
+    } else if q.is_empty() {
+        s.quick_finder.filtered = (0..s.quick_finder.entries.len()).collect();
+        s.quick_finder.filtered_commands = vec![];
     } else {
         let mut scored: Vec<(usize, i32)> = s.quick_finder.entries.iter().enumerate()
             .filter_map(|(i, p)| {
-                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                fuzzy_score(&q, name).map(|sc| (i, sc))
+                let path_str = p.to_string_lossy();
+                fuzzy_score_path(&q, &path_str).map(|sc| (i, sc))
             })
             .collect();
         scored.sort_by(|a, b| b.1.cmp(&a.1));
         s.quick_finder.filtered = scored.into_iter().map(|(i, _)| i).collect();
+        s.quick_finder.filtered_commands = vec![];
     }
     s.quick_finder.selected = 0;
 }
 
-fn refilter_command_palette(s: &mut State) {
-    let q = s.command_palette.query.clone();
-    if q.is_empty() {
-        s.command_palette.filtered = (0..COMMANDS.len()).collect();
-    } else {
-        let mut scored: Vec<(usize, i32)> = COMMANDS.iter().enumerate()
-            .filter_map(|(i, cmd)| fuzzy_score(&q, cmd.name).map(|sc| (i, sc)))
-            .collect();
-        scored.sort_by(|a, b| b.1.cmp(&a.1));
-        s.command_palette.filtered = scored.into_iter().map(|(i, _)| i).collect();
+fn refilter_tree_search(ex: &mut FileExplorer) {
+    if ex.tree_search.is_empty() {
+        ex.tree_search_results.clear();
+        ex.tree_search_sel = 0;
+        return;
     }
-    s.command_palette.selected = 0;
+    let q = ex.tree_search.to_lowercase();
+    let mut scored: Vec<(usize, i32)> = ex.tree_search_entries.iter().enumerate()
+        .filter_map(|(i, p)| {
+            let path_str = p.to_string_lossy();
+            let sc = if ex.tree_search_fuzzy {
+                fuzzy_score_path(&q, &path_str)?
+            } else {
+                let name = path_str.rsplit('/').next().unwrap_or(&path_str);
+                if name.to_lowercase().contains(&q as &str) { 0i32 } else { return None; }
+            };
+            Some((i, sc))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.1.cmp(&a.1));
+    scored.truncate(200);
+    ex.tree_search_results = scored.into_iter().map(|(i, _)| ex.tree_search_entries[i].clone()).collect();
+    ex.tree_search_sel = 0;
 }
 
 fn execute_command(s: &mut State, action: CommandAction) {
@@ -2464,13 +2557,8 @@ impl ApplicationHandler<UserEvent> for App {
             left_view:    LeftView::FileTree,
             context_menu: None,
             quick_finder: QuickFinder {
-                open: false, query: String::new(),
-                entries: vec![], filtered: vec![], selected: 0,
-            },
-            command_palette: CommandPalette {
-                open: false, query: String::new(),
-                filtered: (0..COMMANDS.len()).collect(),
-                selected: 0,
+                open: false, query: String::new(), cursor: 0,
+                entries: vec![], filtered: vec![], filtered_commands: vec![], selected: 0,
             },
             global_find: GlobalFind {
                 query: String::new(), replace: String::new(),
@@ -2810,19 +2898,45 @@ impl ApplicationHandler<UserEvent> for App {
                 if s.explorer.is_some() && mx >= act_w && mx < act_w + s.explorer_w() {
                     let lh  = s.glyphs.lh;
                     if s.left_view == LeftView::FileTree {
+                        let cw  = s.glyphs.cw;
                         let row = my / lh;
                         if row == 0 {
+                            // Hidden-files toggle row
                             if let Some(ex) = s.explorer.as_mut() { ex.toggle_hidden(); }
-                        } else if row > 0 {
-                            let idx = (row - 1) as usize;
-                            let action = s.explorer.as_mut().and_then(|ex| {
-                                if idx < ex.entries.len() {
-                                    ex.selected = idx;
-                                    if ex.entries[idx].is_dir { ex.toggle(idx); None }
-                                    else { Some(ex.entries[idx].path.clone()) }
-                                } else { None }
-                            });
-                            if let Some(path) = action { open_or_reuse_tab(s, path); }
+                        } else if row == 1 {
+                            // Tree search row: fuzzy toggle or focus input
+                            let fuzzy_toggle_w = 3 * cw + 6;
+                            if mx - act_w < fuzzy_toggle_w {
+                                if let Some(ex) = s.explorer.as_mut() {
+                                    ex.tree_search_fuzzy = !ex.tree_search_fuzzy;
+                                    refilter_tree_search(ex);
+                                }
+                            } else if let Some(ex) = s.explorer.as_mut() {
+                                ex.tree_search_focused = true;
+                                if ex.tree_search_entries.is_empty() {
+                                    let root = ex.root.clone();
+                                    walk_files(&root, &mut ex.tree_search_entries, 0);
+                                }
+                            }
+                        } else if row >= 2 {
+                            let idx = (row - 2) as usize;
+                            let in_search = s.explorer.as_ref().map_or(false, |ex| !ex.tree_search.is_empty());
+                            if in_search {
+                                let path = s.explorer.as_ref()
+                                    .and_then(|ex| ex.tree_search_results.get(idx).cloned());
+                                if let Some(path) = path { open_or_reuse_tab(s, path); }
+                            } else {
+                                // Unfocus tree search if clicking entries
+                                if let Some(ex) = s.explorer.as_mut() { ex.tree_search_focused = false; }
+                                let action = s.explorer.as_mut().and_then(|ex| {
+                                    if idx < ex.entries.len() {
+                                        ex.selected = idx;
+                                        if ex.entries[idx].is_dir { ex.toggle(idx); None }
+                                        else { Some(ex.entries[idx].path.clone()) }
+                                    } else { None }
+                                });
+                                if let Some(path) = action { open_or_reuse_tab(s, path); }
+                            }
                         }
                     } else {
                         // Global search panel click — determine which field was clicked
@@ -3337,11 +3451,12 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
 
-                // Cmd+Shift+P — command palette
+                // Cmd+Shift+P — command palette (unified quick finder in command mode)
                 if cmd && shift && matches!(&event.logical_key, Key::Character(c) if matches!(c.as_str(), "p" | "P")) {
-                    s.command_palette.open = true;
-                    s.command_palette.query.clear();
-                    refilter_command_palette(s);
+                    open_quick_finder(s);
+                    s.quick_finder.query  = ">".to_string();
+                    s.quick_finder.cursor = 1;
+                    refilter_quick_finder(s);
                     { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                     return;
                 }
@@ -3359,33 +3474,48 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
 
-                // Quick finder input routing
-                if s.quick_finder.open {
+                // Tree search input routing
+                if s.explorer.as_ref().map_or(false, |ex| ex.tree_search_focused)
+                    && s.left_view == LeftView::FileTree
+                {
                     match &event.logical_key {
-                        Key::Named(NamedKey::Escape) => { s.quick_finder.open = false; }
+                        Key::Named(NamedKey::Escape) => {
+                            if let Some(ex) = s.explorer.as_mut() {
+                                ex.tree_search.clear();
+                                ex.tree_search_focused = false;
+                            }
+                        }
                         Key::Named(NamedKey::ArrowUp) => {
-                            s.quick_finder.selected = s.quick_finder.selected.saturating_sub(1);
+                            if let Some(ex) = s.explorer.as_mut() {
+                                ex.tree_search_sel = ex.tree_search_sel.saturating_sub(1);
+                            }
                         }
                         Key::Named(NamedKey::ArrowDown) => {
-                            let n = s.quick_finder.filtered.len();
-                            if n > 0 { s.quick_finder.selected = (s.quick_finder.selected + 1).min(n - 1); }
+                            if let Some(ex) = s.explorer.as_mut() {
+                                let n = ex.tree_search_results.len();
+                                if n > 0 { ex.tree_search_sel = (ex.tree_search_sel + 1).min(n - 1); }
+                            }
                         }
                         Key::Named(NamedKey::Enter) => {
-                            let idx = s.quick_finder.selected;
-                            if let Some(&fi) = s.quick_finder.filtered.get(idx) {
-                                let path = s.quick_finder.entries[fi].clone();
-                                s.quick_finder.open = false;
+                            let path = s.explorer.as_ref()
+                                .and_then(|ex| ex.tree_search_results.get(ex.tree_search_sel).cloned());
+                            if let Some(path) = path {
+                                if let Some(ex) = s.explorer.as_mut() { ex.tree_search_focused = false; }
                                 open_or_reuse_tab(s, path);
                             }
                         }
                         Key::Named(NamedKey::Backspace) => {
-                            s.quick_finder.query.pop();
-                            refilter_quick_finder(s);
+                            if let Some(ex) = s.explorer.as_mut() {
+                                ex.tree_search.pop();
+                                refilter_tree_search(ex);
+                            }
                         }
                         Key::Character(c) => {
-                            s.quick_finder.query.push_str(c.as_str());
                             for ch in c.chars() { s.glyphs.load(ch); }
-                            refilter_quick_finder(s);
+                            if let Some(ex) = s.explorer.as_mut() {
+                                ex.tree_search.push_str(c.as_str());
+                                refilter_tree_search(ex);
+                            }
                         }
                         _ => {}
                     }
@@ -3393,33 +3523,92 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
 
-                // Command palette input routing
-                if s.command_palette.open {
+                // Quick finder / command palette input routing (unified)
+                if s.quick_finder.open {
+                    let is_cmd_mode = s.quick_finder.query.starts_with('>');
                     match &event.logical_key {
-                        Key::Named(NamedKey::Escape) => { s.command_palette.open = false; }
+                        Key::Named(NamedKey::Escape) => { s.quick_finder.open = false; }
                         Key::Named(NamedKey::ArrowUp) => {
-                            s.command_palette.selected = s.command_palette.selected.saturating_sub(1);
+                            s.quick_finder.selected = s.quick_finder.selected.saturating_sub(1);
                         }
                         Key::Named(NamedKey::ArrowDown) => {
-                            let n = s.command_palette.filtered.len();
-                            if n > 0 { s.command_palette.selected = (s.command_palette.selected + 1).min(n - 1); }
+                            let n = if is_cmd_mode {
+                                s.quick_finder.filtered_commands.len()
+                            } else {
+                                s.quick_finder.filtered.len()
+                            };
+                            if n > 0 { s.quick_finder.selected = (s.quick_finder.selected + 1).min(n - 1); }
                         }
                         Key::Named(NamedKey::Enter) => {
-                            let idx = s.command_palette.selected;
-                            if let Some(&fi) = s.command_palette.filtered.get(idx) {
-                                let action = COMMANDS[fi].action;
-                                s.command_palette.open = false;
-                                execute_command(s, action);
+                            let idx = s.quick_finder.selected;
+                            if is_cmd_mode {
+                                if let Some(&fi) = s.quick_finder.filtered_commands.get(idx) {
+                                    let action = COMMANDS[fi].action;
+                                    s.quick_finder.open = false;
+                                    execute_command(s, action);
+                                }
+                            } else if let Some(&fi) = s.quick_finder.filtered.get(idx) {
+                                let path = s.quick_finder.entries[fi].clone();
+                                s.quick_finder.open = false;
+                                open_or_reuse_tab(s, path);
+                            }
+                        }
+                        Key::Named(NamedKey::ArrowLeft) => {
+                            s.quick_finder.cursor = if alt {
+                                qf_prev_word(&s.quick_finder.query, s.quick_finder.cursor)
+                            } else if cmd {
+                                0
+                            } else {
+                                qf_prev_char(&s.quick_finder.query, s.quick_finder.cursor)
+                            };
+                        }
+                        Key::Named(NamedKey::ArrowRight) => {
+                            s.quick_finder.cursor = if alt {
+                                qf_next_word(&s.quick_finder.query, s.quick_finder.cursor)
+                            } else if cmd {
+                                s.quick_finder.query.len()
+                            } else {
+                                qf_next_char(&s.quick_finder.query, s.quick_finder.cursor)
+                            };
+                        }
+                        Key::Named(NamedKey::Home) => {
+                            s.quick_finder.cursor = 0;
+                        }
+                        Key::Named(NamedKey::End) => {
+                            s.quick_finder.cursor = s.quick_finder.query.len();
+                        }
+                        Key::Named(NamedKey::Delete) => {
+                            let next = qf_next_char(&s.quick_finder.query, s.quick_finder.cursor);
+                            if next > s.quick_finder.cursor {
+                                s.quick_finder.query.drain(s.quick_finder.cursor..next);
+                                refilter_quick_finder(s);
                             }
                         }
                         Key::Named(NamedKey::Backspace) => {
-                            s.command_palette.query.pop();
-                            refilter_command_palette(s);
+                            if cmd {
+                                s.quick_finder.query.clear();
+                                s.quick_finder.cursor = 0;
+                            } else if alt {
+                                let new_cur = qf_prev_word(&s.quick_finder.query, s.quick_finder.cursor);
+                                s.quick_finder.query.drain(new_cur..s.quick_finder.cursor);
+                                s.quick_finder.cursor = new_cur;
+                            } else if s.quick_finder.cursor > 0 {
+                                let new_cur = qf_prev_char(&s.quick_finder.query, s.quick_finder.cursor);
+                                s.quick_finder.query.drain(new_cur..s.quick_finder.cursor);
+                                s.quick_finder.cursor = new_cur;
+                            }
+                            refilter_quick_finder(s);
                         }
                         Key::Character(c) => {
-                            s.command_palette.query.push_str(c.as_str());
-                            for ch in c.chars() { s.glyphs.load(ch); }
-                            refilter_command_palette(s);
+                            if cmd && c.as_str() == "a" {
+                                s.quick_finder.cursor = s.quick_finder.query.len();
+                            } else if !cmd && !ctrl {
+                                let c_str = c.as_str();
+                                s.quick_finder.query.insert_str(s.quick_finder.cursor, c_str);
+                                s.quick_finder.cursor += c_str.len();
+                                for ch in c.chars() { s.glyphs.load(ch); }
+                                refilter_quick_finder(s);
+                            }
                         }
                         _ => {}
                     }
@@ -4451,11 +4640,13 @@ fn render(s: &mut State) {
     let act_w            = s.activity_bar_w();
     let status_msg       = s.status_msg.clone();
 
-    // Quick finder snapshot
-    let qf_open     = s.quick_finder.open;
-    let qf_query    = s.quick_finder.query.clone();
-    let qf_selected = s.quick_finder.selected;
-    let qf_items: Vec<(String, String)> = if qf_open {
+    // Quick finder / command palette snapshot (unified)
+    let qf_open         = s.quick_finder.open;
+    let qf_query        = s.quick_finder.query.clone();
+    let qf_cursor_chars = s.quick_finder.query[..s.quick_finder.cursor].chars().count();
+    let qf_is_cmd_mode  = qf_query.starts_with('>');
+    let qf_selected     = s.quick_finder.selected;
+    let qf_items: Vec<(String, String)> = if qf_open && !qf_is_cmd_mode {
         let n = s.quick_finder.filtered.len();
         let view_start = qf_selected.saturating_sub(4).min(n.saturating_sub(10));
         let view_end   = (view_start + 10).min(n);
@@ -4466,29 +4657,35 @@ fn render(s: &mut State) {
             (name, dir)
         }).collect()
     } else { vec![] };
-    let qf_sel_in_view = if qf_open {
+    let qf_sel_in_view = if qf_open && !qf_is_cmd_mode {
         let n = s.quick_finder.filtered.len();
         let view_start = qf_selected.saturating_sub(4).min(n.saturating_sub(10));
         qf_selected.saturating_sub(view_start)
     } else { 0 };
-
-    // Command palette snapshot
-    let cp_open     = s.command_palette.open;
-    let cp_query    = s.command_palette.query.clone();
-    let cp_selected = s.command_palette.selected;
-    let cp_items: Vec<(String, String)> = if cp_open {
-        let n = s.command_palette.filtered.len();
-        let view_start = cp_selected.saturating_sub(4).min(n.saturating_sub(10));
+    let qf_cmd_items: Vec<(String, String)> = if qf_open && qf_is_cmd_mode {
+        let n = s.quick_finder.filtered_commands.len();
+        let view_start = qf_selected.saturating_sub(4).min(n.saturating_sub(10));
         let view_end   = (view_start + 10).min(n);
-        s.command_palette.filtered[view_start..view_end].iter().map(|&idx| {
+        s.quick_finder.filtered_commands[view_start..view_end].iter().map(|&idx| {
             (COMMANDS[idx].name.to_owned(), COMMANDS[idx].shortcut.to_owned())
         }).collect()
     } else { vec![] };
-    let cp_sel_in_view = if cp_open {
-        let n = s.command_palette.filtered.len();
-        let view_start = cp_selected.saturating_sub(4).min(n.saturating_sub(10));
-        cp_selected.saturating_sub(view_start)
+    let qf_cmd_sel_in_view = if qf_open && qf_is_cmd_mode {
+        let n = s.quick_finder.filtered_commands.len();
+        let view_start = qf_selected.saturating_sub(4).min(n.saturating_sub(10));
+        qf_selected.saturating_sub(view_start)
     } else { 0 };
+
+    // Tree search snapshot
+    let tree_search_snap: Option<(String, bool, bool, Vec<(String, String)>, usize)> =
+        s.explorer.as_ref().map(|ex| {
+            let items: Vec<(String, String)> = ex.tree_search_results.iter().take(100).map(|p| {
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_owned();
+                let dir  = p.parent().and_then(|d| d.to_str()).unwrap_or("").to_owned();
+                (name, dir)
+            }).collect();
+            (ex.tree_search.clone(), ex.tree_search_focused, ex.tree_search_fuzzy, items, ex.tree_search_sel)
+        });
 
     // Global find snapshot
     struct GlobalFindSnap {
@@ -4569,18 +4766,54 @@ fn render(s: &mut State) {
             fill(buf, w, h, px + pw - 1, 0, 1, panel_h, border_col);
 
             if left_view == LeftView::FileTree {
+                // Row 0: hidden-files toggle
                 let toggle_label = if show_hidden { " [x] .hidden" } else { " [ ] .hidden" };
                 draw_str(buf, w, h, g, toggle_label, px, asc, FG_DIM, px + pw - 1);
                 fill(buf, w, h, px, lh - 1, pw - 1, 1, BORDER);
-                for (i, (name, is_dir, expanded, depth, selected)) in entries.iter().enumerate() {
-                    let ey = lh + i as i32 * lh;
-                    if ey + lh > h as i32 - status_h { break; }
-                    let baseline = ey + asc;
-                    if *selected { fill(buf, w, h, px, ey, pw - 1, lh, SEL_BG); }
-                    let prefix = if *is_dir { if *expanded { "▼ " } else { "▶ " } } else { "  " };
-                    let indent = px + *depth as i32 * 10 + 4;
-                    let label  = format!("{prefix}{name}");
-                    draw_str(buf, w, h, g, &label, indent, baseline, FG, px + pw - 1);
+
+                // Row 1: tree search box
+                let ts_empty_str   = String::new();
+                let ts_empty_items: Vec<(String, String)> = vec![];
+                let (ts_query, ts_focused, ts_fuzzy, ts_items, ts_sel) =
+                    tree_search_snap.as_ref().map(|s| (&s.0, s.1, s.2, &s.3, s.4))
+                    .unwrap_or((&ts_empty_str, false, true, &ts_empty_items, 0));
+                let fuzzy_label = if ts_fuzzy { "[~]" } else { "[=]" };
+                let toggle_w = fuzzy_label.chars().count() as i32 * cw + 4;
+                draw_str(buf, w, h, g, fuzzy_label, px + 2, lh + asc, FG_DIM, px + toggle_w);
+                let sx = px + toggle_w;
+                let sw = (pw - toggle_w - 2).max(0);
+                if ts_focused { fill(buf, w, h, sx, lh, sw, lh, SEL_BG); }
+                draw_str(buf, w, h, g, ts_query, sx + 2, lh + asc, FG, sx + sw);
+                if ts_focused {
+                    let cur_x = (sx + 2 + ts_query.chars().count() as i32 * cw).min(sx + sw - 1);
+                    fill(buf, w, h, cur_x, lh, 1, lh, ACCENT);
+                    fill(buf, w, h, sx, 2 * lh - 1, sw, 1, ACCENT);
+                }
+                fill(buf, w, h, px, 2 * lh - 1, pw - 1, 1, BORDER);
+
+                // Rows 2+: entries or filtered search results
+                let entries_start = 2 * lh;
+                if ts_query.is_empty() {
+                    for (i, (name, is_dir, expanded, depth, selected)) in entries.iter().enumerate() {
+                        let ey = entries_start + i as i32 * lh;
+                        if ey + lh > h as i32 - status_h { break; }
+                        let baseline = ey + asc;
+                        if *selected { fill(buf, w, h, px, ey, pw - 1, lh, SEL_BG); }
+                        let prefix = if *is_dir { if *expanded { "▼ " } else { "▶ " } } else { "  " };
+                        let indent = px + *depth as i32 * 10 + 4;
+                        let label  = format!("{prefix}{name}");
+                        draw_str(buf, w, h, g, &label, indent, baseline, FG, px + pw - 1);
+                    }
+                } else {
+                    for (i, (name, dir)) in ts_items.iter().enumerate() {
+                        let ey = entries_start + i as i32 * lh;
+                        if ey + lh > h as i32 - status_h { break; }
+                        let baseline = ey + asc;
+                        if i == ts_sel { fill(buf, w, h, px, ey, pw - 1, lh, SEL_BG); }
+                        let dir_w = dir.chars().count() as i32 * cw;
+                        draw_str(buf, w, h, g, name, px + 4, baseline, FG, px + pw - dir_w - cw - 2);
+                        draw_str(buf, w, h, g, dir, px + pw - dir_w - 2, baseline, FG_DIM, px + pw - 1);
+                    }
                 }
             } else if let Some(ref gf) = gf_snap {
                 // Global search panel
@@ -5077,11 +5310,12 @@ fn render(s: &mut State) {
             }
         }
 
-        // ── Quick file finder overlay ─────────────────────────────────────
+        // ── Quick finder / command palette overlay (unified) ─────────────
         if qf_open {
             darken_buffer(buf, w, h);
-            let ow = (w as i32 * 2 / 3).min(w as i32 - 40);
-            let oh = lh * (qf_items.len() as i32 + 2) + 8;
+            let item_count = if qf_is_cmd_mode { qf_cmd_items.len() } else { qf_items.len() };
+            let ow = (w as i32 * 2 / 3).min(w as i32 - 40).max(360);
+            let oh = lh * (item_count as i32 + 2) + 8;
             let ox = (w as i32 - ow) / 2;
             let oy = h as i32 / 4;
             fill(buf, w, h, ox, oy, ow, oh, BG2);
@@ -5090,44 +5324,37 @@ fn render(s: &mut State) {
             fill(buf, w, h, ox, oy, 1, oh, BORDER);
             fill(buf, w, h, ox + ow - 1, oy, 1, oh, BORDER);
             // Query row
-            draw_str(buf, w, h, g, "> ", ox + 4, oy + 4 + asc, ACCENT, ox + ow - 4);
-            draw_str(buf, w, h, g, &qf_query, ox + 4 + 2 * cw, oy + 4 + asc, FG, ox + ow - 4);
-            let cur_x = ox + 4 + 2 * cw + qf_query.chars().count() as i32 * cw;
-            fill(buf, w, h, cur_x.min(ox + ow - 4), oy + 4, 1, lh, ACCENT);
-            // Result rows
-            for (i, (name, dir)) in qf_items.iter().enumerate() {
-                let ry = oy + 4 + lh + 4 + i as i32 * lh;
-                if i == qf_sel_in_view { fill(buf, w, h, ox + 1, ry, ow - 2, lh, SEL_BG); }
-                draw_str(buf, w, h, g, name, ox + 6, ry + asc, FG, ox + ow - 4 - dir.chars().count() as i32 * cw - cw);
-                draw_str(buf, w, h, g, dir, ox + ow - 4 - dir.chars().count() as i32 * cw, ry + asc, FG_DIM, ox + ow - 2);
+            if qf_is_cmd_mode {
+                // Leading '>' in accent, rest of query in FG
+                draw_str(buf, w, h, g, ">", ox + 4, oy + 4 + asc, ACCENT, ox + 4 + cw);
+                if qf_query.len() > 1 {
+                    draw_str(buf, w, h, g, &qf_query[1..], ox + 4 + cw, oy + 4 + asc, FG, ox + ow - 4);
+                }
+                let cur_x = ox + 4 + qf_cursor_chars as i32 * cw;
+                fill(buf, w, h, cur_x.min(ox + ow - 4), oy + 4, 1, lh, ACCENT);
+            } else {
+                draw_str(buf, w, h, g, "> ", ox + 4, oy + 4 + asc, FG_DIM, ox + ow - 4);
+                draw_str(buf, w, h, g, &qf_query, ox + 4 + 2 * cw, oy + 4 + asc, FG, ox + ow - 4);
+                let cur_x = ox + 4 + 2 * cw + qf_cursor_chars as i32 * cw;
+                fill(buf, w, h, cur_x.min(ox + ow - 4), oy + 4, 1, lh, ACCENT);
             }
-        }
-
-        // ── Command palette overlay ───────────────────────────────────────
-        if cp_open {
-            darken_buffer(buf, w, h);
-            let ow = (w as i32 / 2).min(w as i32 - 40).max(300);
-            let oh = lh * (cp_items.len() as i32 + 2) + 8;
-            let ox = (w as i32 - ow) / 2;
-            let oy = h as i32 / 4;
-            fill(buf, w, h, ox, oy, ow, oh, BG2);
-            fill(buf, w, h, ox, oy, ow, 1, BORDER);
-            fill(buf, w, h, ox, oy + oh - 1, ow, 1, BORDER);
-            fill(buf, w, h, ox, oy, 1, oh, BORDER);
-            fill(buf, w, h, ox + ow - 1, oy, 1, oh, BORDER);
-            // Query row
-            draw_str(buf, w, h, g, "> ", ox + 4, oy + 4 + asc, ACCENT, ox + ow - 4);
-            draw_str(buf, w, h, g, &cp_query, ox + 4 + 2 * cw, oy + 4 + asc, FG, ox + ow - 4);
-            let cur_x = ox + 4 + 2 * cw + cp_query.chars().count() as i32 * cw;
-            fill(buf, w, h, cur_x.min(ox + ow - 4), oy + 4, 1, lh, ACCENT);
-            // Command rows
-            for (i, (name, shortcut)) in cp_items.iter().enumerate() {
-                let ry = oy + 4 + lh + 4 + i as i32 * lh;
-                if i == cp_sel_in_view { fill(buf, w, h, ox + 1, ry, ow - 2, lh, SEL_BG); }
-                draw_str(buf, w, h, g, name, ox + 6, ry + asc, FG, ox + ow - 4);
-                if !shortcut.is_empty() {
-                    let sw = shortcut.chars().count() as i32 * cw;
-                    draw_str(buf, w, h, g, shortcut, ox + ow - 4 - sw, ry + asc, FG_DIM, ox + ow - 2);
+            // Result rows
+            if qf_is_cmd_mode {
+                for (i, (name, shortcut)) in qf_cmd_items.iter().enumerate() {
+                    let ry = oy + 4 + lh + 4 + i as i32 * lh;
+                    if i == qf_cmd_sel_in_view { fill(buf, w, h, ox + 1, ry, ow - 2, lh, SEL_BG); }
+                    draw_str(buf, w, h, g, name, ox + 6, ry + asc, FG, ox + ow - 4);
+                    if !shortcut.is_empty() {
+                        let sw = shortcut.chars().count() as i32 * cw;
+                        draw_str(buf, w, h, g, shortcut, ox + ow - 4 - sw, ry + asc, FG_DIM, ox + ow - 2);
+                    }
+                }
+            } else {
+                for (i, (name, dir)) in qf_items.iter().enumerate() {
+                    let ry = oy + 4 + lh + 4 + i as i32 * lh;
+                    if i == qf_sel_in_view { fill(buf, w, h, ox + 1, ry, ow - 2, lh, SEL_BG); }
+                    draw_str(buf, w, h, g, name, ox + 6, ry + asc, FG, ox + ow - 4 - dir.chars().count() as i32 * cw - cw);
+                    draw_str(buf, w, h, g, dir, ox + ow - 4 - dir.chars().count() as i32 * cw, ry + asc, FG_DIM, ox + ow - 2);
                 }
             }
         }
