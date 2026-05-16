@@ -1015,7 +1015,10 @@ impl State {
         let row_h = lh + 4;
         if pane.find.replace_open { row_h * 2 } else { row_h }
     }
-    fn find_h(&self) -> i32 { Self::pane_find_h(self.pane(), self.glyphs.lh) }
+    fn find_h(&self) -> i32 {
+        if !self.panes.contains_key(&self.active_pane) { return 0; }
+        Self::pane_find_h(self.pane(), self.glyphs.lh)
+    }
 
     fn pane_area(&self) -> Rect {
         let act_w = self.activity_bar_w();
@@ -3134,7 +3137,7 @@ impl ApplicationHandler<UserEvent> for App {
                     };
                     s.win.set_cursor(cursor);
                 }
-                if s.mouse_down {
+                if s.mouse_down && s.panes.contains_key(&s.active_pane) {
                     let pos = s.xy_to_char(mx, my);
                     s.tab_mut().primary_mut().head = pos;
                     s.ensure_visible();
@@ -3650,6 +3653,11 @@ impl ApplicationHandler<UserEvent> for App {
                                     let pane = s.panes.get_mut(&clicked_pane_id).unwrap();
                                     if pane.term_ids.is_empty() {
                                         s.panes.remove(&clicked_pane_id);
+                                        if s.panes.is_empty() {
+                                            el.exit();
+                                            { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                                            return;
+                                        }
                                         let old_tree = std::mem::replace(&mut s.pane_tree, PaneTree::Leaf(0));
                                         if let Some(t) = remove_pane_from_tree(old_tree, clicked_pane_id) {
                                             s.pane_tree = t;
