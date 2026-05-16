@@ -286,6 +286,8 @@ struct GlobalFind {
     selected:       usize,
     focus:          GlobalFindFocus,
     case_sensitive: bool,
+    live_search:    bool,
+    search_fire_at: Option<Instant>,
     cursor_query:   usize,
     cursor_replace: usize,
     cursor_include: usize,
@@ -2634,13 +2636,37 @@ impl App {
 impl ApplicationHandler<UserEvent> for App {
     fn new_events(&mut self, _el: &ActiveEventLoop, cause: StartCause) {
         if let StartCause::ResumeTimeReached { .. } = cause {
+            let now = Instant::now();
             if let Some(s) = self.state.as_mut() {
-                dlog!("[blink] t={}", ts());
-                s.cursor_visible = !s.cursor_visible;
-                s.cursor_blink = Instant::now() + Duration::from_millis(500);
-                // Mark dirty; vsync display link or about_to_wait flush will trigger the render.
-                self.dirty.store(true, Ordering::Release);
-                s.needs_redraw = true;
+                // Cursor blink
+                if now >= s.cursor_blink {
+                    dlog!("[blink] t={}", ts());
+                    s.cursor_visible = !s.cursor_visible;
+                    s.cursor_blink = now + Duration::from_millis(500);
+                    self.dirty.store(true, Ordering::Release);
+                    s.needs_redraw = true;
+                }
+                // Live search debounce
+                if let Some(fire_at) = s.global_find.search_fire_at {
+                    if now >= fire_at {
+                        s.global_find.search_fire_at = None;
+                        let root = s.explorer.as_ref().map(|e| e.root.clone())
+                            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                        let query   = s.global_find.query.clone();
+                        let include = s.global_find.include_glob.clone();
+                        let exclude = s.global_find.exclude_glob.clone();
+                        let cs      = s.global_find.case_sensitive;
+                        if !query.is_empty() {
+                            s.global_find.results  = global_search(&root, &query, &include, &exclude, cs);
+                        } else {
+                            s.global_find.results.clear();
+                        }
+                        s.global_find.selected = 0;
+                        s.global_find.scroll   = 0;
+                        self.dirty.store(true, Ordering::Release);
+                        s.needs_redraw = true;
+                    }
+                }
             }
         }
     }
@@ -2729,6 +2755,7 @@ impl ApplicationHandler<UserEvent> for App {
                 include_glob: String::new(), exclude_glob: String::new(),
                 results: vec![], scroll: 0, selected: 0,
                 focus: GlobalFindFocus::Query, case_sensitive: false,
+                live_search: false, search_fire_at: None,
                 cursor_query: 0, cursor_replace: 0, cursor_include: 0, cursor_exclude: 0,
                 sel_anchor_q: None, sel_anchor_r: None, sel_anchor_inc: None, sel_anchor_exc: None,
             },
@@ -3183,6 +3210,17 @@ impl ApplicationHandler<UserEvent> for App {
                                 }
                             }
                         } else if my >= search_btn_y && my < search_btn_y + lh {
+                            let field_label_w_px = field_label_w;
+                            let field_x_abs = act_w + field_label_w_px;
+                            if mx < field_x_abs {
+                                // Live toggle (label area left of field_x)
+                                s.global_find.live_search = !s.global_find.live_search;
+                                // If switching to live and query is non-empty, fire immediately
+                                if s.global_find.live_search && !s.global_find.query.is_empty() {
+                                    s.global_find.search_fire_at =
+                                        Some(Instant::now() + Duration::from_millis(300));
+                                }
+                            } else {
                             // Search button
                             let root = s.explorer.as_ref().map(|e| e.root.clone())
                                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
@@ -3208,6 +3246,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 global_replace(&results, &query, &replace, cs, &mut s.panes);
                                 s.global_find.results.clear();
                             }
+                            } // end else (not live toggle)
                         } else if my >= results_start_y {
                             let ri = ((my - results_start_y) / lh) as usize + s.global_find.scroll;
                             if ri < s.global_find.results.len() {
@@ -3931,8 +3970,8 @@ impl ApplicationHandler<UserEvent> for App {
                             if let Key::Character(c) = key {
                                 if !cmd && !ctrl { for ch in c.chars() { s.glyphs.load(ch); } }
                             }
+                            let focus = s.global_find.focus;
                             let gf = &mut s.global_find;
-                            let focus = gf.focus;
                             let (field, cursor, sel) = match focus {
                                 GlobalFindFocus::Query   => (&mut gf.query,        &mut gf.cursor_query,   &mut gf.sel_anchor_q),
                                 GlobalFindFocus::Replace => (&mut gf.replace,      &mut gf.cursor_replace, &mut gf.sel_anchor_r),
@@ -3940,7 +3979,14 @@ impl ApplicationHandler<UserEvent> for App {
                                 GlobalFindFocus::Exclude => (&mut gf.exclude_glob, &mut gf.cursor_exclude, &mut gf.sel_anchor_exc),
                                 GlobalFindFocus::Results => unreachable!(),
                             };
-                            input_field_edit(field, cursor, sel, key, cmd, alt, ctrl, shift);
+                            let changed = input_field_edit(field, cursor, sel, key, cmd, alt, ctrl, shift);
+                            // Schedule live search on any change to search-relevant fields
+                            if changed && s.global_find.live_search
+                                && matches!(focus, GlobalFindFocus::Query | GlobalFindFocus::Include | GlobalFindFocus::Exclude)
+                            {
+                                s.global_find.search_fire_at =
+                                    Some(Instant::now() + Duration::from_millis(300));
+                            }
                         }
                     }
                     { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
@@ -4525,7 +4571,12 @@ impl ApplicationHandler<UserEvent> for App {
                 s.needs_redraw = false;
                 s.win.request_redraw();
             }
-            el.set_control_flow(ControlFlow::WaitUntil(s.cursor_blink));
+            let next_wake = if let Some(fire_at) = s.global_find.search_fire_at {
+                fire_at.min(s.cursor_blink)
+            } else {
+                s.cursor_blink
+            };
+            el.set_control_flow(ControlFlow::WaitUntil(next_wake));
         } else {
             el.set_control_flow(ControlFlow::Wait);
         }
@@ -5016,6 +5067,7 @@ fn render(s: &mut State) {
         include:  String, exclude: String,
         focus:    GlobalFindFocus,
         case_sensitive: bool,
+        live_search: bool,
         results:  Vec<(String, usize, String, usize, usize)>,
         selected: usize, scroll: usize,
         cursor_query:   usize, cursor_replace: usize,
@@ -5032,6 +5084,7 @@ fn render(s: &mut State) {
             exclude: gf.exclude_glob.clone(),
             focus:   gf.focus,
             case_sensitive: gf.case_sensitive,
+            live_search: gf.live_search,
             results: gf.results.iter().map(|r| {
                 let name = r.path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_owned();
                 (name, r.line_num, r.line_text.clone(), r.match_col, r.match_len)
@@ -5208,6 +5261,11 @@ fn render(s: &mut State) {
 
                 // Buttons row
                 fy += 2;
+                // Live/Submit toggle (in label area, left of field_x)
+                let live_label = if gf.live_search { "[~] live" } else { "[ ] live" };
+                let live_col   = if gf.live_search { ACCENT } else { FG_DIM };
+                draw_str(buf, w, h, g, live_label, px + 2, fy + asc, live_col, field_x);
+                // Search + Replace All buttons
                 let search_label = "[Search]";
                 let sl = search_label.chars().count() as i32 * cw;
                 fill(buf, w, h, field_x, fy, sl, lh, SEL_BG);
