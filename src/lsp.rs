@@ -18,6 +18,13 @@ use winit::event_loop::EventLoopProxy;
 
 use crate::{Diagnostic, DiagSeverity, Lang, UserEvent};
 
+// ── PendingKind ───────────────────────────────────────────────────────────────
+pub enum PendingKind {
+    Definition,
+    References,
+    Formatting { path: PathBuf },
+}
+
 // ── LspServer ─────────────────────────────────────────────────────────────────
 pub struct LspServer {
     pub lang:           Lang,
@@ -27,6 +34,7 @@ pub struct LspServer {
     pub request_id:     u64,
     pub doc_version:    HashMap<PathBuf, u64>,
     pub initialized:    bool,
+    pub pending:        HashMap<u64, PendingKind>,
 }
 
 // ── LspManager ────────────────────────────────────────────────────────────────
@@ -161,7 +169,7 @@ pub fn start_server(
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
 
-    // stdout reader: JSON-RPC messages → LspOutput + LspDiagnostics events
+    // stdout reader: JSON-RPC messages → LspOutput + LspDiagnostics/LspResponse events
     let proxy_out = proxy.clone();
     let opi = output_pane_id;
     thread::spawn(move || {
@@ -172,13 +180,15 @@ pub fn start_server(
                 pane_id: opi,
                 data:    msg.as_bytes().to_vec(),
             });
-            // Parse diagnostics
-            if let Some((path, diags)) = parse_diagnostics(&msg) {
-                let _ = proxy_out.send_event(UserEvent::LspDiagnostics { path, diagnostics: diags });
-            }
-            // If this is the initialize response, send `initialized`
-            if is_initialize_response(&msg) {
-                // Can't access stdin here; the main thread handles this via the initialized flag.
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&msg) {
+                if v["id"].is_u64() && v.get("method").is_none() {
+                    // It's a response to a request
+                    let id = v["id"].as_u64().unwrap();
+                    let result = v["result"].clone();
+                    let _ = proxy_out.send_event(UserEvent::LspResponse { server_id: opi, id, result });
+                } else if let Some((path, diags)) = parse_diagnostics(&msg) {
+                    let _ = proxy_out.send_event(UserEvent::LspDiagnostics { path, diagnostics: diags });
+                }
             }
         }
     });
@@ -203,6 +213,7 @@ pub fn start_server(
         request_id: 0,
         doc_version: HashMap::new(),
         initialized: false,
+        pending: HashMap::new(),
     })
 }
 
@@ -240,7 +251,10 @@ pub fn send_initialize(server: &mut LspServer, root_path: Option<&PathBuf>) {
         "capabilities": {
             "textDocument": {
                 "publishDiagnostics": { "relatedInformation": false },
-                "synchronization": { "didSave": true }
+                "synchronization":    { "didSave": true },
+                "definition":         {},
+                "references":         {},
+                "formatting":         {}
             }
         }
     });
@@ -273,6 +287,34 @@ pub fn notify_did_change(server: &mut LspServer, path: &PathBuf, text: &str) {
 pub fn send_initialized(server: &mut LspServer) {
     send_notification(server, "initialized", serde_json::json!({}));
     server.initialized = true;
+}
+
+pub fn request_definition(srv: &mut LspServer, path: &PathBuf, line: usize, col: usize) -> u64 {
+    let id = send_request(srv, "textDocument/definition", serde_json::json!({
+        "textDocument": { "uri": uri_from_path(path) },
+        "position": { "line": line, "character": col }
+    }));
+    srv.pending.insert(id, PendingKind::Definition);
+    id
+}
+
+pub fn request_references(srv: &mut LspServer, path: &PathBuf, line: usize, col: usize) -> u64 {
+    let id = send_request(srv, "textDocument/references", serde_json::json!({
+        "textDocument": { "uri": uri_from_path(path) },
+        "position": { "line": line, "character": col },
+        "context": { "includeDeclaration": false }
+    }));
+    srv.pending.insert(id, PendingKind::References);
+    id
+}
+
+pub fn request_formatting(srv: &mut LspServer, path: &PathBuf) -> u64 {
+    let id = send_request(srv, "textDocument/formatting", serde_json::json!({
+        "textDocument": { "uri": uri_from_path(path) },
+        "options": { "tabSize": 4, "insertSpaces": true }
+    }));
+    srv.pending.insert(id, PendingKind::Formatting { path: path.clone() });
+    id
 }
 
 fn uri_from_path(path: &PathBuf) -> String {

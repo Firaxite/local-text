@@ -60,7 +60,7 @@ const HL_MATCH_ACTIVE: u32 = 0x524175; // brighter purple — active match
 const RAINBOW: [u32; 6] = [0xFF79C6, 0xFFB86C, 0xF1FA8C, 0x50FA7B, 0x8BE9FD, 0xBD93F9];
 
 // ── Language detection ────────────────────────────────────────────────────────
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum Lang { None, Rust, Python, TypeScript }
 
 impl Lang {
@@ -218,7 +218,7 @@ impl FindBar {
 
 // ── Left panel / activity bar ─────────────────────────────────────────────────
 #[derive(Clone, Copy, PartialEq)]
-enum LeftView { FileTree, GlobalSearch }
+enum LeftView { FileTree, GlobalSearch, Diagnostics }
 
 struct ContextMenu {
     x:       i32,
@@ -245,6 +245,7 @@ struct QuickFinder {
 enum CommandAction {
     Save, CloseTab, SplitRight, SplitDown, OpenTerminal, GoToSettings,
     ToggleFind, ToggleReplace, ToggleExplorer, IncreaseFontSize, DecreaseFontSize,
+    GotoDefinition, FindReferences,
 }
 
 struct CommandEntry { name: &'static str, shortcut: &'static str, action: CommandAction }
@@ -261,6 +262,8 @@ const COMMANDS: &[CommandEntry] = &[
     CommandEntry { name: "Toggle File Explorer",  shortcut: "",              action: CommandAction::ToggleExplorer },
     CommandEntry { name: "Increase Font Size",    shortcut: "Cmd+=",         action: CommandAction::IncreaseFontSize },
     CommandEntry { name: "Decrease Font Size",    shortcut: "Cmd+-",         action: CommandAction::DecreaseFontSize },
+    CommandEntry { name: "Go to Definition",      shortcut: "F12",           action: CommandAction::GotoDefinition },
+    CommandEntry { name: "Find All References",   shortcut: "Cmd+Shift+F12", action: CommandAction::FindReferences },
 ];
 
 // ── Global find/replace ───────────────────────────────────────────────────────
@@ -801,8 +804,17 @@ fn open_terminal_pane(s: &mut State) {
     s.active_pane = pane_id;
 }
 
+fn check_lsp_binaries(s: &mut State) {
+    for (lang, bin) in &[(Lang::TypeScript, "typescript-language-server"), (Lang::Rust, "rust-analyzer"), (Lang::Python, "pylsp")] {
+        let installed = std::process::Command::new("which").arg(bin).output()
+            .map(|o| o.status.success()).unwrap_or(false);
+        s.lsp_installed.insert(*lang, installed);
+    }
+}
+
 fn open_settings_tab(s: &mut State) {
     if s.panes.get(&s.active_pane).map_or(false, |p| p.kind != PaneKind::Editor) { return; }
+    check_lsp_binaries(s);
     let pane = s.pane_mut();
     if let Some(i) = pane.tabs.iter().position(|t| t.kind == TabKind::Settings) {
         pane.active = i;
@@ -836,6 +848,7 @@ pub enum UserEvent {
     TermOutput     { pane_id: usize, data: Vec<u8> },
     LspOutput      { pane_id: usize, data: Vec<u8> },
     LspDiagnostics { path: PathBuf, diagnostics: Vec<Diagnostic> },
+    LspResponse    { server_id: usize, id: u64, result: serde_json::Value },
     Redraw,
 }
 
@@ -854,11 +867,12 @@ struct State {
     drag_pending: Option<(usize, usize, f32, f32)>,
     resize_drag:  Option<ResizeDrag>,
 
-    term_panes:  HashMap<usize, terminal::TermPane>,
-    lsp_panes:   HashMap<usize, OutputPane>,
-    lsp:         lsp::LspManager,
-    diagnostics: HashMap<PathBuf, Vec<Diagnostic>>,
-    proxy:       EventLoopProxy<UserEvent>,
+    term_panes:     HashMap<usize, terminal::TermPane>,
+    lsp_panes:      HashMap<usize, OutputPane>,
+    lsp:            lsp::LspManager,
+    diagnostics:    HashMap<PathBuf, Vec<Diagnostic>>,
+    lsp_installed:  HashMap<Lang, bool>,
+    proxy:          EventLoopProxy<UserEvent>,
 
     cursor_visible: bool,
     cursor_blink:   Instant,
@@ -887,7 +901,8 @@ struct State {
     settings:     settings::Settings,
     needs_redraw: bool,
 
-    left_view:    LeftView,
+    left_view:      LeftView,
+    diag_panel_sel: usize,
     context_menu: Option<ContextMenu>,
     quick_finder: QuickFinder,
     global_find:  GlobalFind,
@@ -1626,6 +1641,63 @@ fn open_or_reuse_tab(s: &mut State, path: PathBuf) {
     notify_lsp_open(s, &path);
 }
 
+fn apply_goto_definition(s: &mut State, result: &serde_json::Value) {
+    let loc = if result.is_array() { result.get(0) } else { Some(result) };
+    let Some(loc) = loc else { return };
+    let uri  = loc["uri"].as_str().unwrap_or("");
+    let line = loc["range"]["start"]["line"].as_u64().unwrap_or(0) as usize;
+    let col  = loc["range"]["start"]["character"].as_u64().unwrap_or(0) as usize;
+    let path = PathBuf::from(uri.strip_prefix("file://").unwrap_or(uri));
+    open_or_reuse_tab(s, path);
+    let pos = s.tab().text.line_to_char(line) + col;
+    s.tab_mut().cursors = vec![Cursor::new(pos)];
+    s.ensure_visible();
+}
+
+fn apply_references(s: &mut State, result: &serde_json::Value) {
+    let locs = result.as_array().map(|a| a.as_slice()).unwrap_or(&[]);
+    s.global_find.results = locs.iter().filter_map(|loc| {
+        let uri  = loc["uri"].as_str()?;
+        let path = PathBuf::from(uri.strip_prefix("file://")?);
+        let line = loc["range"]["start"]["line"].as_u64()? as usize;
+        let col  = loc["range"]["start"]["character"].as_u64()? as usize;
+        let text = std::fs::read_to_string(&path).ok()
+            .and_then(|s| s.lines().nth(line).map(|l| l.to_owned()))
+            .unwrap_or_default();
+        Some(GlobalFindResult { path, line_num: line, line_text: text, match_col: col, match_len: 1 })
+    }).collect();
+    s.global_find.selected = 0;
+    s.global_find.scroll   = 0;
+    s.global_find.focus    = GlobalFindFocus::Results;
+    if s.explorer.is_some() { s.left_view = LeftView::GlobalSearch; }
+}
+
+fn apply_text_edits(s: &mut State, path: &PathBuf, result: &serde_json::Value) {
+    let edits = result.as_array().map(|a| a.as_slice()).unwrap_or(&[]);
+    for p in s.panes.values_mut() {
+        for t in p.tabs.iter_mut() {
+            if t.path.as_deref() != Some(path.as_path()) { continue; }
+            let mut sorted: Vec<(usize, usize, String)> = edits.iter().filter_map(|e| {
+                let sl = e["range"]["start"]["line"].as_u64()? as usize;
+                let sc = e["range"]["start"]["character"].as_u64()? as usize;
+                let el = e["range"]["end"]["line"].as_u64()? as usize;
+                let ec = e["range"]["end"]["character"].as_u64()? as usize;
+                let new_text = e["newText"].as_str()?.to_owned();
+                let start = t.text.line_to_char(sl) + sc;
+                let end   = t.text.line_to_char(el) + ec;
+                Some((start, end, new_text))
+            }).collect();
+            sorted.sort_by(|a, b| b.0.cmp(&a.0));
+            for (start, end, new_text) in sorted {
+                t.text.remove(start..end);
+                t.text.insert(start, &new_text);
+            }
+            t.dirty = true;
+            return;
+        }
+    }
+}
+
 fn term_token_bounds(row: &[terminal::Cell], col: usize) -> (usize, usize) {
     if col >= row.len() || row[col].ch.is_whitespace() { return (col, col); }
     let mut lo = col;
@@ -2362,8 +2434,9 @@ fn open_quick_finder(s: &mut State) {
     s.quick_finder.selected            = 0;
     s.quick_finder.restore_tree_focus  = had_tree_focus;
     s.quick_finder.open                = true;
-    // Unfocus tree search so it doesn't swallow subsequent keystrokes
+    // Unfocus tree search and global find so they don't swallow subsequent keystrokes
     if let Some(ex) = s.explorer.as_mut() { ex.tree_search_focused = false; }
+    s.global_find.focus = GlobalFindFocus::Results;
 }
 
 fn refilter_quick_finder(s: &mut State) {
@@ -2424,7 +2497,19 @@ fn refilter_tree_search(ex: &mut FileExplorer) {
 
 fn execute_command(s: &mut State, action: CommandAction) {
     match action {
-        CommandAction::Save           => { let id = s.active_pane; if s.panes.get(&id).map_or(false, |p| p.kind == PaneKind::Editor) { s.tab_mut().save(); } }
+        CommandAction::Save           => {
+            let id = s.active_pane;
+            if s.panes.get(&id).map_or(false, |p| p.kind == PaneKind::Editor) {
+                s.tab_mut().save();
+                let lang = s.tab().path.as_deref().map(Lang::from_path).unwrap_or(Lang::None);
+                let path = s.tab().path.clone();
+                if lang != Lang::None {
+                    if let (Some(srv), Some(ref p)) = (s.lsp.server_for_lang_mut(lang), path.as_ref()) {
+                        if srv.initialized { lsp::request_formatting(srv, p); }
+                    }
+                }
+            }
+        }
         CommandAction::CloseTab       => { /* handled by Cmd+W */ }
         CommandAction::GoToSettings   => open_settings_tab(s),
         CommandAction::OpenTerminal   => open_terminal_pane(s),
@@ -2479,6 +2564,32 @@ fn execute_command(s: &mut State, action: CommandAction) {
             s.glyphs.resize(s.font_size);
             s.settings.font_size = s.font_size;
             s.settings.save();
+        }
+        CommandAction::GotoDefinition => {
+            let lang  = s.tab().path.as_deref().map(Lang::from_path).unwrap_or(Lang::None);
+            let path  = s.tab().path.clone();
+            let pos   = s.tab().primary().head;
+            let text  = s.tab().text.clone();
+            let line  = text.char_to_line(pos.min(text.len_chars().saturating_sub(1)));
+            let col   = pos.saturating_sub(text.line_to_char(line));
+            if lang != Lang::None {
+                if let (Some(srv), Some(ref p)) = (s.lsp.server_for_lang_mut(lang), path.as_ref()) {
+                    if srv.initialized { lsp::request_definition(srv, p, line, col); }
+                }
+            }
+        }
+        CommandAction::FindReferences => {
+            let lang  = s.tab().path.as_deref().map(Lang::from_path).unwrap_or(Lang::None);
+            let path  = s.tab().path.clone();
+            let pos   = s.tab().primary().head;
+            let text  = s.tab().text.clone();
+            let line  = text.char_to_line(pos.min(text.len_chars().saturating_sub(1)));
+            let col   = pos.saturating_sub(text.line_to_char(line));
+            if lang != Lang::None {
+                if let (Some(srv), Some(ref p)) = (s.lsp.server_for_lang_mut(lang), path.as_ref()) {
+                    if srv.initialized { lsp::request_references(srv, p, line, col); }
+                }
+            }
         }
     }
 }
@@ -2719,10 +2830,11 @@ impl ApplicationHandler<UserEvent> for App {
             drag_pending: None,
             resize_drag:  None,
             term_panes:  HashMap::new(),
-            lsp_panes:   HashMap::new(),
-            lsp:         lsp::LspManager::new(),
-            diagnostics: HashMap::new(),
-            proxy:       self.proxy.clone(),
+            lsp_panes:     HashMap::new(),
+            lsp:           lsp::LspManager::new(),
+            diagnostics:   HashMap::new(),
+            lsp_installed: HashMap::new(),
+            proxy:         self.proxy.clone(),
             cursor_visible: true,
             cursor_blink:   Instant::now() + Duration::from_millis(500),
             mods:   ModifiersState::default(),
@@ -2748,7 +2860,8 @@ impl ApplicationHandler<UserEvent> for App {
             settings:     loaded_settings,
             needs_redraw: false,
 
-            left_view:    LeftView::FileTree,
+            left_view:      LeftView::FileTree,
+            diag_panel_sel: 0,
             context_menu: None,
             quick_finder: QuickFinder {
                 open: false, query: String::new(), cursor: 0, sel_anchor: None,
@@ -2894,6 +3007,9 @@ impl ApplicationHandler<UserEvent> for App {
                     s.ensure_visible();
                     { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                 }
+                // Redraw for hover tooltip updates
+                { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+
                 // Terminal mouse motion: selection drag + mouse reporting
                 {
                     let pane_id = s.active_pane;
@@ -3088,12 +3204,15 @@ impl ApplicationHandler<UserEvent> for App {
                     let lh = s.glyphs.lh;
                     let file_icon_y = 8;
                     let srch_icon_y = file_icon_y + lh + 4;
+                    let diag_icon_y = srch_icon_y + lh + 4;
                     let gear_y      = s.h as i32 - s.status_h() - lh - 8;
                     if my >= file_icon_y && my < file_icon_y + lh {
                         s.left_view = LeftView::FileTree;
                     } else if my >= srch_icon_y && my < srch_icon_y + lh {
                         s.left_view = LeftView::GlobalSearch;
                         s.global_find.focus = GlobalFindFocus::Query;
+                    } else if my >= diag_icon_y && my < diag_icon_y + lh {
+                        s.left_view = LeftView::Diagnostics;
                     } else if my >= gear_y && my < gear_y + lh {
                         if s.context_menu.is_some() {
                             s.context_menu = None;
@@ -3178,6 +3297,36 @@ impl ApplicationHandler<UserEvent> for App {
                                     } else { None }
                                 });
                                 if let Some(path) = action { open_or_reuse_tab(s, path); }
+                            }
+                        }
+                    } else if s.left_view == LeftView::Diagnostics {
+                        // Diagnostics panel click — open file and jump to line
+                        let header_rows = 2; // header label + separator
+                        let first_item_y = header_rows * lh + 2 + 4;
+                        if my >= first_item_y {
+                            let idx = ((my - first_item_y) / lh) as usize;
+                            // Collect items in same order as rendering (sorted)
+                            let mut items: Vec<(PathBuf, usize)> = s.diagnostics.iter()
+                                .flat_map(|(path, diags)| {
+                                    diags.iter().map(move |d| (path.clone(), d.line))
+                                })
+                                .collect();
+                            items.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+                            // Re-sort by severity (errors first) — same as diag_panel_snap
+                            let mut sev_items: Vec<(usize, PathBuf, usize)> = s.diagnostics.iter()
+                                .flat_map(|(path, diags)| {
+                                    let sev_ord = |s: &DiagSeverity| match s { DiagSeverity::Error => 0, DiagSeverity::Warning => 1, _ => 2 };
+                                    diags.iter().map(move |d| (sev_ord(&d.severity), path.clone(), d.line))
+                                })
+                                .collect();
+                            sev_items.sort();
+                            if idx < sev_items.len() {
+                                s.diag_panel_sel = idx;
+                                let (_, path, line) = sev_items[idx].clone();
+                                open_or_reuse_tab(s, path);
+                                let pos = s.tab().text.line_to_char(line);
+                                s.tab_mut().cursors = vec![Cursor::new(pos)];
+                                s.ensure_visible();
                             }
                         }
                     } else {
@@ -3277,8 +3426,9 @@ impl ApplicationHandler<UserEvent> for App {
                 // Which pane was clicked?
                 let area = s.pane_area();
                 let Some(clicked_pane_id) = pane_at_pos(&s.pane_tree, mx, my, area) else { return };
-                // Clicking any content pane removes tree-search focus
+                // Clicking any content pane removes left-panel focus
                 if let Some(ex) = s.explorer.as_mut() { ex.tree_search_focused = false; }
+                s.global_find.focus = GlobalFindFocus::Results;
                 let pane_rect = layout_tree(&s.pane_tree, area).into_iter()
                     .find(|(id, _)| *id == clicked_pane_id).map(|(_, r)| r).unwrap_or(area);
 
@@ -3541,6 +3691,29 @@ impl ApplicationHandler<UserEvent> for App {
                                 s.settings.term_word_select = settings::TermWordSelect::Word;
                                 s.settings.save();
                             }
+                        } else {
+                            // Language Servers section — install button clicks
+                            let lsp_sec_y = tws_y + lh + 8;
+                            let lsp_rows: [(&str, &str); 3] = [
+                                ("TypeScript", "npm install -g typescript-language-server typescript\n"),
+                                ("Rust      ", "rustup component add rust-analyzer\n"),
+                                ("Python    ", "pip install python-lsp-server\n"),
+                            ];
+                            let inst_btn_x = btn_x + 11 * cw;
+                            let inst_btn_w = 9 * cw;
+                            for (i, (_, cmd)) in lsp_rows.iter().enumerate() {
+                                let ly = lsp_sec_y + lh + 4 + i as i32 * (lh + 4);
+                                if my >= ly && my < ly + lh && mx >= inst_btn_x && mx < inst_btn_x + inst_btn_w {
+                                    open_terminal_pane(s);
+                                    let pane_id = s.active_pane;
+                                    if let Some(&tid) = s.panes.get(&pane_id).and_then(|p| p.term_ids.get(p.active)) {
+                                        if let Some(tp) = s.term_panes.get(&tid) {
+                                            let bytes = cmd.as_bytes();
+                                            if tp.pty_fd >= 0 { unsafe { libc::write(tp.pty_fd, bytes.as_ptr().cast(), bytes.len()); } }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                     { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
@@ -3608,15 +3781,31 @@ impl ApplicationHandler<UserEvent> for App {
                 // Editor area click
                 let pos = s.xy_to_char(mx, my);
                 if cmd {
-                    // Cmd+Click: extract whitespace-delimited token and open it
-                    let len = s.tab().text.len_chars();
-                    if pos < len && !s.tab().text.char(pos).is_whitespace() {
-                        let mut lo = pos;
-                        while lo > 0 && !s.tab().text.char(lo - 1).is_whitespace() { lo -= 1; }
-                        let mut hi = pos + 1;
-                        while hi < len && !s.tab().text.char(hi).is_whitespace() { hi += 1; }
-                        let token: String = s.tab().text.slice(lo..hi).chars().collect();
-                        open_token(s, &token);
+                    // Cmd+Click: try LSP goto-definition first, fallback to path token open
+                    let click_line = s.tab().text.char_to_line(pos.min(s.tab().text.len_chars().saturating_sub(1)));
+                    let line_start = s.tab().text.line_to_char(click_line);
+                    let click_col  = pos.saturating_sub(line_start);
+                    let tab_lang   = s.tab().path.as_deref().map(Lang::from_path).unwrap_or(Lang::None);
+                    let tab_path   = s.tab().path.clone();
+                    let mut lsp_sent = false;
+                    if tab_lang != Lang::None {
+                        if let (Some(srv), Some(ref path)) = (s.lsp.server_for_lang_mut(tab_lang), tab_path.as_ref()) {
+                            if srv.initialized {
+                                lsp::request_definition(srv, path, click_line, click_col);
+                                lsp_sent = true;
+                            }
+                        }
+                    }
+                    if !lsp_sent {
+                        let len = s.tab().text.len_chars();
+                        if pos < len && !s.tab().text.char(pos).is_whitespace() {
+                            let mut lo = pos;
+                            while lo > 0 && !s.tab().text.char(lo - 1).is_whitespace() { lo -= 1; }
+                            let mut hi = pos + 1;
+                            while hi < len && !s.tab().text.char(hi).is_whitespace() { hi += 1; }
+                            let token: String = s.tab().text.slice(lo..hi).chars().collect();
+                            open_token(s, &token);
+                        }
                     }
                 } else if alt {
                     s.tab_mut().cursors.push(Cursor::new(pos));
@@ -3993,6 +4182,39 @@ impl ApplicationHandler<UserEvent> for App {
                                     Some(Instant::now() + Duration::from_millis(300));
                             }
                         }
+                    }
+                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                    return;
+                }
+
+                // Diagnostics panel keyboard navigation
+                if s.explorer.is_some() && s.left_view == LeftView::Diagnostics {
+                    let total: usize = s.diagnostics.values().map(|v| v.len()).sum();
+                    match &event.logical_key {
+                        Key::Named(NamedKey::ArrowUp) => {
+                            s.diag_panel_sel = s.diag_panel_sel.saturating_sub(1);
+                        }
+                        Key::Named(NamedKey::ArrowDown) => {
+                            if total > 0 { s.diag_panel_sel = (s.diag_panel_sel + 1).min(total.saturating_sub(1)); }
+                        }
+                        Key::Named(NamedKey::Enter) if total > 0 => {
+                            let mut sev_items: Vec<(usize, PathBuf, usize)> = s.diagnostics.iter()
+                                .flat_map(|(path, diags)| {
+                                    let sev_ord = |s: &DiagSeverity| match s { DiagSeverity::Error => 0, DiagSeverity::Warning => 1, _ => 2 };
+                                    diags.iter().map(move |d| (sev_ord(&d.severity), path.clone(), d.line))
+                                })
+                                .collect();
+                            sev_items.sort();
+                            let idx = s.diag_panel_sel.min(sev_items.len().saturating_sub(1));
+                            if idx < sev_items.len() {
+                                let (_, path, line) = sev_items[idx].clone();
+                                open_or_reuse_tab(s, path);
+                                let pos = s.tab().text.line_to_char(line);
+                                s.tab_mut().cursors = vec![Cursor::new(pos)];
+                                s.ensure_visible();
+                            }
+                        }
+                        _ => {}
                     }
                     { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                     return;
@@ -4541,6 +4763,14 @@ impl ApplicationHandler<UserEvent> for App {
                                 Key::Named(NamedKey::Tab)      => s.insert_str("    "),
                                 Key::Named(NamedKey::PageUp)   => s.scroll_by(-10),
                                 Key::Named(NamedKey::PageDown) => s.scroll_by(10),
+                                Key::Named(NamedKey::F12) => {
+                                    let action = if shift && cmd {
+                                        CommandAction::FindReferences
+                                    } else {
+                                        CommandAction::GotoDefinition
+                                    };
+                                    execute_command(s, action);
+                                }
                                 _ => {
                                     if !ctrl && !cmd {
                                         if let Some(txt) = event.text.as_deref() {
@@ -4613,6 +4843,23 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::LspDiagnostics { path, diagnostics } => {
                 s.diagnostics.insert(path, diagnostics);
+            }
+            UserEvent::LspResponse { server_id, id, result } => {
+                let kind = s.lsp.servers.get_mut(&server_id)
+                    .and_then(|srv| srv.pending.remove(&id));
+                match kind {
+                    Some(lsp::PendingKind::Definition) => {
+                        apply_goto_definition(s, &result);
+                    }
+                    Some(lsp::PendingKind::References) => {
+                        apply_references(s, &result);
+                    }
+                    Some(lsp::PendingKind::Formatting { path }) => {
+                        apply_text_edits(s, &path, &result);
+                    }
+                    None => {}
+                }
+                s.needs_redraw = true;
             }
             UserEvent::Redraw => {}
         }
@@ -4714,8 +4961,8 @@ struct PaneSnap {
     dirty:          bool,
     cur_line:       usize,
     cur_col:        usize,
-    // Diagnostics: (line, col_start, col_end, severity)
-    diagnostics:    Vec<(usize, usize, usize, DiagSeverity)>,
+    // Diagnostics: (line, col_start, col_end, severity, message)
+    diagnostics:    Vec<(usize, usize, usize, DiagSeverity, String)>,
 }
 
 fn render(s: &mut State) {
@@ -4981,7 +5228,7 @@ fn render(s: &mut State) {
             cur_line, cur_col,
             diagnostics: tab.path.as_ref()
                 .and_then(|p| s.diagnostics.get(p))
-                .map(|diags| diags.iter().map(|d| (d.line, d.col_start, d.col_end, d.severity.clone())).collect())
+                .map(|diags| diags.iter().map(|d| (d.line, d.col_start, d.col_end, d.severity.clone(), d.message.clone())).collect())
                 .unwrap_or_default(),
         })
     }).collect();
@@ -5009,6 +5256,12 @@ fn render(s: &mut State) {
     let term_cmd_bs      = s.settings.term_cmd_bs;
     let term_alt_bs      = s.settings.term_alt_bs;
     let term_word_select = s.settings.term_word_select;
+    let ts_installed     = s.lsp_installed.get(&Lang::TypeScript).copied().unwrap_or(false);
+    let ts_running       = s.lsp.has_server_for(Lang::TypeScript);
+    let rust_installed   = s.lsp_installed.get(&Lang::Rust).copied().unwrap_or(false);
+    let rust_running     = s.lsp.has_server_for(Lang::Rust);
+    let py_installed     = s.lsp_installed.get(&Lang::Python).copied().unwrap_or(false);
+    let py_running       = s.lsp.has_server_for(Lang::Python);
     let explorer_drag    = s.explorer_drag;
     let ui_scale         = s.font_size / FONT_PX;
     let left_view        = s.left_view;
@@ -5107,9 +5360,48 @@ fn render(s: &mut State) {
         })
     } else { None };
 
+    // Diagnostics panel snapshot: (filename, line, severity, message) sorted errors-first
+    let diag_panel_sel  = s.diag_panel_sel;
+    let diag_panel_snap: Option<Vec<(String, usize, DiagSeverity, String, PathBuf)>> =
+        if s.explorer.is_some() && left_view == LeftView::Diagnostics {
+            let mut items: Vec<(String, usize, DiagSeverity, String, PathBuf)> = s.diagnostics.iter()
+                .flat_map(|(path, diags)| {
+                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_owned();
+                    diags.iter().map(move |d| (name.clone(), d.line, d.severity.clone(), d.message.clone(), path.clone()))
+                })
+                .collect();
+            // Sort: errors first, then warnings, then info/hint, then by filename+line
+            items.sort_by(|a, b| {
+                let sev_ord = |s: &DiagSeverity| match s { DiagSeverity::Error => 0, DiagSeverity::Warning => 1, _ => 2 };
+                sev_ord(&a.2).cmp(&sev_ord(&b.2)).then(a.0.cmp(&b.0)).then(a.1.cmp(&b.1))
+            });
+            Some(items)
+        } else { None };
+
+    // Error count for activity bar badge
+    let err_count: usize = s.diagnostics.values()
+        .map(|v| v.iter().filter(|d| d.severity == DiagSeverity::Error).count())
+        .sum();
+
     // Context menu snapshot
     let ctx_menu_snap: Option<(i32, i32, Vec<&'static str>, usize)> =
         s.context_menu.as_ref().map(|m| (m.x, m.y, m.items.clone(), m.hovered));
+
+    // Hover tooltip: find if mouse is over a diagnostic squiggle in any editor pane
+    let mx_hover = s.mouse_x as i32;
+    let my_hover = s.mouse_y as i32;
+    let hover_tip: Option<(i32, i32, String)> = pane_snaps.iter().find_map(|snap| {
+        let ed_x = snap.rect.x + snap.gutter_w;
+        snap.diagnostics.iter().find_map(|(dline, cs, ce, _, msg)| {
+            let row_y = snap.rect.y + tab_h + (*dline as i32 - snap.scroll as i32) * lh;
+            if my_hover < row_y || my_hover >= row_y + lh { return None; }
+            let x1 = ed_x + (*cs as i32 - snap.hscroll as i32) * cw;
+            let x2 = ed_x + (*ce as i32 - snap.hscroll as i32) * cw;
+            if mx_hover >= x1 && mx_hover < x2.max(x1 + cw) {
+                Some((mx_hover, row_y, msg.clone()))
+            } else { None }
+        })
+    });
 
     // SAFETY: render_frame takes FnOnce and calls it synchronously before returning.
     // s.glyphs is alive for the entire duration, and renderer does not alias glyphs.
@@ -5131,6 +5423,7 @@ fn render(s: &mut State) {
             let icon_size = lh;
             let file_icon_y = 8;
             let srch_icon_y = file_icon_y + icon_size + 4;
+            let diag_icon_y = srch_icon_y + icon_size + 4;
             let gear_y      = panel_h - icon_size - 8;
 
             // File tree icon
@@ -5146,6 +5439,19 @@ fn render(s: &mut State) {
             let gs_bg = if gs_active { SEL_BG } else { BG };
             fill(buf, w, h, 2, srch_icon_y, act_w - 3, icon_size, gs_bg);
             draw_str(buf, w, h, g, " [S]", 2, srch_icon_y + asc, if gs_active { ACCENT } else { FG_DIM }, act_w - 1);
+
+            // Diagnostics icon
+            let dg_active = left_view == LeftView::Diagnostics;
+            if dg_active { fill(buf, w, h, 0, diag_icon_y, 2, icon_size, ACCENT); }
+            let dg_bg = if dg_active { SEL_BG } else { BG };
+            fill(buf, w, h, 2, diag_icon_y, act_w - 3, icon_size, dg_bg);
+            let dg_label = if err_count > 0 {
+                format!("[!{}]", err_count.min(99))
+            } else {
+                "[!]".to_owned()
+            };
+            let dg_color = if err_count > 0 { 0xFF5555u32 } else if dg_active { ACCENT } else { FG_DIM };
+            draw_str(buf, w, h, g, &dg_label, 2, diag_icon_y + asc, dg_color, act_w - 1);
 
             // Gear icon — centered, full-width
             fill(buf, w, h, 2, gear_y, act_w - 3, icon_size, SEL_BG);
@@ -5304,6 +5610,35 @@ fn render(s: &mut State) {
                     let preview: String = line_text.trim().chars().take(((pw - hlen) / cw).max(0) as usize).collect();
                     draw_str(buf, w, h, g, &preview, px + 2 + hlen, ry + asc, FG_DIM, px + pw - 1);
                 }
+            } else if let Some(ref dp) = diag_panel_snap {
+                // Diagnostics panel
+                let mut ry = 4i32;
+                let label = if err_count > 0 {
+                    format!(" Diagnostics ({} error{})", err_count, if err_count == 1 { "" } else { "s" })
+                } else {
+                    " Diagnostics".to_owned()
+                };
+                draw_str(buf, w, h, g, &label, px, ry + asc, if err_count > 0 { 0xFF5555u32 } else { FG }, px + pw - 1);
+                ry += lh + 2;
+                fill(buf, w, h, px, ry, pw - 1, 1, BORDER);
+                ry += 4;
+                for (i, (name, line_num, sev, msg, _path)) in dp.iter().enumerate() {
+                    if ry + lh > panel_h { break; }
+                    let is_sel = i == diag_panel_sel;
+                    if is_sel { fill(buf, w, h, px, ry, pw - 1, lh, SEL_BG); }
+                    let (icon, sev_color) = match sev {
+                        DiagSeverity::Error   => ("[!]", 0xFF5555u32),
+                        DiagSeverity::Warning => ("[~]", 0xE0AF68u32),
+                        _                     => ("[-]", FG_DIM),
+                    };
+                    let header = format!("{} {}:{} ", icon, name, line_num + 1);
+                    let hlen   = header.chars().count() as i32 * cw;
+                    draw_str(buf, w, h, g, &header, px + 2, ry + asc, sev_color, px + hlen + 2);
+                    let avail  = ((pw - hlen - 4) / cw).max(0) as usize;
+                    let preview: String = msg.trim().chars().take(avail).collect();
+                    draw_str(buf, w, h, g, &preview, px + 2 + hlen, ry + asc, FG_DIM, px + pw - 1);
+                    ry += lh;
+                }
             }
         }
 
@@ -5433,6 +5768,34 @@ fn render(s: &mut State) {
                 fill(buf, w, h, btn_x + 12 * cw, tws_y, 6 * cw, lh, wd_bg);
                 draw_str(buf, w, h, g, " Word ", btn_x + 12 * cw, tws_y + asc, wd_fg, btn_x + 18 * cw);
 
+                // ── Language Servers section ───────────────────────────────────
+                let lsp_sec_y = tws_y + lh + 8;
+                draw_str(buf, w, h, g, "  Language Servers", r.x, lsp_sec_y + asc, FG, btn_x - cw);
+                fill(buf, w, h, r.x + cw, lsp_sec_y + lh - 1, r.w - 2 * cw, 1, BORDER);
+                let inst_btn_w = 9 * cw; // "[Install]"
+
+                let lsp_rows: [(&str, bool, bool, &str); 3] = [
+                    ("TypeScript", ts_installed, ts_running, "npm i -g typescript-language-server typescript"),
+                    ("Rust      ", rust_installed, rust_running, "rustup component add rust-analyzer"),
+                    ("Python    ", py_installed, py_running, "pip install python-lsp-server"),
+                ];
+                for (i, (name, installed, running, _)) in lsp_rows.iter().enumerate() {
+                    let ly = lsp_sec_y + lh + 4 + i as i32 * (lh + 4);
+                    draw_str(buf, w, h, g, &format!("  {}", name), r.x, ly + asc, FG, btn_x - cw);
+                    if *running {
+                        fill(buf, w, h, btn_x, ly, 10 * cw, lh, ACCENT);
+                        draw_str(buf, w, h, g, " running  ", btn_x, ly + asc, BG, btn_x + 10 * cw);
+                    } else if *installed {
+                        draw_str(buf, w, h, g, " installed", btn_x, ly + asc, FG_DIM, btn_x + 10 * cw);
+                        fill(buf, w, h, btn_x + 11 * cw, ly, inst_btn_w, lh, SEL_BG);
+                        draw_str(buf, w, h, g, "[Install]", btn_x + 11 * cw, ly + asc, FG, btn_x + 11 * cw + inst_btn_w);
+                    } else {
+                        draw_str(buf, w, h, g, " not found", btn_x, ly + asc, FG_DIM, btn_x + 10 * cw);
+                        fill(buf, w, h, btn_x + 11 * cw, ly, inst_btn_w, lh, SEL_BG);
+                        draw_str(buf, w, h, g, "[Install]", btn_x + 11 * cw, ly + asc, FG, btn_x + 11 * cw + inst_btn_w);
+                    }
+                }
+
                 continue;
             }
 
@@ -5450,8 +5813,8 @@ fn render(s: &mut State) {
                     FG
                 } else {
                     // Check if any diagnostic is on this line; use worst severity color
-                    let has_error = snap.diagnostics.iter().any(|&(dl, _, _, ref s)| dl == li && *s == DiagSeverity::Error);
-                    let has_warn  = snap.diagnostics.iter().any(|&(dl, _, _, ref s)| dl == li && *s == DiagSeverity::Warning);
+                    let has_error = snap.diagnostics.iter().any(|&(dl, _, _, ref s, _)| dl == li && *s == DiagSeverity::Error);
+                    let has_warn  = snap.diagnostics.iter().any(|&(dl, _, _, ref s, _)| dl == li && *s == DiagSeverity::Warning);
                     if has_error { 0xFF5555u32 } else if has_warn { 0xE0AF68 } else { FG_DIM }
                 };
                 draw_str(buf, w, h, g, &ln_str, ln_x, baseline, ln_color, ed_x);
@@ -5513,7 +5876,7 @@ fn render(s: &mut State) {
                 }
 
                 // Diagnostic squiggles
-                for &(dline, cs, ce, ref sev) in &snap.diagnostics {
+                for &(dline, cs, ce, ref sev, _) in &snap.diagnostics {
                     if dline != li { continue; }
                     let color = match sev {
                         DiagSeverity::Error   => 0xFF5555u32,
@@ -5859,6 +6222,22 @@ fn render(s: &mut State) {
                     draw_str(buf, w, h, g, dir, ox + ow - 4 - dir.chars().count() as i32 * cw, ry + asc, FG_DIM, ox + ow - 2);
                 }
             }
+        }
+
+        // ── Hover tooltip (diagnostic message) ───────────────────────────
+        if let Some((tx, ty, ref msg)) = hover_tip {
+            let max_chars = (w as i32 / cw - 4).max(10) as usize;
+            let disp: String = msg.chars().take(max_chars).collect();
+            let tip_w  = disp.chars().count() as i32 * cw + 8;
+            let tip_h  = lh + 4;
+            let tip_x  = tx.min(w as i32 - tip_w - 4).max(0);
+            let tip_y  = (ty - tip_h).max(0);
+            fill(buf, w, h, tip_x, tip_y, tip_w, tip_h, BG2);
+            fill(buf, w, h, tip_x, tip_y, tip_w, 1, BORDER);
+            fill(buf, w, h, tip_x, tip_y + tip_h - 1, tip_w, 1, BORDER);
+            fill(buf, w, h, tip_x, tip_y, 1, tip_h, BORDER);
+            fill(buf, w, h, tip_x + tip_w - 1, tip_y, 1, tip_h, BORDER);
+            draw_str(buf, w, h, g, &disp, tip_x + 4, tip_y + 2 + asc, FG, tip_x + tip_w - 1);
         }
     });
 }
