@@ -3233,6 +3233,8 @@ impl ApplicationHandler<UserEvent> for App {
                 // Which pane was clicked?
                 let area = s.pane_area();
                 let Some(clicked_pane_id) = pane_at_pos(&s.pane_tree, mx, my, area) else { return };
+                // Clicking any content pane removes tree-search focus
+                if let Some(ex) = s.explorer.as_mut() { ex.tree_search_focused = false; }
                 let pane_rect = layout_tree(&s.pane_tree, area).into_iter()
                     .find(|(id, _)| *id == clicked_pane_id).map(|(_, r)| r).unwrap_or(area);
 
