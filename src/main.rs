@@ -265,6 +265,7 @@ enum CommandAction {
     ToggleFind, ToggleReplace, ToggleExplorer, IncreaseFontSize, DecreaseFontSize,
     GotoDefinition, FindReferences,
     Copy, Cut, Paste,
+    CursorBack, CursorForward,
 }
 
 struct CommandEntry { name: &'static str, shortcut: &'static str, action: CommandAction }
@@ -272,7 +273,9 @@ struct CommandEntry { name: &'static str, shortcut: &'static str, action: Comman
 const COMMANDS: &[CommandEntry] = &[
     CommandEntry { name: "Save File",             shortcut: "Cmd+S",         action: CommandAction::Save },
     CommandEntry { name: "Close Tab",             shortcut: "Cmd+W",         action: CommandAction::CloseTab },
-    CommandEntry { name: "Open Settings",         shortcut: "Cmd+,",         action: CommandAction::GoToSettings },
+    CommandEntry { name: "Open Settings",         shortcut: "",              action: CommandAction::GoToSettings },
+    CommandEntry { name: "Navigate Back",         shortcut: "Cmd+,",         action: CommandAction::CursorBack },
+    CommandEntry { name: "Navigate Forward",      shortcut: "Cmd+.",         action: CommandAction::CursorForward },
     CommandEntry { name: "Open Terminal",         shortcut: "Ctrl+`",        action: CommandAction::OpenTerminal },
     CommandEntry { name: "Split Right",           shortcut: "",              action: CommandAction::SplitRight },
     CommandEntry { name: "Split Down",            shortcut: "",              action: CommandAction::SplitDown },
@@ -919,6 +922,9 @@ struct State {
 
     settings:     settings::Settings,
     needs_redraw: bool,
+
+    cursor_back: Vec<(PathBuf, usize)>,
+    cursor_fwd:  Vec<(PathBuf, usize)>,
 
     left_view:      LeftView,
     diag_panel_sel: usize,
@@ -1667,6 +1673,7 @@ fn apply_goto_definition(s: &mut State, result: &serde_json::Value) {
     let line = loc["range"]["start"]["line"].as_u64().unwrap_or(0) as usize;
     let col  = loc["range"]["start"]["character"].as_u64().unwrap_or(0) as usize;
     let path = PathBuf::from(uri.strip_prefix("file://").unwrap_or(uri));
+    push_cursor_history(s);
     open_or_reuse_tab(s, path);
     let pos = s.tab().text.line_to_char(line) + col;
     s.tab_mut().cursors = vec![Cursor::new(pos)];
@@ -1714,6 +1721,50 @@ fn apply_text_edits(s: &mut State, path: &PathBuf, result: &serde_json::Value) {
             t.dirty = true;
             return;
         }
+    }
+}
+
+// ── Cursor position history ───────────────────────────────────────────────────
+
+fn push_cursor_history(s: &mut State) {
+    let pid = s.active_pane;
+    if !s.panes.get(&pid).map_or(false, |p| p.kind == PaneKind::Editor) { return; }
+    if let Some(path) = s.tab().path.clone() {
+        let pos = s.tab().primary().head;
+        s.cursor_back.push((path, pos));
+        s.cursor_fwd.clear();
+    }
+}
+
+fn cursor_go_back(s: &mut State) {
+    let pid = s.active_pane;
+    let current = if s.panes.get(&pid).map_or(false, |p| p.kind == PaneKind::Editor) {
+        s.tab().path.clone().map(|p| (p, s.tab().primary().head))
+    } else { None };
+    if let Some(entry) = s.cursor_back.pop() {
+        if let Some(cur) = current { s.cursor_fwd.push(cur); }
+        let (path, pos) = entry;
+        open_or_reuse_tab(s, path);
+        let n = s.tab().text.len_chars();
+        let clamped = pos.min(n.saturating_sub(1));
+        s.tab_mut().cursors = vec![Cursor::new(clamped)];
+        s.ensure_visible();
+    }
+}
+
+fn cursor_go_fwd(s: &mut State) {
+    let pid = s.active_pane;
+    let current = if s.panes.get(&pid).map_or(false, |p| p.kind == PaneKind::Editor) {
+        s.tab().path.clone().map(|p| (p, s.tab().primary().head))
+    } else { None };
+    if let Some(entry) = s.cursor_fwd.pop() {
+        if let Some(cur) = current { s.cursor_back.push(cur); }
+        let (path, pos) = entry;
+        open_or_reuse_tab(s, path);
+        let n = s.tab().text.len_chars();
+        let clamped = pos.min(n.saturating_sub(1));
+        s.tab_mut().cursors = vec![Cursor::new(clamped)];
+        s.ensure_visible();
     }
 }
 
@@ -2648,6 +2699,8 @@ fn execute_command(s: &mut State, action: CommandAction) {
                 s.insert_str(&text);
             }
         }
+        CommandAction::CursorBack    => cursor_go_back(s),
+        CommandAction::CursorForward => cursor_go_fwd(s),
     }
 }
 
@@ -2917,6 +2970,9 @@ impl ApplicationHandler<UserEvent> for App {
             settings:     loaded_settings,
             needs_redraw: false,
 
+            cursor_back: Vec::new(),
+            cursor_fwd:  Vec::new(),
+
             left_view:      LeftView::FileTree,
             diag_panel_sel: 0,
             context_menu: None,
@@ -2989,8 +3045,8 @@ impl ApplicationHandler<UserEvent> for App {
                     let sc_w    = cm.items.iter().filter(|i| i.action != CtxAction::Separator).map(|i| i.shortcut.chars().count()).max().unwrap_or(0) as i32;
                     let menu_w  = (label_w + sc_w + 4) * s.glyphs.cw + 16;
                     let total_h: i32 = cm.items.iter().map(|i| if i.action == CtxAction::Separator { sep_h } else { item_h }).sum::<i32>() + 4;
-                    let menu_x = cm.x.min(s.w as i32 - menu_w);
-                    let menu_y = (cm.y - total_h).max(0);
+                    let menu_x = cm.x.min(s.w as i32 - menu_w).max(0);
+                    let menu_y = cm.y.min(s.h as i32 - total_h).max(0);
                     if mx >= menu_x && mx < menu_x + menu_w && my >= menu_y && my < menu_y + total_h {
                         // Find which item is hovered by scanning y positions
                         let mut iy = menu_y + 2;
@@ -3292,8 +3348,8 @@ impl ApplicationHandler<UserEvent> for App {
                     let label_w = cm.items.iter().filter(|i| i.action != CtxAction::Separator).map(|i| i.label.chars().count()).max().unwrap_or(8) as i32;
                     let sc_w    = cm.items.iter().filter(|i| i.action != CtxAction::Separator).map(|i| i.shortcut.chars().count()).max().unwrap_or(0) as i32;
                     let menu_w  = (label_w + sc_w + 4) * s.glyphs.cw + 16;
-                    let menu_x  = cm.x.min(s.w as i32 - menu_w);
-                    let menu_y  = (cm.y - total_h).max(0);
+                    let menu_x  = cm.x.min(s.w as i32 - menu_w).max(0);
+                    let menu_y  = cm.y.min(s.h as i32 - total_h).max(0);
                     let in_menu = mx >= menu_x && mx < menu_x + menu_w && my >= menu_y && my < menu_y + total_h;
                     if in_menu {
                         let mut iy = menu_y + 2;
@@ -3354,7 +3410,7 @@ impl ApplicationHandler<UserEvent> for App {
                         } else {
                             s.context_menu = Some(ContextMenu {
                                 x: act_w, y: gear_y,
-                                items: vec![ContextMenuItem { label: "Open Settings", shortcut: "Cmd+,", action: CtxAction::OpenSettings, enabled: true }],
+                                items: vec![ContextMenuItem { label: "Open Settings", shortcut: "", action: CtxAction::OpenSettings, enabled: true }],
                                 hovered: 0,
                             });
                         }
@@ -4086,9 +4142,14 @@ impl ApplicationHandler<UserEvent> for App {
                 let alt   = s.mods.alt_key();
                 let shift = s.mods.shift_key();
 
-                // Cmd+, — open/focus Settings tab
+                // Cmd+, / Cmd+. — cursor history navigation
                 if cmd && matches!(&event.logical_key, Key::Character(c) if c.as_str() == ",") {
-                    open_settings_tab(s);
+                    cursor_go_back(s);
+                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                    return;
+                }
+                if cmd && matches!(&event.logical_key, Key::Character(c) if c.as_str() == ".") {
+                    cursor_go_fwd(s);
                     { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                     return;
                 }
@@ -4157,6 +4218,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 .and_then(|ex| ex.tree_search_results.get(ex.tree_search_sel).cloned());
                             if let Some(path) = path {
                                 if let Some(ex) = s.explorer.as_mut() { ex.tree_search_focused = false; }
+                                push_cursor_history(s);
                                 open_or_reuse_tab(s, path);
                             }
                         }
@@ -4219,6 +4281,7 @@ impl ApplicationHandler<UserEvent> for App {
                                     s.quick_finder.restore_tree_focus = false;
                                     if let Some(ex) = s.explorer.as_mut() { ex.tree_search_focused = true; }
                                 }
+                                push_cursor_history(s);
                                 open_or_reuse_tab(s, path);
                             }
                         }
@@ -4343,6 +4406,7 @@ impl ApplicationHandler<UserEvent> for App {
                             let idx = s.diag_panel_sel.min(sev_items.len().saturating_sub(1));
                             if idx < sev_items.len() {
                                 let (_, path, line) = sev_items[idx].clone();
+                                push_cursor_history(s);
                                 open_or_reuse_tab(s, path);
                                 let pos = s.tab().text.line_to_char(line);
                                 s.tab_mut().cursors = vec![Cursor::new(pos)];
@@ -4370,6 +4434,7 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         Key::Named(NamedKey::Enter) => {
                             let r = s.global_find.results[s.global_find.selected].clone();
+                            push_cursor_history(s);
                             open_or_reuse_tab(s, r.path.clone());
                             let line = r.line_num;
                             let col  = r.match_col;
