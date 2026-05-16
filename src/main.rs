@@ -220,10 +220,28 @@ impl FindBar {
 #[derive(Clone, Copy, PartialEq)]
 enum LeftView { FileTree, GlobalSearch, Diagnostics }
 
+#[derive(Clone, Copy, PartialEq)]
+enum CtxAction {
+    Separator,
+    OpenSettings,
+    GotoDefinition,
+    FindReferences,
+    FormatDocument,
+    Copy, Cut, Paste,
+}
+
+#[derive(Clone)]
+struct ContextMenuItem {
+    label:    &'static str,
+    shortcut: &'static str,
+    action:   CtxAction,
+    enabled:  bool,
+}
+
 struct ContextMenu {
     x:       i32,
     y:       i32,
-    items:   Vec<&'static str>,
+    items:   Vec<ContextMenuItem>,
     hovered: usize,
 }
 
@@ -246,6 +264,7 @@ enum CommandAction {
     Save, CloseTab, SplitRight, SplitDown, OpenTerminal, GoToSettings,
     ToggleFind, ToggleReplace, ToggleExplorer, IncreaseFontSize, DecreaseFontSize,
     GotoDefinition, FindReferences,
+    Copy, Cut, Paste,
 }
 
 struct CommandEntry { name: &'static str, shortcut: &'static str, action: CommandAction }
@@ -2591,6 +2610,44 @@ fn execute_command(s: &mut State, action: CommandAction) {
                 }
             }
         }
+        CommandAction::Copy => {
+            let order = s.cursor_order_ltr();
+            let texts: Vec<String> = order.iter()
+                .filter(|&&i| s.tab().cursors[i].has_sel())
+                .map(|&i| { let lo = s.tab().cursors[i].lo(); let hi = s.tab().cursors[i].hi(); s.tab().text.slice(lo..hi).chars().collect() })
+                .collect();
+            if !texts.is_empty() { clipboard_set(&texts.join("\n")); }
+        }
+        CommandAction::Cut => {
+            let order = s.cursor_order_ltr();
+            let texts: Vec<String> = order.iter()
+                .filter(|&&i| s.tab().cursors[i].has_sel())
+                .map(|&i| { let lo = s.tab().cursors[i].lo(); let hi = s.tab().cursors[i].hi(); s.tab().text.slice(lo..hi).chars().collect() })
+                .collect();
+            if !texts.is_empty() {
+                clipboard_set(&texts.join("\n"));
+                s.push_undo(false);
+                let mut delta: isize = 0;
+                for &i in &order {
+                    if s.tab().cursors[i].has_sel() {
+                        let lo = (s.tab().cursors[i].lo() as isize + delta) as usize;
+                        let hi = (s.tab().cursors[i].hi() as isize + delta) as usize;
+                        s.tab_mut().text.remove(lo..hi);
+                        s.tab_mut().cursors[i] = Cursor::new(lo);
+                        delta -= (hi - lo) as isize;
+                        s.tab_mut().dirty = true;
+                    }
+                }
+                s.dedup_cursors();
+                s.ensure_visible();
+            }
+        }
+        CommandAction::Paste => {
+            if let Some(text) = clipboard_get() {
+                for ch in text.chars() { s.glyphs.load(ch); }
+                s.insert_str(&text);
+            }
+        }
     }
 }
 
@@ -2906,6 +2963,8 @@ impl ApplicationHandler<UserEvent> for App {
 
             WindowEvent::ModifiersChanged(m) => {
                 s.mods = m.state();
+                // Redraw so cmd+hover underline appears/disappears immediately
+                { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
             }
 
             WindowEvent::CursorMoved { position, .. } => {
@@ -2925,13 +2984,21 @@ impl ApplicationHandler<UserEvent> for App {
                 // Update context menu hover
                 if let Some(ref mut cm) = s.context_menu {
                     let item_h = s.glyphs.lh + 2;
-                    let menu_w = cm.items.iter().map(|s| s.chars().count()).max().unwrap_or(10) as i32 * s.glyphs.cw + s.glyphs.cw * 2;
-                    let menu_h = cm.items.len() as i32 * item_h + 4;
+                    let sep_h  = 5i32;
+                    let label_w = cm.items.iter().filter(|i| i.action != CtxAction::Separator).map(|i| i.label.chars().count()).max().unwrap_or(8) as i32;
+                    let sc_w    = cm.items.iter().filter(|i| i.action != CtxAction::Separator).map(|i| i.shortcut.chars().count()).max().unwrap_or(0) as i32;
+                    let menu_w  = (label_w + sc_w + 4) * s.glyphs.cw + 16;
+                    let total_h: i32 = cm.items.iter().map(|i| if i.action == CtxAction::Separator { sep_h } else { item_h }).sum::<i32>() + 4;
                     let menu_x = cm.x.min(s.w as i32 - menu_w);
-                    let menu_y = (cm.y - menu_h).max(0);
-                    let rel = (my - menu_y - 2) / item_h;
-                    if mx >= menu_x && mx < menu_x + menu_w && my >= menu_y && my < menu_y + menu_h && rel >= 0 {
-                        cm.hovered = rel as usize;
+                    let menu_y = (cm.y - total_h).max(0);
+                    if mx >= menu_x && mx < menu_x + menu_w && my >= menu_y && my < menu_y + total_h {
+                        // Find which item is hovered by scanning y positions
+                        let mut iy = menu_y + 2;
+                        for (idx, item) in cm.items.iter().enumerate() {
+                            let ih = if item.action == CtxAction::Separator { sep_h } else { item_h };
+                            if my >= iy && my < iy + ih { cm.hovered = idx; break; }
+                            iy += ih;
+                        }
                     }
                     { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                 }
@@ -2999,7 +3066,17 @@ impl ApplicationHandler<UserEvent> for App {
                     let r     = s.active_pane_rect();
                     let fh    = s.find_h();
                     let in_ed = my >= r.y + s.tab_h() && my < r.y + r.h - fh && mx >= r.x;
-                    s.win.set_cursor(if in_ed { CursorIcon::Text } else { CursorIcon::Default });
+                    let cmd   = s.mods.super_key();
+                    // When Cmd is held and mouse is in the editor content area, use pointer cursor
+                    // to signal that Cmd+Click will navigate (goto definition)
+                    let cursor = if !in_ed {
+                        CursorIcon::Default
+                    } else if cmd {
+                        CursorIcon::Pointer
+                    } else {
+                        CursorIcon::Text
+                    };
+                    s.win.set_cursor(cursor);
                 }
                 if s.mouse_down {
                     let pos = s.xy_to_char(mx, my);
@@ -3133,6 +3210,40 @@ impl ApplicationHandler<UserEvent> for App {
 
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
+                button: MouseButton::Right, ..
+            } => {
+                let mx = s.mouse_x as i32;
+                let my = s.mouse_y as i32;
+                s.context_menu = None;
+                // Only show editor context menu when clicking in editor content area
+                let area = s.pane_area();
+                if let Some(pid) = pane_at_pos(&s.pane_tree, mx, my, area) {
+                    if s.panes.get(&pid).map_or(false, |p| p.kind == PaneKind::Editor) {
+                        s.active_pane = pid;
+                        let lang = s.tab().path.as_deref().map(Lang::from_path).unwrap_or(Lang::None);
+                        let lsp_avail = lang != Lang::None && s.lsp.has_server_for(lang)
+                            && s.lsp.server_for_lang_mut(lang).map_or(false, |srv| srv.initialized);
+                        let has_sel = s.tab().cursors.iter().any(|c| c.has_sel());
+                        s.context_menu = Some(ContextMenu {
+                            x: mx, y: my,
+                            hovered: 0,
+                            items: vec![
+                                ContextMenuItem { label: "Go to Definition",   shortcut: "Cmd+Click / F12",   action: CtxAction::GotoDefinition, enabled: lsp_avail },
+                                ContextMenuItem { label: "Find All References", shortcut: "Cmd+Shift+F12",    action: CtxAction::FindReferences,  enabled: lsp_avail },
+                                ContextMenuItem { label: "Format Document",    shortcut: "on Cmd+S",          action: CtxAction::FormatDocument,  enabled: lsp_avail },
+                                ContextMenuItem { label: "",                   shortcut: "",                  action: CtxAction::Separator,        enabled: true },
+                                ContextMenuItem { label: "Copy",               shortcut: "Cmd+C",             action: CtxAction::Copy,            enabled: has_sel },
+                                ContextMenuItem { label: "Cut",                shortcut: "Cmd+X",             action: CtxAction::Cut,             enabled: has_sel },
+                                ContextMenuItem { label: "Paste",              shortcut: "Cmd+V",             action: CtxAction::Paste,           enabled: true },
+                            ],
+                        });
+                    }
+                }
+                { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+            }
+
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
                 button: MouseButton::Left, ..
             } => {
                 let mx  = s.mouse_x as i32;
@@ -3176,19 +3287,43 @@ impl ApplicationHandler<UserEvent> for App {
                 // Dismiss context menu on any click outside it
                 if let Some(ref cm) = s.context_menu {
                     let item_h = s.glyphs.lh + 2;
-                    let menu_w = cm.items.iter().map(|s| s.chars().count()).max().unwrap_or(10) as i32 * s.glyphs.cw + s.glyphs.cw * 2;
-                    let menu_h = cm.items.len() as i32 * item_h + 4;
-                    let menu_x = cm.x.min(s.w as i32 - menu_w);
-                    let menu_y = (cm.y - menu_h).max(0);
-                    let in_menu = mx >= menu_x && mx < menu_x + menu_w && my >= menu_y && my < menu_y + menu_h;
+                    let sep_h  = 5i32;
+                    let total_h: i32 = cm.items.iter().map(|i| if i.action == CtxAction::Separator { sep_h } else { item_h }).sum::<i32>() + 4;
+                    let label_w = cm.items.iter().filter(|i| i.action != CtxAction::Separator).map(|i| i.label.chars().count()).max().unwrap_or(8) as i32;
+                    let sc_w    = cm.items.iter().filter(|i| i.action != CtxAction::Separator).map(|i| i.shortcut.chars().count()).max().unwrap_or(0) as i32;
+                    let menu_w  = (label_w + sc_w + 4) * s.glyphs.cw + 16;
+                    let menu_x  = cm.x.min(s.w as i32 - menu_w);
+                    let menu_y  = (cm.y - total_h).max(0);
+                    let in_menu = mx >= menu_x && mx < menu_x + menu_w && my >= menu_y && my < menu_y + total_h;
                     if in_menu {
-                        let rel = (my - menu_y - 2) / item_h;
-                        if rel >= 0 && (rel as usize) < cm.items.len() {
-                            let item = cm.items[rel as usize];
-                            s.context_menu = None;
-                            if item == "Open Settings" { open_settings_tab(s); }
-                        } else {
-                            s.context_menu = None;
+                        let mut iy = menu_y + 2;
+                        let mut action_taken: Option<CtxAction> = None;
+                        for item in &cm.items {
+                            let ih = if item.action == CtxAction::Separator { sep_h } else { item_h };
+                            if my >= iy && my < iy + ih && item.action != CtxAction::Separator && item.enabled {
+                                action_taken = Some(item.action);
+                                break;
+                            }
+                            iy += ih;
+                        }
+                        s.context_menu = None;
+                        if let Some(action) = action_taken {
+                            match action {
+                                CtxAction::OpenSettings   => open_settings_tab(s),
+                                CtxAction::GotoDefinition => execute_command(s, CommandAction::GotoDefinition),
+                                CtxAction::FindReferences => execute_command(s, CommandAction::FindReferences),
+                                CtxAction::FormatDocument => {
+                                    let lang = s.tab().path.as_deref().map(Lang::from_path).unwrap_or(Lang::None);
+                                    let path = s.tab().path.clone();
+                                    if let (Some(srv), Some(ref p)) = (s.lsp.server_for_lang_mut(lang), path.as_ref()) {
+                                        if srv.initialized { lsp::request_formatting(srv, p); }
+                                    }
+                                }
+                                CtxAction::Copy  => { execute_command(s, CommandAction::Copy); }
+                                CtxAction::Cut   => { execute_command(s, CommandAction::Cut); }
+                                CtxAction::Paste => { execute_command(s, CommandAction::Paste); }
+                                CtxAction::Separator => {}
+                            }
                         }
                         { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                         return;
@@ -3219,7 +3354,7 @@ impl ApplicationHandler<UserEvent> for App {
                         } else {
                             s.context_menu = Some(ContextMenu {
                                 x: act_w, y: gear_y,
-                                items: vec!["Open Settings"],
+                                items: vec![ContextMenuItem { label: "Open Settings", shortcut: "Cmd+,", action: CtxAction::OpenSettings, enabled: true }],
                                 hovered: 0,
                             });
                         }
@@ -5384,7 +5519,7 @@ fn render(s: &mut State) {
         .sum();
 
     // Context menu snapshot
-    let ctx_menu_snap: Option<(i32, i32, Vec<&'static str>, usize)> =
+    let ctx_menu_snap: Option<(i32, i32, Vec<ContextMenuItem>, usize)> =
         s.context_menu.as_ref().map(|m| (m.x, m.y, m.items.clone(), m.hovered));
 
     // Hover tooltip: find if mouse is over a diagnostic squiggle in any editor pane
@@ -5402,6 +5537,39 @@ fn render(s: &mut State) {
             } else { None }
         })
     });
+
+    // Cmd+hover underline: when Cmd is held and the mouse is over an identifier in an editor
+    // pane that has an active LSP server, underline the token to indicate goto-def is available.
+    let cmd_held = s.mods.super_key();
+    let cmd_hover_underline: Option<(i32, i32, i32, i32)> = if cmd_held {
+        pane_snaps.iter().find_map(|snap| {
+            if snap.is_settings_tab { return None; }
+            let ed_x    = snap.rect.x + snap.gutter_w;
+            let clip_r  = snap.rect.x + snap.rect.w;
+            let content_y = snap.rect.y + tab_h;
+            let fh = snap.find_h;
+            if mx_hover < ed_x || my_hover < content_y || my_hover >= snap.rect.y + snap.rect.h - fh { return None; }
+            let vi = (my_hover - content_y) / lh;
+            let li = snap.scroll as i32 + vi;
+            if li < 0 || li as usize >= snap.total { return None; }
+            let col_raw = ((mx_hover - ed_x) / cw + snap.hscroll as i32).max(0) as usize;
+            let (text, _, _) = snap.lines.get(vi as usize)?;
+            let chars: Vec<char> = text.chars().collect();
+            if col_raw >= chars.len() { return None; }
+            let ch = chars[col_raw];
+            let is_word = |c: char| c.is_alphanumeric() || c == '_';
+            if !is_word(ch) { return None; }
+            let mut lo = col_raw;
+            while lo > 0 && is_word(chars[lo - 1]) { lo -= 1; }
+            let mut hi = col_raw + 1;
+            while hi < chars.len() && is_word(chars[hi]) { hi += 1; }
+            let x1 = (ed_x + (lo as i32 - snap.hscroll as i32) * cw).max(ed_x);
+            let x2 = (ed_x + (hi as i32 - snap.hscroll as i32) * cw).min(clip_r);
+            let py_top = content_y + vi * lh;
+            if x2 <= x1 { return None; }
+            Some((x1, py_top, x2, py_top + lh))
+        })
+    } else { None };
 
     // SAFETY: render_frame takes FnOnce and calls it synchronously before returning.
     // s.glyphs is alive for the entire duration, and renderer does not alias glyphs.
@@ -6137,21 +6305,37 @@ fn render(s: &mut State) {
         }
 
         // ── Context menu ──────────────────────────────────────────────────
-        if let Some((mx, my, items, hovered)) = &ctx_menu_snap {
-            let item_h = lh + 2;
-            let menu_w = items.iter().map(|s| s.chars().count()).max().unwrap_or(10) as i32 * cw + cw * 2;
-            let menu_h = items.len() as i32 * item_h + 4;
-            let menu_x = (*mx).min(w as i32 - menu_w);
-            let menu_y = (*my - menu_h).max(0);
-            fill(buf, w, h, menu_x, menu_y, menu_w, menu_h, BG2);
+        if let Some((cmx, cmy, items, hovered)) = &ctx_menu_snap {
+            let item_h  = lh + 2;
+            let sep_h   = 5i32;
+            let label_w = items.iter().filter(|i| i.action != CtxAction::Separator).map(|i| i.label.chars().count()).max().unwrap_or(8) as i32;
+            let sc_w    = items.iter().filter(|i| i.action != CtxAction::Separator).map(|i| i.shortcut.chars().count()).max().unwrap_or(0) as i32;
+            let menu_w  = (label_w + sc_w + 4) * cw + 16;
+            let total_h: i32 = items.iter().map(|i| if i.action == CtxAction::Separator { sep_h } else { item_h }).sum::<i32>() + 4;
+            let menu_x  = (*cmx).min(w as i32 - menu_w).max(0);
+            let menu_y  = (*cmy).min(h as i32 - total_h).max(0);
+            fill(buf, w, h, menu_x, menu_y, menu_w, total_h, BG2);
             fill(buf, w, h, menu_x, menu_y, menu_w, 1, BORDER);
-            fill(buf, w, h, menu_x, menu_y + menu_h - 1, menu_w, 1, BORDER);
-            fill(buf, w, h, menu_x, menu_y, 1, menu_h, BORDER);
-            fill(buf, w, h, menu_x + menu_w - 1, menu_y, 1, menu_h, BORDER);
+            fill(buf, w, h, menu_x, menu_y + total_h - 1, menu_w, 1, BORDER);
+            fill(buf, w, h, menu_x, menu_y, 1, total_h, BORDER);
+            fill(buf, w, h, menu_x + menu_w - 1, menu_y, 1, total_h, BORDER);
+            let mut iy = menu_y + 2;
             for (i, item) in items.iter().enumerate() {
-                let iy = menu_y + 2 + i as i32 * item_h;
-                if i == *hovered { fill(buf, w, h, menu_x + 1, iy, menu_w - 2, item_h, SEL_BG); }
-                draw_str(buf, w, h, g, item, menu_x + cw, iy + asc, FG, menu_x + menu_w - 1);
+                if item.action == CtxAction::Separator {
+                    fill(buf, w, h, menu_x + 1, iy + 2, menu_w - 2, 1, BORDER);
+                    iy += sep_h;
+                    continue;
+                }
+                if i == *hovered && item.enabled {
+                    fill(buf, w, h, menu_x + 1, iy, menu_w - 2, item_h, SEL_BG);
+                }
+                let label_color = if item.enabled { FG } else { FG_DIM };
+                draw_str(buf, w, h, g, item.label, menu_x + cw, iy + asc, label_color, menu_x + menu_w - sc_w * cw - cw - 4);
+                if !item.shortcut.is_empty() {
+                    let sc_x = menu_x + menu_w - item.shortcut.chars().count() as i32 * cw - cw;
+                    draw_str(buf, w, h, g, item.shortcut, sc_x, iy + asc, FG_DIM, menu_x + menu_w - 1);
+                }
+                iy += item_h;
             }
         }
 
@@ -6222,6 +6406,12 @@ fn render(s: &mut State) {
                     draw_str(buf, w, h, g, dir, ox + ow - 4 - dir.chars().count() as i32 * cw, ry + asc, FG_DIM, ox + ow - 2);
                 }
             }
+        }
+
+        // ── Cmd+hover underline ──────────────────────────────────────────
+        if let Some((x1, py_top, x2, _py_bot)) = cmd_hover_underline {
+            // Underline at 1px above bottom of line (between baseline and descenders)
+            fill(buf, w, h, x1, py_top + lh - 2, x2 - x1, 1, ACCENT);
         }
 
         // ── Hover tooltip (diagnostic message) ───────────────────────────
