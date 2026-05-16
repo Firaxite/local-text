@@ -8,6 +8,14 @@ use std::path::PathBuf;
 #[serde(rename_all = "lowercase")]
 pub enum RendererBackend { Cpu, Gpu }
 
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TermWordSelect {
+    #[default]
+    Whitespace,  // bounded by whitespace (good for URLs, git branches)
+    Word,        // alphanumeric + underscore (editor-style)
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Settings {
     pub renderer:         RendererBackend,
@@ -18,10 +26,18 @@ pub struct Settings {
     pub rainbow_brackets: bool,
     #[serde(default = "Settings::default_undo_limit")]
     pub undo_limit:       Option<usize>,
+    #[serde(default)]
+    pub term_copy_paste:  bool,
+    #[serde(default)]
+    pub term_cmd_bs:      bool,
+    #[serde(default)]
+    pub term_alt_bs:      bool,
+    #[serde(default)]
+    pub term_word_select: TermWordSelect,
 }
 
 impl Default for Settings {
-    fn default() -> Self { Settings { renderer: RendererBackend::Cpu, vsync: true, font_size: Self::default_font_size(), rainbow_brackets: false, undo_limit: Self::default_undo_limit() } }
+    fn default() -> Self { Settings { renderer: RendererBackend::Cpu, vsync: true, font_size: Self::default_font_size(), rainbow_brackets: false, undo_limit: Self::default_undo_limit(), term_copy_paste: false, term_cmd_bs: false, term_alt_bs: false, term_word_select: TermWordSelect::Whitespace } }
 }
 
 impl Settings {

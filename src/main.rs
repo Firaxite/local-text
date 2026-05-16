@@ -229,14 +229,15 @@ struct ContextMenu {
 
 // ── Quick file finder ─────────────────────────────────────────────────────────
 struct QuickFinder {
-    open:              bool,
-    query:             String,
-    cursor:            usize,
-    sel_anchor:        Option<usize>,
-    entries:           Vec<std::path::PathBuf>,
-    filtered:          Vec<usize>,
-    filtered_commands: Vec<usize>,
-    selected:          usize,
+    open:               bool,
+    query:              String,
+    cursor:             usize,
+    sel_anchor:         Option<usize>,
+    entries:            Vec<std::path::PathBuf>,
+    filtered:           Vec<usize>,
+    filtered_commands:  Vec<usize>,
+    selected:           usize,
+    restore_tree_focus: bool,
 }
 
 // ── Command palette ───────────────────────────────────────────────────────────
@@ -1632,6 +1633,17 @@ fn term_token_bounds(row: &[terminal::Cell], col: usize) -> (usize, usize) {
     (lo, hi)
 }
 
+fn term_word_bounds(row: &[terminal::Cell], col: usize) -> (usize, usize) {
+    if col >= row.len() { return (col, col); }
+    let ch = row[col].ch;
+    if !ch.is_alphanumeric() && ch != '_' { return (col, col); }
+    let mut lo = col;
+    while lo > 0 && { let c = row[lo - 1].ch; c.is_alphanumeric() || c == '_' } { lo -= 1; }
+    let mut hi = col;
+    while hi + 1 < row.len() && { let c = row[hi + 1].ch; c.is_alphanumeric() || c == '_' } { hi += 1; }
+    (lo, hi)
+}
+
 fn open_token(s: &mut State, token: &str) {
     if token.is_empty() { return; }
     if token.starts_with("http://") || token.starts_with("https://") {
@@ -2328,19 +2340,21 @@ fn walk_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>, depth: u
 }
 
 fn open_quick_finder(s: &mut State) {
+    let had_tree_focus = s.explorer.as_ref().map(|e| e.tree_search_focused).unwrap_or(false);
     let root = s.explorer.as_ref().map(|e| e.root.clone())
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let mut entries = Vec::new();
     walk_files(&root, &mut entries, 0);
     let n = entries.len();
-    s.quick_finder.entries           = entries;
-    s.quick_finder.filtered          = (0..n).collect();
-    s.quick_finder.filtered_commands = vec![];
-    s.quick_finder.query             = String::new();
-    s.quick_finder.cursor            = 0;
-    s.quick_finder.sel_anchor        = None;
-    s.quick_finder.selected          = 0;
-    s.quick_finder.open              = true;
+    s.quick_finder.entries             = entries;
+    s.quick_finder.filtered            = (0..n).collect();
+    s.quick_finder.filtered_commands   = vec![];
+    s.quick_finder.query               = String::new();
+    s.quick_finder.cursor              = 0;
+    s.quick_finder.sel_anchor          = None;
+    s.quick_finder.selected            = 0;
+    s.quick_finder.restore_tree_focus  = had_tree_focus;
+    s.quick_finder.open                = true;
     // Unfocus tree search so it doesn't swallow subsequent keystrokes
     if let Some(ex) = s.explorer.as_mut() { ex.tree_search_focused = false; }
 }
@@ -2708,6 +2722,7 @@ impl ApplicationHandler<UserEvent> for App {
             quick_finder: QuickFinder {
                 open: false, query: String::new(), cursor: 0, sel_anchor: None,
                 entries: vec![], filtered: vec![], filtered_commands: vec![], selected: 0,
+                restore_tree_focus: false,
             },
             global_find: GlobalFind {
                 query: String::new(), replace: String::new(),
@@ -3371,9 +3386,14 @@ impl ApplicationHandler<UserEvent> for App {
                                             open_token(s, &token);
                                         }
                                     } else if s.term_click_count == 2 {
-                                        // Double-click: select non-whitespace token on this row
+                                        // Double-click: select word on this row
                                         if term_row < rows.len() {
-                                            let (lo, hi) = term_token_bounds(&rows[term_row], term_col);
+                                            let (lo, hi) = match s.settings.term_word_select {
+                                                settings::TermWordSelect::Word =>
+                                                    term_word_bounds(&rows[term_row], term_col),
+                                                settings::TermWordSelect::Whitespace =>
+                                                    term_token_bounds(&rows[term_row], term_col),
+                                            };
                                             s.term_sel = Some(TermSel {
                                                 start_vi: term_row, start_col: lo,
                                                 end_vi:   term_row, end_col:   hi,
@@ -3449,6 +3469,32 @@ impl ApplicationHandler<UserEvent> for App {
                         } else if mx >= btn_x + 4 * cw {
                             s.settings.undo_limit = Some((lim + 50).min(10_000));
                             s.settings.save();
+                        }
+                    } else {
+                        // Terminal section — y-positions mirror the render function
+                        let info_y    = if s.settings.undo_limit.is_some() { ul_y + lh * 2 + 8 } else { ul_y + lh + 4 };
+                        let term_sec_y = info_y + lh + 8;
+                        let tcp_y     = term_sec_y + lh + 4;
+                        let tcb_y     = tcp_y + lh + 4;
+                        let tab_y     = tcb_y + lh + 4;
+                        let tws_y     = tab_y + lh + 4;
+                        if my >= tcp_y && my < tcp_y + lh && mx >= btn_x && mx < btn_x + 8 * cw {
+                            s.settings.term_copy_paste = !s.settings.term_copy_paste;
+                            s.settings.save();
+                        } else if my >= tcb_y && my < tcb_y + lh && mx >= btn_x && mx < btn_x + 8 * cw {
+                            s.settings.term_cmd_bs = !s.settings.term_cmd_bs;
+                            s.settings.save();
+                        } else if my >= tab_y && my < tab_y + lh && mx >= btn_x && mx < btn_x + 8 * cw {
+                            s.settings.term_alt_bs = !s.settings.term_alt_bs;
+                            s.settings.save();
+                        } else if my >= tws_y && my < tws_y + lh {
+                            if mx >= btn_x && mx < btn_x + 11 * cw {
+                                s.settings.term_word_select = settings::TermWordSelect::Whitespace;
+                                s.settings.save();
+                            } else if mx >= btn_x + 12 * cw && mx < btn_x + 18 * cw {
+                                s.settings.term_word_select = settings::TermWordSelect::Word;
+                                s.settings.save();
+                            }
                         }
                     }
                     { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
@@ -3766,7 +3812,13 @@ impl ApplicationHandler<UserEvent> for App {
                 if s.quick_finder.open {
                     let is_cmd_mode = s.quick_finder.query.starts_with('>');
                     match &event.logical_key {
-                        Key::Named(NamedKey::Escape) => { s.quick_finder.open = false; }
+                        Key::Named(NamedKey::Escape) => {
+                            s.quick_finder.open = false;
+                            if s.quick_finder.restore_tree_focus {
+                                s.quick_finder.restore_tree_focus = false;
+                                if let Some(ex) = s.explorer.as_mut() { ex.tree_search_focused = true; }
+                            }
+                        }
                         Key::Named(NamedKey::ArrowUp) => {
                             s.quick_finder.selected = s.quick_finder.selected.saturating_sub(1);
                         }
@@ -3784,11 +3836,19 @@ impl ApplicationHandler<UserEvent> for App {
                                 if let Some(&fi) = s.quick_finder.filtered_commands.get(idx) {
                                     let action = COMMANDS[fi].action;
                                     s.quick_finder.open = false;
+                                    if s.quick_finder.restore_tree_focus {
+                                        s.quick_finder.restore_tree_focus = false;
+                                        if let Some(ex) = s.explorer.as_mut() { ex.tree_search_focused = true; }
+                                    }
                                     execute_command(s, action);
                                 }
                             } else if let Some(&fi) = s.quick_finder.filtered.get(idx) {
                                 let path = s.quick_finder.entries[fi].clone();
                                 s.quick_finder.open = false;
+                                if s.quick_finder.restore_tree_focus {
+                                    s.quick_finder.restore_tree_focus = false;
+                                    if let Some(ex) = s.explorer.as_mut() { ex.tree_search_focused = true; }
+                                }
                                 open_or_reuse_tab(s, path);
                             }
                         }
@@ -3932,7 +3992,12 @@ impl ApplicationHandler<UserEvent> for App {
                                 .map(|p| p.term_ids.clone()).unwrap_or_default();
                             for tid in tids { s.term_panes.remove(&tid); }
                             s.panes.remove(&pane_id);
-                            if s.panes.is_empty() { el.exit(); return; }
+                            if s.panes.is_empty() {
+                                s.pane_tree  = PaneTree::Leaf(0);
+                                s.active_pane = 0;
+                                el.exit();
+                                return;
+                            }
                             let old_tree = std::mem::replace(&mut s.pane_tree, PaneTree::Leaf(0));
                             if let Some(t) = remove_pane_from_tree(old_tree, pane_id) { s.pane_tree = t; }
                             let new_active = layout_tree(&s.pane_tree, s.pane_area())
@@ -3968,7 +4033,7 @@ impl ApplicationHandler<UserEvent> for App {
                         { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                         return;
                     }
-                    // Cmd+C — copy terminal selection
+                    // Cmd+C — copy terminal selection (or fall through when term_copy_paste disabled)
                     if cmd && matches!(&event.logical_key, Key::Character(c) if matches!(c.as_str(), "c" | "C")) {
                         if let Some(sel) = s.term_sel.clone() {
                             if !sel.is_empty() {
@@ -3998,10 +4063,11 @@ impl ApplicationHandler<UserEvent> for App {
                                 return;
                             }
                         }
-                        // No selection: fall through to PTY (send Ctrl+C if not in selection mode)
+                        // No selection: if copy/paste enabled, swallow here; otherwise fall through to PTY
+                        if s.settings.term_copy_paste { return; }
                     }
-                    // Cmd+V — paste from clipboard
-                    if cmd && matches!(&event.logical_key, Key::Character(c) if matches!(c.as_str(), "v" | "V")) {
+                    // Cmd+V — paste from clipboard (only when term_copy_paste enabled)
+                    if s.settings.term_copy_paste && cmd && matches!(&event.logical_key, Key::Character(c) if matches!(c.as_str(), "v" | "V")) {
                         s.term_sel = None;
                         let text = clipboard_read();
                         if !text.is_empty() {
@@ -4011,6 +4077,26 @@ impl ApplicationHandler<UserEvent> for App {
                                     let bytes = text.as_bytes();
                                     if tp.pty_fd >= 0 { let _ = unsafe { libc::write(tp.pty_fd, bytes.as_ptr().cast(), bytes.len()) }; }
                                 }
+                            }
+                        }
+                        return;
+                    }
+                    // Cmd+Backspace → send \x15 (kill to line start) when enabled
+                    if s.settings.term_cmd_bs && cmd && matches!(&event.logical_key, Key::Named(NamedKey::Backspace)) {
+                        let p = &s.panes[&s.active_pane];
+                        if let Some(&tid) = p.term_ids.get(p.active) {
+                            if let Some(tp) = s.term_panes.get(&tid) {
+                                if tp.pty_fd >= 0 { let _ = unsafe { libc::write(tp.pty_fd, b"\x15".as_ptr().cast(), 1) }; }
+                            }
+                        }
+                        return;
+                    }
+                    // Alt/Option+Backspace → send \x17 (delete previous word) when enabled
+                    if s.settings.term_alt_bs && alt && matches!(&event.logical_key, Key::Named(NamedKey::Backspace)) {
+                        let p = &s.panes[&s.active_pane];
+                        if let Some(&tid) = p.term_ids.get(p.active) {
+                            if let Some(tp) = s.term_panes.get(&tid) {
+                                if tp.pty_fd >= 0 { let _ = unsafe { libc::write(tp.pty_fd, b"\x17".as_ptr().cast(), 1) }; }
                             }
                         }
                         return;
@@ -4578,6 +4664,7 @@ fn render(s: &mut State) {
     let w = s.w;
     let h = s.h;
     if w == 0 || h == 0 { return; }
+    if s.panes.is_empty() { return; }
     dlog!("[render] {}x{} t={}", w, h, ts());
 
     // Sync shared buffers: propagate the active tab's text/path/dirty to all
@@ -4860,6 +4947,10 @@ fn render(s: &mut State) {
     let vsync_on         = s.settings.vsync;
     let rainbow_brackets = s.settings.rainbow_brackets;
     let undo_limit       = s.settings.undo_limit;
+    let term_copy_paste  = s.settings.term_copy_paste;
+    let term_cmd_bs      = s.settings.term_cmd_bs;
+    let term_alt_bs      = s.settings.term_alt_bs;
+    let term_word_select = s.settings.term_word_select;
     let explorer_drag    = s.explorer_drag;
     let ui_scale         = s.font_size / FONT_PX;
     let left_view        = s.left_view;
@@ -5243,6 +5334,40 @@ fn render(s: &mut State) {
                 };
                 let info_y = if undo_limit.is_some() { ul_y + lh * 2 + 8 } else { ul_y + lh + 4 };
                 draw_str(buf, w, h, g, info, r.x, info_y + asc, FG_DIM, r.x + r.w);
+
+                // ── Terminal section ───────────────────────────────────────────
+                let term_sec_y = info_y + lh + 8;
+                draw_str(buf, w, h, g, "  Terminal", r.x, term_sec_y + asc, FG, btn_x - cw);
+                fill(buf, w, h, r.x + cw, term_sec_y + lh - 1, r.w - 2 * cw, 1, BORDER);
+
+                let tcp_y = term_sec_y + lh + 4;
+                draw_str(buf, w, h, g, "  Copy/Paste (Cmd+C / Cmd+V)", r.x, tcp_y + asc, FG, btn_x - cw);
+                let (tcp_bg, tcp_fg) = if term_copy_paste { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
+                fill(buf, w, h, btn_x, tcp_y, 8 * cw, lh, tcp_bg);
+                draw_str(buf, w, h, g, if term_copy_paste { " [x] On " } else { " [ ] Off" }, btn_x, tcp_y + asc, tcp_fg, btn_x + 8 * cw);
+
+                let tcb_y = tcp_y + lh + 4;
+                draw_str(buf, w, h, g, "  Cmd+Backspace \u{2192} \\x15", r.x, tcb_y + asc, FG, btn_x - cw);
+                let (tcb_bg, tcb_fg) = if term_cmd_bs { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
+                fill(buf, w, h, btn_x, tcb_y, 8 * cw, lh, tcb_bg);
+                draw_str(buf, w, h, g, if term_cmd_bs { " [x] On " } else { " [ ] Off" }, btn_x, tcb_y + asc, tcb_fg, btn_x + 8 * cw);
+
+                let tab_y = tcb_y + lh + 4;
+                draw_str(buf, w, h, g, "  Alt+Backspace \u{2192} \\x17", r.x, tab_y + asc, FG, btn_x - cw);
+                let (tab_bg, tab_fg) = if term_alt_bs { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
+                fill(buf, w, h, btn_x, tab_y, 8 * cw, lh, tab_bg);
+                draw_str(buf, w, h, g, if term_alt_bs { " [x] On " } else { " [ ] Off" }, btn_x, tab_y + asc, tab_fg, btn_x + 8 * cw);
+
+                let tws_y = tab_y + lh + 4;
+                draw_str(buf, w, h, g, "  Double-click", r.x, tws_y + asc, FG, btn_x - cw);
+                let ws_is_active = term_word_select == settings::TermWordSelect::Whitespace;
+                let (ws_bg, ws_fg) = if ws_is_active { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
+                fill(buf, w, h, btn_x, tws_y, 11 * cw, lh, ws_bg);
+                draw_str(buf, w, h, g, " Whitespace ", btn_x, tws_y + asc, ws_fg, btn_x + 11 * cw);
+                let (wd_bg, wd_fg) = if !ws_is_active { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
+                fill(buf, w, h, btn_x + 12 * cw, tws_y, 6 * cw, lh, wd_bg);
+                draw_str(buf, w, h, g, " Word ", btn_x + 12 * cw, tws_y + asc, wd_fg, btn_x + 18 * cw);
+
                 continue;
             }
 
