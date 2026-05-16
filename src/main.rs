@@ -2285,6 +2285,11 @@ fn input_field_edit(
             }
             true
         }
+        Key::Named(NamedKey::Space) if !cmd && !ctrl => {
+            if let Some((mn, mx)) = sel_range { field.drain(mn..mx); *cursor = mn; *sel = None; }
+            field.insert_str(*cursor, " "); *cursor += 1;
+            true
+        }
         Key::Character(c) => match c.as_str() {
             "a" if cmd => {
                 *sel = Some(0); *cursor = field.len(); true
