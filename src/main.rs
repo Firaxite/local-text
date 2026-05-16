@@ -3099,6 +3099,7 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: winit::window::WindowId, event: WindowEvent) {
         let Some(s) = self.state.as_mut() else { return };
+        if s.panes.is_empty() { return; }
 
         match event {
             WindowEvent::CloseRequested => el.exit(),
@@ -5210,6 +5211,7 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn user_event(&mut self, _el: &ActiveEventLoop, event: UserEvent) {
         let Some(s) = self.state.as_mut() else { return };
+        if s.panes.is_empty() { return; }
         match event {
             UserEvent::TermOutput { pane_id, data } => {
                 if let Some(tp) = s.term_panes.get_mut(&pane_id) {
