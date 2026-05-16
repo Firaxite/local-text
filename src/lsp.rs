@@ -23,6 +23,7 @@ pub enum PendingKind {
     Definition,
     References,
     Formatting { path: PathBuf },
+    OrganizeImports { path: PathBuf },
 }
 
 // ── LspServer ─────────────────────────────────────────────────────────────────
@@ -254,7 +255,12 @@ pub fn send_initialize(server: &mut LspServer, root_path: Option<&PathBuf>) {
                 "synchronization":    { "didSave": true },
                 "definition":         {},
                 "references":         {},
-                "formatting":         {}
+                "formatting":         {},
+                "codeAction": {
+                    "codeActionLiteralSupport": {
+                        "codeActionKind": { "valueSet": ["source.organizeImports"] }
+                    }
+                }
             }
         }
     });
@@ -314,6 +320,19 @@ pub fn request_formatting(srv: &mut LspServer, path: &PathBuf) -> u64 {
         "options": { "tabSize": 4, "insertSpaces": true }
     }));
     srv.pending.insert(id, PendingKind::Formatting { path: path.clone() });
+    id
+}
+
+pub fn request_organize_imports(srv: &mut LspServer, path: &PathBuf) -> u64 {
+    let id = send_request(srv, "textDocument/codeAction", serde_json::json!({
+        "textDocument": { "uri": uri_from_path(path) },
+        "range": {
+            "start": { "line": 0, "character": 0 },
+            "end":   { "line": 0, "character": 0 }
+        },
+        "context": { "only": ["source.organizeImports"], "diagnostics": [] }
+    }));
+    srv.pending.insert(id, PendingKind::OrganizeImports { path: path.clone() });
     id
 }
 

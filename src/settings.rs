@@ -34,10 +34,16 @@ pub struct Settings {
     pub term_alt_bs:      bool,
     #[serde(default)]
     pub term_word_select: TermWordSelect,
+    #[serde(default)]
+    pub format_on_save:           String,  // comma-separated globs, e.g. "**/*.ts,**/*.rs"
+    #[serde(default)]
+    pub organize_imports_on_save: String,  // comma-separated globs
+    #[serde(default)]
+    pub format_command:           String,  // e.g. "rustfmt" or "prettier --write {file}"
 }
 
 impl Default for Settings {
-    fn default() -> Self { Settings { renderer: RendererBackend::Cpu, vsync: true, font_size: Self::default_font_size(), rainbow_brackets: false, undo_limit: Self::default_undo_limit(), term_copy_paste: false, term_cmd_bs: false, term_alt_bs: false, term_word_select: TermWordSelect::Whitespace } }
+    fn default() -> Self { Settings { renderer: RendererBackend::Cpu, vsync: true, font_size: Self::default_font_size(), rainbow_brackets: false, undo_limit: Self::default_undo_limit(), term_copy_paste: false, term_cmd_bs: false, term_alt_bs: false, term_word_select: TermWordSelect::Whitespace, format_on_save: String::new(), organize_imports_on_save: String::new(), format_command: String::new() } }
 }
 
 impl Settings {

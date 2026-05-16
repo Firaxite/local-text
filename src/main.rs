@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{CursorIcon, Window, WindowAttributes};
 #[cfg(target_os = "macos")]
 use winit::platform::macos::WindowAttributesExtMacOS;
@@ -227,8 +227,12 @@ enum CtxAction {
     GotoDefinition,
     FindReferences,
     FormatDocument,
+    OrganizeImports,
     Copy, Cut, Paste,
 }
+
+#[derive(Clone, Copy, PartialEq)]
+enum SettingsFieldId { FormatOnSave, OrganizeImportsOnSave, FormatCommand }
 
 #[derive(Clone)]
 struct ContextMenuItem {
@@ -266,6 +270,7 @@ enum CommandAction {
     GotoDefinition, FindReferences,
     Copy, Cut, Paste,
     CursorBack, CursorForward,
+    FormatDocument, OrganizeImports,
 }
 
 struct CommandEntry { name: &'static str, shortcut: &'static str, action: CommandAction }
@@ -286,6 +291,8 @@ const COMMANDS: &[CommandEntry] = &[
     CommandEntry { name: "Decrease Font Size",    shortcut: "Cmd+-",         action: CommandAction::DecreaseFontSize },
     CommandEntry { name: "Go to Definition",      shortcut: "F12",           action: CommandAction::GotoDefinition },
     CommandEntry { name: "Find All References",   shortcut: "Cmd+Shift+F12", action: CommandAction::FindReferences },
+    CommandEntry { name: "Format Document",       shortcut: "Opt+Shift+F",   action: CommandAction::FormatDocument },
+    CommandEntry { name: "Organize Imports",      shortcut: "Opt+Shift+O",   action: CommandAction::OrganizeImports },
 ];
 
 // ── Global find/replace ───────────────────────────────────────────────────────
@@ -871,6 +878,7 @@ pub enum UserEvent {
     LspOutput      { pane_id: usize, data: Vec<u8> },
     LspDiagnostics { path: PathBuf, diagnostics: Vec<Diagnostic> },
     LspResponse    { server_id: usize, id: u64, result: serde_json::Value },
+    FormatterDone  { path: PathBuf },
     Redraw,
 }
 
@@ -922,6 +930,10 @@ struct State {
 
     settings:     settings::Settings,
     needs_redraw: bool,
+
+    settings_edit_field:  Option<SettingsFieldId>,
+    settings_edit_text:   String,
+    settings_edit_cursor: usize,
 
     cursor_back: Vec<(PathBuf, usize)>,
     cursor_fwd:  Vec<(PathBuf, usize)>,
@@ -1723,6 +1735,35 @@ fn apply_text_edits(s: &mut State, path: &PathBuf, result: &serde_json::Value) {
             }
             t.dirty = true;
             return;
+        }
+    }
+}
+
+fn apply_organize_imports(s: &mut State, path: &PathBuf, result: &serde_json::Value) {
+    let actions = match result.as_array() {
+        Some(a) => a,
+        None    => return,
+    };
+    let action = actions.iter()
+        .find(|a| a["kind"].as_str() == Some("source.organizeImports"))
+        .or_else(|| actions.first());
+    let Some(action) = action else { return };
+
+    let edit = &action["edit"];
+    let uri  = format!("file://{}", path.display());
+
+    if let Some(edits) = edit["changes"][&uri].as_array() {
+        apply_text_edits(s, path, &serde_json::Value::Array(edits.clone()));
+        return;
+    }
+    if let Some(doc_changes) = edit["documentChanges"].as_array() {
+        for dc in doc_changes {
+            if dc["textDocument"]["uri"].as_str() == Some(&uri) {
+                if let Some(edits) = dc["edits"].as_array() {
+                    apply_text_edits(s, path, &serde_json::Value::Array(edits.clone()));
+                    return;
+                }
+            }
         }
     }
 }
@@ -2576,9 +2617,42 @@ fn execute_command(s: &mut State, action: CommandAction) {
                 s.tab_mut().save();
                 let lang = s.tab().path.as_deref().map(Lang::from_path).unwrap_or(Lang::None);
                 let path = s.tab().path.clone();
-                if lang != Lang::None {
-                    if let (Some(srv), Some(ref p)) = (s.lsp.server_for_lang_mut(lang), path.as_ref()) {
-                        if srv.initialized { lsp::request_formatting(srv, p); }
+                let path_str = path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+
+                let fmt_globs = s.settings.format_on_save.clone();
+                if !fmt_globs.is_empty() && lang != Lang::None {
+                    let matches = fmt_globs.split(',').map(|g| g.trim()).any(|g| glob_match(g, &path_str));
+                    if matches {
+                        if let (Some(srv), Some(ref p)) = (s.lsp.server_for_lang_mut(lang), path.as_ref()) {
+                            if srv.initialized { lsp::request_formatting(srv, p); }
+                        }
+                    }
+                }
+
+                let org_globs = s.settings.organize_imports_on_save.clone();
+                if !org_globs.is_empty() && lang != Lang::None {
+                    let matches = org_globs.split(',').map(|g| g.trim()).any(|g| glob_match(g, &path_str));
+                    if matches {
+                        if let (Some(srv), Some(ref p)) = (s.lsp.server_for_lang_mut(lang), path.as_ref()) {
+                            if srv.initialized { lsp::request_organize_imports(srv, p); }
+                        }
+                    }
+                }
+
+                let fmt_cmd = s.settings.format_command.clone();
+                if !fmt_cmd.is_empty() {
+                    if let Some(ref p) = path {
+                        let path_clone = p.clone();
+                        let proxy = s.proxy.clone();
+                        let cmd_str = if fmt_cmd.contains("{file}") {
+                            fmt_cmd.replace("{file}", &path_clone.to_string_lossy())
+                        } else {
+                            format!("{} {}", fmt_cmd, path_clone.to_string_lossy())
+                        };
+                        std::thread::spawn(move || {
+                            let _ = std::process::Command::new("sh").arg("-c").arg(&cmd_str).status();
+                            let _ = proxy.send_event(UserEvent::FormatterDone { path: path_clone });
+                        });
                     }
                 }
             }
@@ -2704,6 +2778,24 @@ fn execute_command(s: &mut State, action: CommandAction) {
         }
         CommandAction::CursorBack    => cursor_go_back(s),
         CommandAction::CursorForward => cursor_go_fwd(s),
+        CommandAction::FormatDocument => {
+            let lang = s.tab().path.as_deref().map(Lang::from_path).unwrap_or(Lang::None);
+            let path = s.tab().path.clone();
+            if lang != Lang::None {
+                if let (Some(srv), Some(ref p)) = (s.lsp.server_for_lang_mut(lang), path.as_ref()) {
+                    if srv.initialized { lsp::request_formatting(srv, p); }
+                }
+            }
+        }
+        CommandAction::OrganizeImports => {
+            let lang = s.tab().path.as_deref().map(Lang::from_path).unwrap_or(Lang::None);
+            let path = s.tab().path.clone();
+            if lang != Lang::None {
+                if let (Some(srv), Some(ref p)) = (s.lsp.server_for_lang_mut(lang), path.as_ref()) {
+                    if srv.initialized { lsp::request_organize_imports(srv, p); }
+                }
+            }
+        }
     }
 }
 
@@ -2972,6 +3064,10 @@ impl ApplicationHandler<UserEvent> for App {
 
             settings:     loaded_settings,
             needs_redraw: false,
+
+            settings_edit_field:  None,
+            settings_edit_text:   String::new(),
+            settings_edit_cursor: 0,
 
             cursor_back: Vec::new(),
             cursor_fwd:  Vec::new(),
@@ -3287,9 +3383,10 @@ impl ApplicationHandler<UserEvent> for App {
                             x: mx, y: my,
                             hovered: 0,
                             items: vec![
-                                ContextMenuItem { label: "Go to Definition",   shortcut: "Cmd+Click / F12",   action: CtxAction::GotoDefinition, enabled: lsp_avail },
-                                ContextMenuItem { label: "Find All References", shortcut: "Cmd+Shift+F12",    action: CtxAction::FindReferences,  enabled: lsp_avail },
-                                ContextMenuItem { label: "Format Document",    shortcut: "on Cmd+S",          action: CtxAction::FormatDocument,  enabled: lsp_avail },
+                                ContextMenuItem { label: "Go to Definition",   shortcut: "Cmd+Click / F12",   action: CtxAction::GotoDefinition,  enabled: lsp_avail },
+                                ContextMenuItem { label: "Find All References", shortcut: "Cmd+Shift+F12",   action: CtxAction::FindReferences,   enabled: lsp_avail },
+                                ContextMenuItem { label: "Format Document",    shortcut: "Opt+Shift+F",       action: CtxAction::FormatDocument,  enabled: lsp_avail },
+                                ContextMenuItem { label: "Organize Imports",   shortcut: "Opt+Shift+O",       action: CtxAction::OrganizeImports, enabled: lsp_avail },
                                 ContextMenuItem { label: "",                   shortcut: "",                  action: CtxAction::Separator,        enabled: true },
                                 ContextMenuItem { label: "Copy",               shortcut: "Cmd+C",             action: CtxAction::Copy,            enabled: has_sel },
                                 ContextMenuItem { label: "Cut",                shortcut: "Cmd+X",             action: CtxAction::Cut,             enabled: has_sel },
@@ -3369,15 +3466,10 @@ impl ApplicationHandler<UserEvent> for App {
                         if let Some(action) = action_taken {
                             match action {
                                 CtxAction::OpenSettings   => open_settings_tab(s),
-                                CtxAction::GotoDefinition => execute_command(s, CommandAction::GotoDefinition),
-                                CtxAction::FindReferences => execute_command(s, CommandAction::FindReferences),
-                                CtxAction::FormatDocument => {
-                                    let lang = s.tab().path.as_deref().map(Lang::from_path).unwrap_or(Lang::None);
-                                    let path = s.tab().path.clone();
-                                    if let (Some(srv), Some(ref p)) = (s.lsp.server_for_lang_mut(lang), path.as_ref()) {
-                                        if srv.initialized { lsp::request_formatting(srv, p); }
-                                    }
-                                }
+                                CtxAction::GotoDefinition  => execute_command(s, CommandAction::GotoDefinition),
+                                CtxAction::FindReferences  => execute_command(s, CommandAction::FindReferences),
+                                CtxAction::FormatDocument  => execute_command(s, CommandAction::FormatDocument),
+                                CtxAction::OrganizeImports => execute_command(s, CommandAction::OrganizeImports),
                                 CtxAction::Copy  => { execute_command(s, CommandAction::Copy); }
                                 CtxAction::Cut   => { execute_command(s, CommandAction::Cut); }
                                 CtxAction::Paste => { execute_command(s, CommandAction::Paste); }
@@ -3911,6 +4003,41 @@ impl ApplicationHandler<UserEvent> for App {
                                             if tp.pty_fd >= 0 { unsafe { libc::write(tp.pty_fd, bytes.as_ptr().cast(), bytes.len()); } }
                                         }
                                     }
+                                }
+                            }
+                            // Save Actions section — text field activation
+                            let save_sec_y = lsp_sec_y + lh + 4 + 3 * (lh + 4) + 4;
+                            let save_btn_x = pane_rect.x + 16 * cw;
+                            let field_w = (pane_rect.w - 16 * cw - 4).max(cw);
+                            let sa_field_ids = [SettingsFieldId::FormatOnSave, SettingsFieldId::OrganizeImportsOnSave, SettingsFieldId::FormatCommand];
+                            let mut clicked_field = false;
+                            for (i, fid) in sa_field_ids.iter().enumerate() {
+                                let fy = save_sec_y + lh + 4 + i as i32 * (lh + 4);
+                                if my >= fy && my < fy + lh && mx >= save_btn_x && mx < save_btn_x + field_w {
+                                    let current = match fid {
+                                        SettingsFieldId::FormatOnSave          => s.settings.format_on_save.clone(),
+                                        SettingsFieldId::OrganizeImportsOnSave => s.settings.organize_imports_on_save.clone(),
+                                        SettingsFieldId::FormatCommand         => s.settings.format_command.clone(),
+                                    };
+                                    let cursor = current.chars().count();
+                                    s.settings_edit_field  = Some(*fid);
+                                    s.settings_edit_text   = current;
+                                    s.settings_edit_cursor = cursor;
+                                    clicked_field = true;
+                                    break;
+                                }
+                            }
+                            if !clicked_field {
+                                // Click outside fields — commit and close any open field
+                                if let Some(fid) = s.settings_edit_field {
+                                    let text = s.settings_edit_text.clone();
+                                    match fid {
+                                        SettingsFieldId::FormatOnSave          => s.settings.format_on_save = text,
+                                        SettingsFieldId::OrganizeImportsOnSave => s.settings.organize_imports_on_save = text,
+                                        SettingsFieldId::FormatCommand         => s.settings.format_command = text,
+                                    }
+                                    s.settings.save();
+                                    s.settings_edit_field = None;
                                 }
                             }
                         }
@@ -4456,6 +4583,56 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
 
+                // Settings text field editing
+                if let Some(field_id) = s.settings_edit_field {
+                    match &event.logical_key {
+                        Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Escape) => {
+                            if matches!(&event.logical_key, Key::Named(NamedKey::Enter)) {
+                                let text = s.settings_edit_text.clone();
+                                match field_id {
+                                    SettingsFieldId::FormatOnSave          => s.settings.format_on_save = text,
+                                    SettingsFieldId::OrganizeImportsOnSave => s.settings.organize_imports_on_save = text,
+                                    SettingsFieldId::FormatCommand         => s.settings.format_command = text,
+                                }
+                                s.settings.save();
+                            }
+                            s.settings_edit_field = None;
+                        }
+                        Key::Named(NamedKey::Backspace) => {
+                            if s.settings_edit_cursor > 0 {
+                                let byte_off = s.settings_edit_text.char_indices()
+                                    .nth(s.settings_edit_cursor - 1).map(|(i, _)| i).unwrap_or(0);
+                                s.settings_edit_text.remove(byte_off);
+                                s.settings_edit_cursor -= 1;
+                            }
+                        }
+                        Key::Named(NamedKey::ArrowLeft)  => {
+                            s.settings_edit_cursor = s.settings_edit_cursor.saturating_sub(1);
+                        }
+                        Key::Named(NamedKey::ArrowRight) => {
+                            let max = s.settings_edit_text.chars().count();
+                            if s.settings_edit_cursor < max { s.settings_edit_cursor += 1; }
+                        }
+                        Key::Named(NamedKey::Home) => { s.settings_edit_cursor = 0; }
+                        Key::Named(NamedKey::End)  => {
+                            s.settings_edit_cursor = s.settings_edit_text.chars().count();
+                        }
+                        _ => {
+                            if let Some(txt) = event.text.as_deref() {
+                                if !txt.chars().any(|c| c.is_control()) {
+                                    let byte_off = s.settings_edit_text.char_indices()
+                                        .nth(s.settings_edit_cursor).map(|(i, _)| i)
+                                        .unwrap_or(s.settings_edit_text.len());
+                                    s.settings_edit_text.insert_str(byte_off, txt);
+                                    s.settings_edit_cursor += txt.chars().count();
+                                }
+                            }
+                        }
+                    }
+                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                    return;
+                }
+
                 // Terminal pane intercepts (before PTY forwarding)
                 if s.panes.get(&s.active_pane).map_or(false, |p| p.kind == PaneKind::Terminal) {
                     // Cmd+W — close active terminal tab or pane
@@ -4733,7 +4910,7 @@ impl ApplicationHandler<UserEvent> for App {
                             if let Some(path) = open_file_dialog() { open_or_reuse_tab(s, path); }
                             true
                         } else if (ctrl || cmd) && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "s") {
-                            s.tab_mut().save();
+                            execute_command(s, CommandAction::Save);
                             true
                         } else if cmd && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "=") {
                             let old = s.font_size;
@@ -4925,6 +5102,12 @@ impl ApplicationHandler<UserEvent> for App {
                                 s.find_mut().open = false;
                                 true
                             } else { false }
+                        } else if alt && shift && event.physical_key == PhysicalKey::Code(KeyCode::KeyF) {
+                            execute_command(s, CommandAction::FormatDocument);
+                            true
+                        } else if alt && shift && event.physical_key == PhysicalKey::Code(KeyCode::KeyO) {
+                            execute_command(s, CommandAction::OrganizeImports);
+                            true
                         } else if ctrl && matches!(&event.logical_key, Key::Character(_)) {
                             false
                         } else if active_tab_is_settings {
@@ -5065,7 +5248,25 @@ impl ApplicationHandler<UserEvent> for App {
                     Some(lsp::PendingKind::Formatting { path }) => {
                         apply_text_edits(s, &path, &result);
                     }
+                    Some(lsp::PendingKind::OrganizeImports { path }) => {
+                        apply_organize_imports(s, &path, &result);
+                    }
                     None => {}
+                }
+                s.needs_redraw = true;
+            }
+            UserEvent::FormatterDone { path } => {
+                for pane in s.panes.values_mut() {
+                    for tab in pane.tabs.iter_mut() {
+                        if tab.path.as_deref() == Some(path.as_path()) {
+                            if let Ok(text) = std::fs::read_to_string(&path) {
+                                tab.text = ropey::Rope::from_str(&text);
+                                tab.dirty = false;
+                                tab.hl_dirty_from = 0;
+                                tab.max_line_len = None;
+                            }
+                        }
+                    }
                 }
                 s.needs_redraw = true;
             }
@@ -5470,6 +5671,12 @@ fn render(s: &mut State) {
     let rust_running     = s.lsp.has_server_for(Lang::Rust);
     let py_installed     = s.lsp_installed.get(&Lang::Python).copied().unwrap_or(false);
     let py_running       = s.lsp.has_server_for(Lang::Python);
+    let format_on_save          = s.settings.format_on_save.clone();
+    let organize_imports_on_save = s.settings.organize_imports_on_save.clone();
+    let format_command          = s.settings.format_command.clone();
+    let settings_edit_field     = s.settings_edit_field;
+    let settings_edit_text      = s.settings_edit_text.clone();
+    let settings_edit_cursor    = s.settings_edit_cursor;
     let explorer_drag    = s.explorer_drag;
     let ui_scale         = s.font_size / FONT_PX;
     let left_view        = s.left_view;
@@ -6034,6 +6241,33 @@ fn render(s: &mut State) {
                         draw_str(buf, w, h, g, " not found", btn_x, ly + asc, FG_DIM, btn_x + 10 * cw);
                         fill(buf, w, h, btn_x + 11 * cw, ly, inst_btn_w, lh, SEL_BG);
                         draw_str(buf, w, h, g, "[Install]", btn_x + 11 * cw, ly + asc, FG, btn_x + 11 * cw + inst_btn_w);
+                    }
+                }
+
+                // ── Save Actions section ───────────────────────────────────────
+                let save_sec_y = lsp_sec_y + lh + 4 + 3 * (lh + 4) + 4;
+                draw_str(buf, w, h, g, "  Save Actions", r.x, save_sec_y + asc, FG, btn_x - cw);
+                fill(buf, w, h, r.x + cw, save_sec_y + lh - 1, r.w - 2 * cw, 1, BORDER);
+
+                let field_w = (r.w - 16 * cw - 4).max(cw);
+                let save_btn_x = r.x + 16 * cw;
+
+                let sa_fields: [(&str, SettingsFieldId, &str); 3] = [
+                    ("  Format on save", SettingsFieldId::FormatOnSave,         &format_on_save),
+                    ("  Organize imports", SettingsFieldId::OrganizeImportsOnSave, &organize_imports_on_save),
+                    ("  Custom formatter", SettingsFieldId::FormatCommand,      &format_command),
+                ];
+                for (i, (label, fid, value)) in sa_fields.iter().enumerate() {
+                    let fy = save_sec_y + lh + 4 + i as i32 * (lh + 4);
+                    draw_str(buf, w, h, g, label, r.x, fy + asc, FG, save_btn_x - cw);
+                    let is_focused = settings_edit_field == Some(*fid);
+                    let display = if is_focused { settings_edit_text.as_str() } else { *value };
+                    let field_bg = if is_focused { SEL_BG } else { BG2 };
+                    fill(buf, w, h, save_btn_x, fy, field_w, lh, field_bg);
+                    draw_str(buf, w, h, g, display, save_btn_x + cw, fy + asc, FG, save_btn_x + field_w - cw);
+                    if is_focused {
+                        let cur_x = save_btn_x + cw + settings_edit_cursor as i32 * cw;
+                        fill(buf, w, h, cur_x, fy + 1, 1, lh - 2, FG);
                     }
                 }
 
