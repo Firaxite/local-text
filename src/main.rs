@@ -3102,7 +3102,7 @@ impl ApplicationHandler<UserEvent> for App {
         if s.panes.is_empty() { return; }
 
         match event {
-            WindowEvent::CloseRequested => el.exit(),
+            WindowEvent::CloseRequested => { s.panes.clear(); el.exit(); }
 
             WindowEvent::Focused(_focused) => {
                 dlog!("[focus] focused={_focused} t={}", ts());
@@ -3805,6 +3805,7 @@ impl ApplicationHandler<UserEvent> for App {
                                     let new_active = layout_tree(&s.pane_tree, s.pane_area()).first().map(|(id, _)| *id).unwrap_or(0);
                                     s.active_pane = new_active;
                                 } else {
+                                    s.panes.clear();
                                     el.exit();
                                 }
                                 { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
@@ -4278,13 +4279,13 @@ impl ApplicationHandler<UserEvent> for App {
                 let alt   = s.mods.alt_key();
                 let shift = s.mods.shift_key();
 
-                // Cmd+, / Cmd+. — cursor history navigation
-                if cmd && matches!(&event.logical_key, Key::Character(c) if c.as_str() == ",") {
+                // Cmd+, / Cmd+. — cursor history navigation (use physical_key to avoid macOS ≤/≥ chars)
+                if cmd && !alt && event.physical_key == PhysicalKey::Code(KeyCode::Comma) {
                     cursor_go_back(s);
                     { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                     return;
                 }
-                if cmd && matches!(&event.logical_key, Key::Character(c) if c.as_str() == ".") {
+                if cmd && !alt && event.physical_key == PhysicalKey::Code(KeyCode::Period) {
                     cursor_go_fwd(s);
                     { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                     return;
@@ -4967,6 +4968,7 @@ impl ApplicationHandler<UserEvent> for App {
                                     .first().map(|(id, _)| *id).unwrap_or(0);
                                 s.active_pane = new_active;
                             } else {
+                                s.panes.clear();
                                 el.exit();
                             }
                             true
