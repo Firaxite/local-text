@@ -3916,8 +3916,10 @@ impl ApplicationHandler<UserEvent> for App {
                     let cw        = s.glyphs.cw;
                     let lh        = s.glyphs.lh;
                     let content_y = pane_rect.y + tab_h;
+                    let scroll_px = s.panes[&clicked_pane_id].tabs.get(s.panes[&clicked_pane_id].active)
+                        .map_or(0, |t| t.scroll as i32 * lh);
                     let btn_x     = pane_rect.x + 14 * cw;
-                    let ry        = content_y + lh + 8;
+                    let ry        = content_y + lh + 8 - scroll_px;
                     let vy        = ry + lh + 4;
                     let sy        = vy + lh + 4;
                     let rb_y      = sy + lh + 4;
@@ -4264,9 +4266,29 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     }
                     PaneKind::Editor => {
-                        if dy != 0 { s.scroll_by(dy); }
-                        if dx != 0 { s.hscroll_by(dx); }
-                        if dx != 0 || dy != 0 { { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); } }
+                        let is_settings = s.panes.get(&s.active_pane)
+                            .and_then(|p| p.tabs.get(p.active))
+                            .map_or(false, |t| t.kind == TabKind::Settings);
+                        if is_settings {
+                            if dy != 0 {
+                                let lh = s.glyphs.lh as usize;
+                                let pane_rect = s.active_pane_rect();
+                                let visible_h = (pane_rect.h - s.tab_h()).max(0) as usize;
+                                let content_h = if s.settings.undo_limit.is_some() { 21 * lh + 92 } else { 20 * lh + 88 };
+                                let max_scroll = content_h.saturating_sub(visible_h) / lh + 1;
+                                let t = s.tab_mut();
+                                if dy < 0 {
+                                    t.scroll = (t.scroll + (-dy) as usize).min(max_scroll);
+                                } else {
+                                    t.scroll = t.scroll.saturating_sub(dy as usize);
+                                }
+                                { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                            }
+                        } else {
+                            if dy != 0 { s.scroll_by(dy); }
+                            if dx != 0 { s.hscroll_by(dx); }
+                            if dx != 0 || dy != 0 { { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); } }
+                        }
                     }
                 }
             }
@@ -5114,7 +5136,22 @@ impl ApplicationHandler<UserEvent> for App {
                         } else if ctrl && matches!(&event.logical_key, Key::Character(_)) {
                             false
                         } else if active_tab_is_settings {
-                            false // settings tab: block all text editing
+                            match &event.logical_key {
+                                Key::Named(NamedKey::ArrowUp) | Key::Named(NamedKey::PageUp) => {
+                                    s.tab_mut().scroll = s.tab().scroll.saturating_sub(if matches!(&event.logical_key, Key::Named(NamedKey::PageUp)) { 5 } else { 1 });
+                                }
+                                Key::Named(NamedKey::ArrowDown) | Key::Named(NamedKey::PageDown) => {
+                                    let lh = s.glyphs.lh as usize;
+                                    let pane_rect = s.active_pane_rect();
+                                    let visible_h = (pane_rect.h - s.tab_h()).max(0) as usize;
+                                    let content_h = if s.settings.undo_limit.is_some() { 21 * lh + 92 } else { 20 * lh + 88 };
+                                    let max_scroll = content_h.saturating_sub(visible_h) / lh + 1;
+                                    let step = if matches!(&event.logical_key, Key::Named(NamedKey::PageDown)) { 5 } else { 1 };
+                                    s.tab_mut().scroll = (s.tab().scroll + step).min(max_scroll);
+                                }
+                                _ => {}
+                            }
+                            false
                         } else {
                             match &event.logical_key {
                                 Key::Named(NamedKey::ArrowLeft) => {
@@ -5292,6 +5329,12 @@ fn fill(buf: &mut [u32], w: u32, h: u32, x: i32, y: i32, rw: i32, rh: i32, color
             buf[(py * w + px) as usize] = color;
         }
     }
+}
+
+fn fill_clipped(buf: &mut [u32], w: u32, h: u32, clip_top: i32, clip_bot: i32, x: i32, y: i32, rw: i32, rh: i32, color: u32) {
+    let y0 = y.max(clip_top);
+    let y1 = (y + rh).min(clip_bot);
+    if y1 > y0 { fill(buf, w, h, x, y0, rw, y1 - y0, color); }
 }
 
 fn blit(buf: &mut [u32], w: u32, h: u32, bmap: &[u8], m: &Metrics, x: i32, baseline: i32, fg: u32) {
@@ -5549,11 +5592,12 @@ fn render(s: &mut State) {
         if pane.tabs.get(pane.active).map_or(false, |t| t.kind == TabKind::Settings) {
             let tab_info: Vec<(String, bool)> = pane.tabs.iter()
                 .map(|t| (t.display_name().to_owned(), t.dirty)).collect();
+            let settings_scroll = pane.tabs.get(pane.active).map_or(0, |t| t.scroll);
             return Some(PaneSnap {
                 id: pid, rect, is_active: pid == active_pane_id,
                 is_settings_tab: true,
                 tab_info, active_tab: pane.active,
-                scroll: 0, hscroll: 0, find_h: 0, editor_h: 0,
+                scroll: settings_scroll, hscroll: 0, find_h: 0, editor_h: 0,
                 cursors_snap: vec![], match_ranges: vec![],
                 find_open: false, find_repl_open: false,
                 find_focus: FindFocus::Query, case_sensitive: false, whole_word: false,
@@ -6129,54 +6173,83 @@ fn render(s: &mut State) {
             // Settings tab content
             if snap.is_settings_tab {
                 let content_y = r.y + tab_h;
+                let scroll_px = snap.scroll as i32 * lh;
+                let clip_top  = content_y;
+                let clip_bot  = r.y + r.h;
                 let btn_x     = r.x + 14 * cw;
+
+                // Clear content area background
+                fill(buf, w, h, r.x, clip_top, r.w, clip_bot - clip_top, BG);
+
+                let row_vis = |y: i32| y + lh > clip_top && y < clip_bot;
+                // fc = fill clipped to content area
+                let fc = |buf: &mut [u32], x: i32, y: i32, rw: i32, rh: i32, color: u32| {
+                    fill_clipped(buf, w, h, clip_top, clip_bot, x, y, rw, rh, color);
+                };
+
                 // Title separator
-                draw_str(buf, w, h, g, "  Settings", r.x, content_y + asc, FG, r.x + r.w);
-                fill(buf, w, h, r.x, content_y + lh, r.w, 1, BORDER);
+                let title_y = content_y - scroll_px;
+                if row_vis(title_y) {
+                    draw_str(buf, w, h, g, "  Settings", r.x, title_y + asc, FG, r.x + r.w);
+                }
+                fc(buf, r.x, content_y + lh - scroll_px, r.w, 1, BORDER);
+
                 // Renderer row
-                let ry = content_y + lh + 8;
-                draw_str(buf, w, h, g, "  Renderer", r.x, ry + asc, FG, btn_x - cw);
-                let (cpu_bg, cpu_fg) = if !renderer_is_gpu { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
-                fill(buf, w, h, btn_x,          ry, 5 * cw, lh, cpu_bg);
-                draw_str(buf, w, h, g, " CPU ", btn_x,          ry + asc, cpu_fg, btn_x + 5 * cw);
-                let (gpu_bg, gpu_fg) = if  renderer_is_gpu { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
-                fill(buf, w, h, btn_x + 6 * cw, ry, 5 * cw, lh, gpu_bg);
-                draw_str(buf, w, h, g, " GPU ", btn_x + 6 * cw, ry + asc, gpu_fg, btn_x + 11 * cw);
+                let ry = content_y + lh + 8 - scroll_px;
+                if row_vis(ry) {
+                    draw_str(buf, w, h, g, "  Renderer", r.x, ry + asc, FG, btn_x - cw);
+                    let (cpu_bg, cpu_fg) = if !renderer_is_gpu { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
+                    fc(buf, btn_x,          ry, 5 * cw, lh, cpu_bg);
+                    draw_str(buf, w, h, g, " CPU ", btn_x,          ry + asc, cpu_fg, btn_x + 5 * cw);
+                    let (gpu_bg, gpu_fg) = if  renderer_is_gpu { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
+                    fc(buf, btn_x + 6 * cw, ry, 5 * cw, lh, gpu_bg);
+                    draw_str(buf, w, h, g, " GPU ", btn_x + 6 * cw, ry + asc, gpu_fg, btn_x + 11 * cw);
+                }
                 // VSync row
                 let vy = ry + lh + 4;
-                draw_str(buf, w, h, g, "  VSync", r.x, vy + asc, FG, btn_x - cw);
-                let (vs_bg, vs_fg) = if vsync_on { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
-                let vs_label = if vsync_on { " [x] On " } else { " [ ] Off" };
-                fill(buf, w, h, btn_x, vy, 8 * cw, lh, vs_bg);
-                draw_str(buf, w, h, g, vs_label, btn_x, vy + asc, vs_fg, btn_x + 8 * cw);
+                if row_vis(vy) {
+                    draw_str(buf, w, h, g, "  VSync", r.x, vy + asc, FG, btn_x - cw);
+                    let (vs_bg, vs_fg) = if vsync_on { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
+                    let vs_label = if vsync_on { " [x] On " } else { " [ ] Off" };
+                    fc(buf, btn_x, vy, 8 * cw, lh, vs_bg);
+                    draw_str(buf, w, h, g, vs_label, btn_x, vy + asc, vs_fg, btn_x + 8 * cw);
+                }
                 // UI Scale row
                 let sy = vy + lh + 4;
-                draw_str(buf, w, h, g, "  UI Scale", r.x, sy + asc, FG, btn_x - cw);
-                let scale_str = format!("  {:.0}%  (Cmd+= / Cmd+-)", ui_scale * 100.0);
-                draw_str(buf, w, h, g, &scale_str, btn_x, sy + asc, FG_DIM, r.x + r.w);
+                if row_vis(sy) {
+                    draw_str(buf, w, h, g, "  UI Scale", r.x, sy + asc, FG, btn_x - cw);
+                    let scale_str = format!("  {:.0}%  (Cmd+= / Cmd+-)", ui_scale * 100.0);
+                    draw_str(buf, w, h, g, &scale_str, btn_x, sy + asc, FG_DIM, r.x + r.w);
+                }
                 // Rainbow Brackets row
                 let rb_y = sy + lh + 4;
-                draw_str(buf, w, h, g, "  Rainbow Brackets", r.x, rb_y + asc, FG, btn_x - cw);
-                let (rb_bg, rb_fg) = if rainbow_brackets { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
-                fill(buf, w, h, btn_x, rb_y, 8 * cw, lh, rb_bg);
-                draw_str(buf, w, h, g, if rainbow_brackets { " [x] On " } else { " [ ] Off" }, btn_x, rb_y + asc, rb_fg, btn_x + 8 * cw);
+                if row_vis(rb_y) {
+                    draw_str(buf, w, h, g, "  Rainbow Brackets", r.x, rb_y + asc, FG, btn_x - cw);
+                    let (rb_bg, rb_fg) = if rainbow_brackets { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
+                    fc(buf, btn_x, rb_y, 8 * cw, lh, rb_bg);
+                    draw_str(buf, w, h, g, if rainbow_brackets { " [x] On " } else { " [ ] Off" }, btn_x, rb_y + asc, rb_fg, btn_x + 8 * cw);
+                }
                 // Undo History toggle row
                 let ul_y = rb_y + lh + 4;
-                draw_str(buf, w, h, g, "  Undo History", r.x, ul_y + asc, FG, btn_x - cw);
-                let unlimited = undo_limit.is_none();
-                let (ul_bg, ul_fg) = if unlimited { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
-                fill(buf, w, h, btn_x, ul_y, 12 * cw, lh, ul_bg);
-                draw_str(buf, w, h, g, if unlimited { " [x] Unlimited" } else { " [ ] Unlimited" }, btn_x, ul_y + asc, ul_fg, btn_x + 12 * cw);
+                if row_vis(ul_y) {
+                    draw_str(buf, w, h, g, "  Undo History", r.x, ul_y + asc, FG, btn_x - cw);
+                    let unlimited = undo_limit.is_none();
+                    let (ul_bg, ul_fg) = if unlimited { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
+                    fc(buf, btn_x, ul_y, 12 * cw, lh, ul_bg);
+                    draw_str(buf, w, h, g, if unlimited { " [x] Unlimited" } else { " [ ] Unlimited" }, btn_x, ul_y + asc, ul_fg, btn_x + 12 * cw);
+                }
                 // Undo Limit spinner row (only when limit is Some)
                 if let Some(lim) = undo_limit {
                     let ul_num_y = ul_y + lh + 4;
-                    draw_str(buf, w, h, g, "  Undo Limit", r.x, ul_num_y + asc, FG, btn_x - cw);
-                    fill(buf, w, h, btn_x, ul_num_y, 3 * cw, lh, SEL_BG);
-                    draw_str(buf, w, h, g, " - ", btn_x, ul_num_y + asc, FG, btn_x + 3 * cw);
-                    let lim_str = format!("  {}  ", lim);
-                    draw_str(buf, w, h, g, &lim_str, btn_x + 3 * cw, ul_num_y + asc, FG_DIM, btn_x + 11 * cw);
-                    fill(buf, w, h, btn_x + 11 * cw, ul_num_y, 3 * cw, lh, SEL_BG);
-                    draw_str(buf, w, h, g, " + ", btn_x + 11 * cw, ul_num_y + asc, FG, btn_x + 14 * cw);
+                    if row_vis(ul_num_y) {
+                        draw_str(buf, w, h, g, "  Undo Limit", r.x, ul_num_y + asc, FG, btn_x - cw);
+                        fc(buf, btn_x, ul_num_y, 3 * cw, lh, SEL_BG);
+                        draw_str(buf, w, h, g, " - ", btn_x, ul_num_y + asc, FG, btn_x + 3 * cw);
+                        let lim_str = format!("  {}  ", lim);
+                        draw_str(buf, w, h, g, &lim_str, btn_x + 3 * cw, ul_num_y + asc, FG_DIM, btn_x + 11 * cw);
+                        fc(buf, btn_x + 11 * cw, ul_num_y, 3 * cw, lh, SEL_BG);
+                        draw_str(buf, w, h, g, " + ", btn_x + 11 * cw, ul_num_y + asc, FG, btn_x + 14 * cw);
+                    }
                 }
                 // Info row
                 let info = if renderer_is_gpu {
@@ -6185,46 +6258,60 @@ fn render(s: &mut State) {
                     "  CPU (no extra RAM) — coalesced + vsync-aligned"
                 };
                 let info_y = if undo_limit.is_some() { ul_y + lh * 2 + 8 } else { ul_y + lh + 4 };
-                draw_str(buf, w, h, g, info, r.x, info_y + asc, FG_DIM, r.x + r.w);
+                if row_vis(info_y) {
+                    draw_str(buf, w, h, g, info, r.x, info_y + asc, FG_DIM, r.x + r.w);
+                }
 
                 // ── Terminal section ───────────────────────────────────────────
                 let term_sec_y = info_y + lh + 8;
-                draw_str(buf, w, h, g, "  Terminal", r.x, term_sec_y + asc, FG, btn_x - cw);
-                fill(buf, w, h, r.x + cw, term_sec_y + lh - 1, r.w - 2 * cw, 1, BORDER);
+                if row_vis(term_sec_y) {
+                    draw_str(buf, w, h, g, "  Terminal", r.x, term_sec_y + asc, FG, btn_x - cw);
+                }
+                fc(buf, r.x + cw, term_sec_y + lh - 1, r.w - 2 * cw, 1, BORDER);
 
                 let tcp_y = term_sec_y + lh + 4;
-                draw_str(buf, w, h, g, "  Copy/Paste (Cmd+C / Cmd+V)", r.x, tcp_y + asc, FG, btn_x - cw);
-                let (tcp_bg, tcp_fg) = if term_copy_paste { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
-                fill(buf, w, h, btn_x, tcp_y, 8 * cw, lh, tcp_bg);
-                draw_str(buf, w, h, g, if term_copy_paste { " [x] On " } else { " [ ] Off" }, btn_x, tcp_y + asc, tcp_fg, btn_x + 8 * cw);
+                if row_vis(tcp_y) {
+                    draw_str(buf, w, h, g, "  Copy/Paste (Cmd+C / Cmd+V)", r.x, tcp_y + asc, FG, btn_x - cw);
+                    let (tcp_bg, tcp_fg) = if term_copy_paste { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
+                    fc(buf, btn_x, tcp_y, 8 * cw, lh, tcp_bg);
+                    draw_str(buf, w, h, g, if term_copy_paste { " [x] On " } else { " [ ] Off" }, btn_x, tcp_y + asc, tcp_fg, btn_x + 8 * cw);
+                }
 
                 let tcb_y = tcp_y + lh + 4;
-                draw_str(buf, w, h, g, "  Cmd+Backspace \u{2192} \\x15", r.x, tcb_y + asc, FG, btn_x - cw);
-                let (tcb_bg, tcb_fg) = if term_cmd_bs { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
-                fill(buf, w, h, btn_x, tcb_y, 8 * cw, lh, tcb_bg);
-                draw_str(buf, w, h, g, if term_cmd_bs { " [x] On " } else { " [ ] Off" }, btn_x, tcb_y + asc, tcb_fg, btn_x + 8 * cw);
+                if row_vis(tcb_y) {
+                    draw_str(buf, w, h, g, "  Cmd+Backspace \u{2192} \\x15", r.x, tcb_y + asc, FG, btn_x - cw);
+                    let (tcb_bg, tcb_fg) = if term_cmd_bs { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
+                    fc(buf, btn_x, tcb_y, 8 * cw, lh, tcb_bg);
+                    draw_str(buf, w, h, g, if term_cmd_bs { " [x] On " } else { " [ ] Off" }, btn_x, tcb_y + asc, tcb_fg, btn_x + 8 * cw);
+                }
 
                 let tab_y = tcb_y + lh + 4;
-                draw_str(buf, w, h, g, "  Alt+Backspace \u{2192} \\x17", r.x, tab_y + asc, FG, btn_x - cw);
-                let (tab_bg, tab_fg) = if term_alt_bs { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
-                fill(buf, w, h, btn_x, tab_y, 8 * cw, lh, tab_bg);
-                draw_str(buf, w, h, g, if term_alt_bs { " [x] On " } else { " [ ] Off" }, btn_x, tab_y + asc, tab_fg, btn_x + 8 * cw);
+                if row_vis(tab_y) {
+                    draw_str(buf, w, h, g, "  Alt+Backspace \u{2192} \\x17", r.x, tab_y + asc, FG, btn_x - cw);
+                    let (tab_bg, tab_fg) = if term_alt_bs { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
+                    fc(buf, btn_x, tab_y, 8 * cw, lh, tab_bg);
+                    draw_str(buf, w, h, g, if term_alt_bs { " [x] On " } else { " [ ] Off" }, btn_x, tab_y + asc, tab_fg, btn_x + 8 * cw);
+                }
 
                 let tws_y = tab_y + lh + 4;
-                draw_str(buf, w, h, g, "  Double-click", r.x, tws_y + asc, FG, btn_x - cw);
-                let ws_is_active = term_word_select == settings::TermWordSelect::Whitespace;
-                let (ws_bg, ws_fg) = if ws_is_active { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
-                fill(buf, w, h, btn_x, tws_y, 11 * cw, lh, ws_bg);
-                draw_str(buf, w, h, g, " Whitespace ", btn_x, tws_y + asc, ws_fg, btn_x + 11 * cw);
-                let (wd_bg, wd_fg) = if !ws_is_active { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
-                fill(buf, w, h, btn_x + 12 * cw, tws_y, 6 * cw, lh, wd_bg);
-                draw_str(buf, w, h, g, " Word ", btn_x + 12 * cw, tws_y + asc, wd_fg, btn_x + 18 * cw);
+                if row_vis(tws_y) {
+                    draw_str(buf, w, h, g, "  Double-click", r.x, tws_y + asc, FG, btn_x - cw);
+                    let ws_is_active = term_word_select == settings::TermWordSelect::Whitespace;
+                    let (ws_bg, ws_fg) = if ws_is_active { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
+                    fc(buf, btn_x, tws_y, 11 * cw, lh, ws_bg);
+                    draw_str(buf, w, h, g, " Whitespace ", btn_x, tws_y + asc, ws_fg, btn_x + 11 * cw);
+                    let (wd_bg, wd_fg) = if !ws_is_active { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
+                    fc(buf, btn_x + 12 * cw, tws_y, 6 * cw, lh, wd_bg);
+                    draw_str(buf, w, h, g, " Word ", btn_x + 12 * cw, tws_y + asc, wd_fg, btn_x + 18 * cw);
+                }
 
                 // ── Language Servers section ───────────────────────────────────
                 let lsp_sec_y = tws_y + lh + 8;
-                draw_str(buf, w, h, g, "  Language Servers", r.x, lsp_sec_y + asc, FG, btn_x - cw);
-                fill(buf, w, h, r.x + cw, lsp_sec_y + lh - 1, r.w - 2 * cw, 1, BORDER);
-                let inst_btn_w = 9 * cw; // "[Install]"
+                if row_vis(lsp_sec_y) {
+                    draw_str(buf, w, h, g, "  Language Servers", r.x, lsp_sec_y + asc, FG, btn_x - cw);
+                }
+                fc(buf, r.x + cw, lsp_sec_y + lh - 1, r.w - 2 * cw, 1, BORDER);
+                let inst_btn_w = 9 * cw;
 
                 let lsp_rows: [(&str, bool, bool, &str); 3] = [
                     ("TypeScript", ts_installed, ts_running, "npm i -g typescript-language-server typescript"),
@@ -6233,46 +6320,67 @@ fn render(s: &mut State) {
                 ];
                 for (i, (name, installed, running, _)) in lsp_rows.iter().enumerate() {
                     let ly = lsp_sec_y + lh + 4 + i as i32 * (lh + 4);
+                    if !row_vis(ly) { continue; }
                     draw_str(buf, w, h, g, &format!("  {}", name), r.x, ly + asc, FG, btn_x - cw);
                     if *running {
-                        fill(buf, w, h, btn_x, ly, 10 * cw, lh, ACCENT);
+                        fc(buf, btn_x, ly, 10 * cw, lh, ACCENT);
                         draw_str(buf, w, h, g, " running  ", btn_x, ly + asc, BG, btn_x + 10 * cw);
                     } else if *installed {
                         draw_str(buf, w, h, g, " installed", btn_x, ly + asc, FG_DIM, btn_x + 10 * cw);
-                        fill(buf, w, h, btn_x + 11 * cw, ly, inst_btn_w, lh, SEL_BG);
+                        fc(buf, btn_x + 11 * cw, ly, inst_btn_w, lh, SEL_BG);
                         draw_str(buf, w, h, g, "[Install]", btn_x + 11 * cw, ly + asc, FG, btn_x + 11 * cw + inst_btn_w);
                     } else {
                         draw_str(buf, w, h, g, " not found", btn_x, ly + asc, FG_DIM, btn_x + 10 * cw);
-                        fill(buf, w, h, btn_x + 11 * cw, ly, inst_btn_w, lh, SEL_BG);
+                        fc(buf, btn_x + 11 * cw, ly, inst_btn_w, lh, SEL_BG);
                         draw_str(buf, w, h, g, "[Install]", btn_x + 11 * cw, ly + asc, FG, btn_x + 11 * cw + inst_btn_w);
                     }
                 }
 
                 // ── Save Actions section ───────────────────────────────────────
                 let save_sec_y = lsp_sec_y + lh + 4 + 3 * (lh + 4) + 4;
-                draw_str(buf, w, h, g, "  Save Actions", r.x, save_sec_y + asc, FG, btn_x - cw);
-                fill(buf, w, h, r.x + cw, save_sec_y + lh - 1, r.w - 2 * cw, 1, BORDER);
+                if row_vis(save_sec_y) {
+                    draw_str(buf, w, h, g, "  Save Actions", r.x, save_sec_y + asc, FG, btn_x - cw);
+                }
+                fc(buf, r.x + cw, save_sec_y + lh - 1, r.w - 2 * cw, 1, BORDER);
 
                 let field_w = (r.w - 16 * cw - 4).max(cw);
                 let save_btn_x = r.x + 16 * cw;
 
                 let sa_fields: [(&str, SettingsFieldId, &str); 3] = [
-                    ("  Format on save", SettingsFieldId::FormatOnSave,         &format_on_save),
+                    ("  Format on save",   SettingsFieldId::FormatOnSave,          &format_on_save),
                     ("  Organize imports", SettingsFieldId::OrganizeImportsOnSave, &organize_imports_on_save),
-                    ("  Custom formatter", SettingsFieldId::FormatCommand,      &format_command),
+                    ("  Custom formatter", SettingsFieldId::FormatCommand,         &format_command),
                 ];
                 for (i, (label, fid, value)) in sa_fields.iter().enumerate() {
                     let fy = save_sec_y + lh + 4 + i as i32 * (lh + 4);
+                    if !row_vis(fy) { continue; }
                     draw_str(buf, w, h, g, label, r.x, fy + asc, FG, save_btn_x - cw);
                     let is_focused = settings_edit_field == Some(*fid);
                     let display = if is_focused { settings_edit_text.as_str() } else { *value };
                     let field_bg = if is_focused { SEL_BG } else { BG2 };
-                    fill(buf, w, h, save_btn_x, fy, field_w, lh, field_bg);
+                    fc(buf, save_btn_x, fy, field_w, lh, field_bg);
                     draw_str(buf, w, h, g, display, save_btn_x + cw, fy + asc, FG, save_btn_x + field_w - cw);
                     if is_focused {
                         let cur_x = save_btn_x + cw + settings_edit_cursor as i32 * cw;
-                        fill(buf, w, h, cur_x, fy + 1, 1, lh - 2, FG);
+                        fc(buf, cur_x, fy + 1, 1, lh - 2, FG);
                     }
+                }
+
+                // Re-paint tab bar on top to overwrite any content that bled upward when scrolled
+                fill(buf, w, h, r.x, r.y, r.w, tab_h, BG2);
+                fill(buf, w, h, r.x, r.y + tab_h - 1, r.w, 1, BORDER);
+                if snap.is_active { fill(buf, w, h, r.x, r.y, 2, tab_h - 1, ACCENT); }
+                let mut tx2 = r.x;
+                for (i, (name, dirty_tab)) in snap.tab_info.iter().enumerate() {
+                    let label  = if *dirty_tab { format!(" {}• ", name) } else { format!(" {}  ", name) };
+                    let tw     = label.chars().count() as i32 * cw;
+                    let is_act = i == snap.active_tab;
+                    fill(buf, w, h, tx2, r.y, tw, tab_h - 1, if is_act { BG } else { BG2 });
+                    if is_act { fill(buf, w, h, tx2, r.y + tab_h - 2, tw, 2, ACCENT); }
+                    draw_str(buf, w, h, g, &label, tx2, r.y + tab_h * 3 / 4, FG, (tx2 + tw - cw).min(clip_r));
+                    draw_str(buf, w, h, g, "×", tx2 + tw - cw, r.y + tab_h * 3 / 4, if is_act { FG } else { FG_DIM }, (tx2 + tw).min(clip_r));
+                    fill(buf, w, h, tx2 + tw, r.y, 1, tab_h, BORDER);
+                    tx2 += tw + 1;
                 }
 
                 continue;
