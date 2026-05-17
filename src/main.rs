@@ -61,7 +61,7 @@ const RAINBOW: [u32; 6] = [0xFF79C6, 0xFFB86C, 0xF1FA8C, 0x50FA7B, 0x8BE9FD, 0xB
 
 // ── Language detection ────────────────────────────────────────────────────────
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-enum Lang { None, Rust, Python, TypeScript }
+enum Lang { None, Rust, Python, TypeScript, Json, Jsonc }
 
 impl Lang {
     fn from_path(path: &std::path::Path) -> Self {
@@ -69,6 +69,8 @@ impl Lang {
             Some("rs")                          => Lang::Rust,
             Some("py" | "pyw")                  => Lang::Python,
             Some("ts" | "tsx" | "js" | "jsx")   => Lang::TypeScript,
+            Some("json")                        => Lang::Json,
+            Some("jsonc")                       => Lang::Jsonc,
             _                                   => Lang::None,
         }
     }
@@ -1926,7 +1928,7 @@ fn is_keyword(word: &str, lang: Lang) -> bool {
             "satisfies"|"static"|"super"|"switch"|"this"|"throw"|"true"|"try"|
             "type"|"typeof"|"undefined"|"var"|"void"|"while"|"with"|"yield"
         ),
-        Lang::None => false,
+        Lang::None | Lang::Json | Lang::Jsonc => false,
     }
 }
 
@@ -1944,7 +1946,7 @@ fn is_type_kw(word: &str, lang: Lang) -> bool {
         Lang::TypeScript => matches!(word,
             "boolean"|"bigint"|"never"|"number"|"string"|"symbol"|"unknown"
         ),
-        Lang::None => false,
+        Lang::None | Lang::Json | Lang::Jsonc => false,
     }
 }
 
@@ -1956,7 +1958,146 @@ fn classify_word(word: &str, lang: Lang, is_call: bool) -> u32 {
     FG
 }
 
+fn strip_jsonc_comments(src: &str) -> String {
+    let chars: Vec<char> = src.chars().collect();
+    let len = chars.len();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0;
+    let mut in_str = false;
+    while i < len {
+        if in_str {
+            out.push(chars[i]);
+            if chars[i] == '\\' && i + 1 < len {
+                i += 1;
+                out.push(chars[i]);
+            } else if chars[i] == '"' {
+                in_str = false;
+            }
+            i += 1;
+        } else if chars[i] == '"' {
+            in_str = true;
+            out.push(chars[i]);
+            i += 1;
+        } else if i + 1 < len && chars[i] == '/' && chars[i + 1] == '/' {
+            while i < len && chars[i] != '\n' { i += 1; }
+        } else if i + 1 < len && chars[i] == '/' && chars[i + 1] == '*' {
+            i += 2;
+            while i + 1 < len && !(chars[i] == '*' && chars[i + 1] == '/') { i += 1; }
+            if i + 1 < len { i += 2; }
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+fn format_json_document(s: &mut State) {
+    let lang = s.tab().path.as_deref().map(Lang::from_path).unwrap_or(Lang::None);
+    let text = s.tab().text.to_string();
+    let src = if lang == Lang::Jsonc { strip_jsonc_comments(&text) } else { text };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&src) else { return };
+    let Ok(mut pretty) = serde_json::to_string_pretty(&value) else { return };
+    pretty.push('\n');
+    let t = s.tab_mut();
+    let len = t.text.len_chars();
+    t.text.remove(0..len);
+    t.text.insert(0, &pretty);
+    t.dirty = true;
+    t.hl_dirty_from = 0;
+    t.max_line_len = None;
+}
+
+fn highlight_json_line(chars: &[char], jsonc: bool, mut state: MlState, rainbow: bool, mut bracket_depth: i32) -> (Vec<u32>, MlState, i32) {
+    let len = chars.len();
+    let mut out = vec![FG; len];
+    let mut i = 0;
+    macro_rules! fill { ($from:expr, $to:expr, $color:expr) => { for k in $from..($to).min(len) { out[k] = $color; } }; }
+    while i < len {
+        match state {
+            MlState::BlockComment => {
+                if i + 1 < len && chars[i] == '*' && chars[i + 1] == '/' {
+                    fill!(i, i + 2, HL_COMMENT);
+                    i += 2;
+                    state = MlState::Normal;
+                } else {
+                    out[i] = HL_COMMENT;
+                    i += 1;
+                }
+            }
+            _ => {
+                // JSONC line comment
+                if jsonc && i + 1 < len && chars[i] == '/' && chars[i + 1] == '/' {
+                    fill!(i, len, HL_COMMENT);
+                    i = len;
+                    continue;
+                }
+                // JSONC block comment
+                if jsonc && i + 1 < len && chars[i] == '/' && chars[i + 1] == '*' {
+                    fill!(i, i + 2, HL_COMMENT);
+                    i += 2;
+                    state = MlState::BlockComment;
+                    continue;
+                }
+                // String — color as key (HL_FUNC) if followed by ':', else value (HL_STRING)
+                if chars[i] == '"' {
+                    let start = i;
+                    i += 1;
+                    while i < len {
+                        if chars[i] == '\\' && i + 1 < len { i += 2; }
+                        else if chars[i] == '"' { i += 1; break; }
+                        else { i += 1; }
+                    }
+                    let mut j = i;
+                    while j < len && (chars[j] == ' ' || chars[j] == '\t') { j += 1; }
+                    let color = if j < len && chars[j] == ':' { HL_FUNC } else { HL_STRING };
+                    fill!(start, i, color);
+                    continue;
+                }
+                // Number (including negative and scientific notation)
+                if chars[i].is_ascii_digit() || (chars[i] == '-' && i + 1 < len && chars[i + 1].is_ascii_digit()) {
+                    let start = i;
+                    while i < len && (chars[i].is_ascii_digit() || matches!(chars[i], '.' | 'e' | 'E' | '+' | '-')) {
+                        i += 1;
+                    }
+                    fill!(start, i, HL_NUMBER);
+                    continue;
+                }
+                // Keywords: true, false, null
+                if chars[i].is_ascii_alphabetic() {
+                    let start = i;
+                    while i < len && chars[i].is_ascii_alphabetic() { i += 1; }
+                    let word: String = chars[start..i].iter().collect();
+                    if matches!(word.as_str(), "true" | "false" | "null") {
+                        fill!(start, i, HL_KEYWORD);
+                    }
+                    continue;
+                }
+                // Structural punctuation: dim it
+                if matches!(chars[i], ':' | ',' | '{' | '}' | '[' | ']') {
+                    if rainbow && matches!(chars[i], '[' | '{') {
+                        out[i] = RAINBOW[(bracket_depth.max(0) as usize) % RAINBOW.len()];
+                        bracket_depth += 1;
+                    } else if rainbow && matches!(chars[i], ']' | '}') {
+                        bracket_depth = bracket_depth.saturating_sub(1);
+                        out[i] = RAINBOW[(bracket_depth.max(0) as usize) % RAINBOW.len()];
+                    } else {
+                        out[i] = FG_DIM;
+                    }
+                    i += 1;
+                    continue;
+                }
+                i += 1;
+            }
+        }
+    }
+    (out, state, bracket_depth)
+}
+
 fn highlight_line(chars: &[char], lang: Lang, mut state: MlState, rainbow: bool, mut bracket_depth: i32) -> (Vec<u32>, MlState, i32) {
+    if matches!(lang, Lang::Json | Lang::Jsonc) {
+        return highlight_json_line(chars, lang == Lang::Jsonc, state, rainbow, bracket_depth);
+    }
     let len = chars.len();
     let mut out = vec![FG; len];
     let mut i = 0;
@@ -2623,8 +2764,13 @@ fn execute_command(s: &mut State, action: CommandAction) {
                 if !fmt_globs.is_empty() && lang != Lang::None {
                     let matches = fmt_globs.split(',').map(|g| g.trim()).any(|g| glob_match(g, &path_str));
                     if matches {
-                        if let (Some(srv), Some(ref p)) = (s.lsp.server_for_lang_mut(lang), path.as_ref()) {
-                            if srv.initialized { lsp::request_formatting(srv, p); }
+                        match lang {
+                            Lang::Json | Lang::Jsonc => format_json_document(s),
+                            _ => {
+                                if let (Some(srv), Some(ref p)) = (s.lsp.server_for_lang_mut(lang), path.as_ref()) {
+                                    if srv.initialized { lsp::request_formatting(srv, p); }
+                                }
+                            }
                         }
                     }
                 }
@@ -2780,10 +2926,14 @@ fn execute_command(s: &mut State, action: CommandAction) {
         CommandAction::CursorForward => cursor_go_fwd(s),
         CommandAction::FormatDocument => {
             let lang = s.tab().path.as_deref().map(Lang::from_path).unwrap_or(Lang::None);
-            let path = s.tab().path.clone();
-            if lang != Lang::None {
-                if let (Some(srv), Some(ref p)) = (s.lsp.server_for_lang_mut(lang), path.as_ref()) {
-                    if srv.initialized { lsp::request_formatting(srv, p); }
+            match lang {
+                Lang::Json | Lang::Jsonc => format_json_document(s),
+                Lang::None => {}
+                _ => {
+                    let path = s.tab().path.clone();
+                    if let (Some(srv), Some(ref p)) = (s.lsp.server_for_lang_mut(lang), path.as_ref()) {
+                        if srv.initialized { lsp::request_formatting(srv, p); }
+                    }
                 }
             }
         }

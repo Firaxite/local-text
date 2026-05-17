@@ -155,7 +155,7 @@ pub fn start_server(
         Lang::Rust       => ("rust-analyzer", &["--stdio"]),
         Lang::TypeScript => ("typescript-language-server", &["--stdio"]),
         Lang::Python     => ("pylsp", &[]),
-        Lang::None       => return None,
+        Lang::None | Lang::Json | Lang::Jsonc => return None,
     };
 
     let mut child = Command::new(cmd)
@@ -273,6 +273,8 @@ pub fn notify_did_open(server: &mut LspServer, path: &PathBuf, text: &str) {
         Lang::Rust       => "rust",
         Lang::TypeScript => "typescript",
         Lang::Python     => "python",
+        Lang::Json       => "json",
+        Lang::Jsonc      => "jsonc",
         Lang::None       => "text",
     };
     let params = did_open_params(path, text, lang_id);
