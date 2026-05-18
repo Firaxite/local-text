@@ -162,6 +162,7 @@ struct CpuRenderer {
     surfaces:      [IOSurfaceRef; 2],  // [0] and [1]; only [1] used when double_buffer=true
     back:          usize,              // index of the surface to write to next
     double_buffer: bool,               // when false back stays 0 (single-surface legacy mode)
+    ca_surface:    IOSurfaceRef,       // surface pointer last given to layer.setContents
     width:         u32,
     height:        u32,
     view:          *mut AnyObject,
@@ -199,7 +200,8 @@ impl CpuRenderer {
         };
 
         CpuRenderer { layer, surfaces: [ptr::null_mut(); 2], back: 0,
-                      double_buffer, width: 0, height: 0, view: view_ptr }
+                      double_buffer, ca_surface: ptr::null_mut(),
+                      width: 0, height: 0, view: view_ptr }
     }
 
     fn resize(&mut self, width: u32, height: u32) {
@@ -210,6 +212,7 @@ impl CpuRenderer {
             if !s.is_null() { unsafe { CFRelease(s.cast()) }; *s = ptr::null_mut(); }
         }
         self.back = 0;
+        self.ca_surface = ptr::null_mut(); // surfaces gone; next frame must setContents
     }
 
     fn render_frame<F: FnOnce(&mut [u32], u32, u32)>(&mut self, draw: F) {
@@ -244,15 +247,17 @@ impl CpuRenderer {
         }
 
         // Present the freshly-written back surface.
-        // Double-buffer: setContents alternates between two different surface pointers —
-        //   CALayer sees a new pointer each frame and re-composites automatically.
-        // Single-buffer: the pointer never changes, so we must call setContentsChanged
-        //   to tell CALayer the pixel data was mutated in place.
+        // setContents is only called when the surface pointer changes (new surface, resize,
+        // or double-buffer flip). All other frames use setContentsChanged, which is a
+        // lightweight dirty-mark and avoids the full property-transaction CA sends to the
+        // render server — keeping memory at parity with the original single-buffer code.
         CATransaction::begin();
         CATransaction::setDisableActions(true);
-        let any: &AnyObject = unsafe { &*(surf as *const AnyObject) };
-        unsafe { self.layer.setContents(Some(any)) };
-        if !self.double_buffer {
+        if surf != self.ca_surface {
+            let any: &AnyObject = unsafe { &*(surf as *const AnyObject) };
+            unsafe { self.layer.setContents(Some(any)) };
+            self.ca_surface = surf;
+        } else {
             unsafe { let _: () = msg_send![&*self.layer, setContentsChanged]; }
         }
         CATransaction::commit();
