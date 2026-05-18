@@ -102,9 +102,19 @@ const SB_W:       i32 = 6;
 const SB_THUMB:   u32 = 0x414868;
 
 // ── Glyph cache ───────────────────────────────────────────────────────────────
+
+// Fallback font paths tried in order when a character isn't in the primary font.
+// Fonts are loaded lazily on first use to avoid paying ~43 MiB of heap at startup
+// for font outlines (fontdue parses all glyphs eagerly in Font::from_bytes).
+const FALLBACK_PATHS: &[&str] = &[
+    "/System/Library/Fonts/Apple Symbols.ttf",
+    "/System/Library/Fonts/Symbol.ttf",
+    "/System/Library/Fonts/Supplemental/STIXTwoMath.otf",
+];
+
 struct Glyphs {
     font:       Font,
-    fallbacks:  Vec<Font>,
+    fallbacks:  Vec<Option<Font>>,  // None = not yet loaded; indexed parallel to FALLBACK_PATHS
     px:         f32,
     map:        HashMap<char, (Metrics, Vec<u8>)>,
     pub cw:     i32,
@@ -116,22 +126,10 @@ struct Glyphs {
 impl Glyphs {
     fn new(bytes: &[u8], px: f32) -> Self {
         let font = Font::from_bytes(bytes, FontSettings::default()).unwrap();
-        let fallbacks = Self::load_fallbacks();
-        let mut s = Self { font, fallbacks, px, map: HashMap::new(), cw: 0, lh: 0, asc: 0, max_entries: None };
+        let mut s = Self { font, fallbacks: vec![None; FALLBACK_PATHS.len()],
+                           px, map: HashMap::new(), cw: 0, lh: 0, asc: 0, max_entries: None };
         s.rebuild_cache(px);
         s
-    }
-
-    fn load_fallbacks() -> Vec<Font> {
-        let paths = [
-            "/System/Library/Fonts/Apple Symbols.ttf",
-            "/System/Library/Fonts/Symbol.ttf",
-            "/System/Library/Fonts/Supplemental/STIXTwoMath.otf",
-        ];
-        paths.iter().filter_map(|p| {
-            std::fs::read(p).ok()
-                .and_then(|b| Font::from_bytes(b, FontSettings::default()).ok())
-        }).collect()
     }
 
     fn resize(&mut self, px: f32) {
@@ -158,10 +156,17 @@ impl Glyphs {
             self.evict_if_over_cap();
             return;
         }
-        // Try fallback fonts for characters not in primary
-        for i in 0..self.fallbacks.len() {
-            if self.fallbacks[i].lookup_glyph_index(ch) != 0 {
-                let (m, b) = self.fallbacks[i].rasterize(ch, self.px);
+        // Try fallback fonts; load lazily on first use
+        for i in 0..FALLBACK_PATHS.len() {
+            if self.fallbacks[i].is_none() {
+                self.fallbacks[i] = std::fs::read(FALLBACK_PATHS[i]).ok()
+                    .and_then(|b| Font::from_bytes(b, FontSettings::default()).ok());
+            }
+            let has_glyph = self.fallbacks[i].as_ref()
+                .map(|f| f.lookup_glyph_index(ch) != 0)
+                .unwrap_or(false);
+            if has_glyph {
+                let (m, b) = self.fallbacks[i].as_ref().unwrap().rasterize(ch, self.px);
                 self.map.insert(ch, (m, b));
                 self.evict_if_over_cap();
                 return;
