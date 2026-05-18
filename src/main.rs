@@ -347,6 +347,8 @@ struct QuickFinder {
     filtered_commands:  Vec<usize>,
     selected:           usize,
     restore_tree_focus: bool,
+    walk_token:         u64,   // incremented on each open; stale QuickFinderFiles events are dropped
+    loading:            bool,  // true while background walk_files is in progress
 }
 
 // ── Command palette ───────────────────────────────────────────────────────────
@@ -1024,7 +1026,8 @@ pub enum UserEvent {
     GitStatusResult { staged: Vec<GitEntry>, unstaged: Vec<GitEntry>, is_git_repo: bool },
     GitDiffResult   { buf_id: usize, path: String, lines: Vec<DiffLine> },
     GitOpDone,
-    SearchDone { token: u64, results: Vec<GlobalFindResult> },
+    SearchDone        { token: u64, results: Vec<GlobalFindResult> },
+    QuickFinderFiles  { token: u64, entries: Vec<PathBuf> },
     Redraw,
 }
 
@@ -3052,25 +3055,32 @@ fn walk_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>, depth: u
     }
 }
 
-fn open_quick_finder(s: &mut State) {
+fn open_quick_finder(s: &mut State, proxy: EventLoopProxy<UserEvent>) {
     let had_tree_focus = s.explorer.as_ref().map(|e| e.tree_search_focused).unwrap_or(false);
     let root = s.explorer.as_ref().map(|e| e.root.clone())
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    let mut entries = Vec::new();
-    walk_files(&root, &mut entries, 0);
-    let n = entries.len();
-    s.quick_finder.entries             = entries;
-    s.quick_finder.filtered            = (0..n).collect();
+
+    s.quick_finder.walk_token += 1;
+    let token = s.quick_finder.walk_token;
+    s.quick_finder.entries             = vec![];
+    s.quick_finder.filtered            = vec![];
     s.quick_finder.filtered_commands   = vec![];
     s.quick_finder.query               = String::new();
     s.quick_finder.cursor              = 0;
     s.quick_finder.sel_anchor          = None;
     s.quick_finder.selected            = 0;
     s.quick_finder.restore_tree_focus  = had_tree_focus;
+    s.quick_finder.loading             = true;
     s.quick_finder.open                = true;
     // Unfocus tree search and global find so they don't swallow subsequent keystrokes
     if let Some(ex) = s.explorer.as_mut() { ex.tree_search_focused = false; }
     s.global_find.focus = GlobalFindFocus::Results;
+
+    std::thread::spawn(move || {
+        let mut entries = Vec::new();
+        walk_files(&root, &mut entries, 0);
+        let _ = proxy.send_event(UserEvent::QuickFinderFiles { token, entries });
+    });
 }
 
 fn refilter_quick_finder(s: &mut State) {
@@ -3635,16 +3645,13 @@ fn global_replace(results: &[GlobalFindResult], query: &str, replace: &str, case
 }
 
 fn darken_buffer(buf: &mut [u32], w: u32, h: u32) {
-    // Multiply each channel by 100/256 ≈ 39% brightness (vs 100/255 — indistinguishable).
-    // Packing R+B into one lane avoids channel extraction and all integer divisions:
-    //   max(channel * 100) = 25500 = 0x63CC < 2^15, so the B contribution (bits 0-14)
-    //   never bleeds into the R contribution (bits 16+) — no overflow between channels.
-    // The compiler auto-vectorizes this loop with NEON on Apple Silicon.
+    // Halve each channel with a single shift+mask — no per-channel extraction needed.
+    // 0xFEFEFEFE mask strips the LSB of each byte before shifting so no channel bleeds
+    // into its neighbour. This is a single two-instruction body that LLVM auto-vectorizes
+    // into NEON ushrl.4s on Apple Silicon (4 pixels per instruction).
     let len = (w as usize).saturating_mul(h as usize).min(buf.len());
     for p in buf[..len].iter_mut() {
-        let rb = ((*p & 0x00FF00FF) * 100 >> 8) & 0x00FF00FF;
-        let g  = ((*p & 0x0000FF00) * 100 >> 8) & 0x0000FF00;
-        *p = rb | g;
+        *p = (*p & 0xFEFEFEFE) >> 1;
     }
 }
 
@@ -3798,7 +3805,7 @@ impl ApplicationHandler<UserEvent> for App {
             quick_finder: QuickFinder {
                 open: false, query: String::new(), cursor: 0, sel_anchor: None,
                 entries: vec![], filtered: vec![], filtered_commands: vec![], selected: 0,
-                restore_tree_focus: false,
+                restore_tree_focus: false, walk_token: 0, loading: false,
             },
             global_find: GlobalFind {
                 query: String::new(), replace: String::new(),
@@ -5432,14 +5439,14 @@ impl ApplicationHandler<UserEvent> for App {
 
                 // Cmd+P — quick file finder
                 if cmd && !shift && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "p") {
-                    open_quick_finder(s);
+                    open_quick_finder(s, self.proxy.clone());
                     { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                     return;
                 }
 
                 // Cmd+Shift+P — command palette (unified quick finder in command mode)
                 if cmd && shift && matches!(&event.logical_key, Key::Character(c) if matches!(c.as_str(), "p" | "P")) {
-                    open_quick_finder(s);
+                    open_quick_finder(s, self.proxy.clone());
                     s.quick_finder.query  = ">".to_string();
                     s.quick_finder.cursor = 1;
                     refilter_quick_finder(s);
@@ -6539,6 +6546,21 @@ impl ApplicationHandler<UserEvent> for App {
                     self.dirty.store(true, Ordering::Release);
                 }
             }
+            UserEvent::QuickFinderFiles { token, entries } => {
+                if token == s.quick_finder.walk_token {
+                    let n = entries.len();
+                    s.quick_finder.entries = entries;
+                    s.quick_finder.loading = false;
+                    // Re-apply the current query filter now that entries are populated
+                    if s.quick_finder.query.is_empty() {
+                        s.quick_finder.filtered = (0..n).collect();
+                    } else {
+                        refilter_quick_finder(s);
+                    }
+                    s.needs_redraw = true;
+                    self.dirty.store(true, Ordering::Release);
+                }
+            }
             UserEvent::GitOpDone => {
                 // Close all GitDiff tabs across all panes (they're stale after a git op)
                 let mut removed_buf_ids: Vec<usize> = Vec::new();
@@ -7112,6 +7134,7 @@ fn render(s: &mut State) {
 
     // Quick finder / command palette snapshot (unified)
     let qf_open         = s.quick_finder.open;
+    let qf_loading      = s.quick_finder.loading;
     let qf_query        = s.quick_finder.query.clone();
     let qf_cursor_chars = s.quick_finder.query[..s.quick_finder.cursor].chars().count();
     let qf_sel_anchor_chars: Option<usize> = s.quick_finder.sel_anchor.map(|a|
@@ -8422,7 +8445,7 @@ fn render(s: &mut State) {
         // ── Quick finder / command palette overlay (unified) ─────────────
         if qf_open {
             darken_buffer(buf, w, h);
-            let item_count = if qf_is_cmd_mode { qf_cmd_items.len() } else { qf_items.len() };
+            let item_count = if qf_is_cmd_mode { qf_cmd_items.len() } else { qf_items.len().max(if qf_loading { 1 } else { 0 }) };
             let ow = (w as i32 * 2 / 3).min(w as i32 - 40).max(360);
             let oh = lh * (item_count as i32 + 2) + 8;
             let ox = (w as i32 - ow) / 2;
@@ -8478,6 +8501,9 @@ fn render(s: &mut State) {
                         draw_str(buf, w, h, g, shortcut, ox + ow - 4 - sw, ry + asc, FG_DIM, ox + ow - 2);
                     }
                 }
+            } else if qf_loading {
+                let ry = oy + 4 + lh + 4;
+                draw_str(buf, w, h, g, "Searching files...", ox + 6, ry + asc, FG_DIM, ox + ow - 4);
             } else {
                 let avail_chars = ((ow - 10) / cw).max(4) as usize;
                 for (i, (name, dir)) in qf_items.iter().enumerate() {
