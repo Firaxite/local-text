@@ -243,14 +243,18 @@ impl CpuRenderer {
             IOSurfaceUnlock(surf, 0, ptr::null_mut());
         }
 
-        // Present the freshly-written back surface.  setContents hands ownership of the
-        // surface reference to CALayer; the compositor reads this surface until we call
-        // setContents again with a different surface (at the next frame, when double-
-        // buffering is on), so there is never a concurrent read/write race.
+        // Present the freshly-written back surface.
+        // Double-buffer: setContents alternates between two different surface pointers —
+        //   CALayer sees a new pointer each frame and re-composites automatically.
+        // Single-buffer: the pointer never changes, so we must call setContentsChanged
+        //   to tell CALayer the pixel data was mutated in place.
         CATransaction::begin();
         CATransaction::setDisableActions(true);
         let any: &AnyObject = unsafe { &*(surf as *const AnyObject) };
         unsafe { self.layer.setContents(Some(any)) };
+        if !self.double_buffer {
+            unsafe { let _: () = msg_send![&*self.layer, setContentsChanged]; }
+        }
         CATransaction::commit();
         unsafe {
             use objc2::ClassType;
