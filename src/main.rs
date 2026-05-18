@@ -56,6 +56,13 @@ const HL_FUNC:    u32 = 0x7AA2F7;
 const HL_MATCH:        u32 = 0x3D3557; // subtle purple — inactive find matches
 const HL_MATCH_ACTIVE: u32 = 0x524175; // brighter purple — active match
 
+// ── Git diff colors ───────────────────────────────────────────────────────────
+const DIFF_ADD_FG: u32 = 0x9ECE6A;  // green  – added line text
+const DIFF_DEL_FG: u32 = 0xF7768E;  // red    – removed line text
+const DIFF_ADD_BG: u32 = 0x20322E;  // dark green tint – added line background
+const DIFF_DEL_BG: u32 = 0x32201E;  // dark red tint   – removed line background
+const DIFF_HUNK:   u32 = 0x7DCFFF;  // cyan   – @@ hunk header
+
 // ── Rainbow bracket colors (depth-cycled) ────────────────────────────────────
 const RAINBOW: [u32; 6] = [0xFF79C6, 0xFFB86C, 0xF1FA8C, 0x50FA7B, 0x8BE9FD, 0xBD93F9];
 
@@ -253,6 +260,21 @@ impl GitPanel {
             is_git_repo: true, loading: false,
         }
     }
+}
+
+#[derive(Clone)]
+enum DiffLine {
+    Hunk(String),     // "@@ -x,y +a,b @@" header
+    Added(String),    // line content after leading '+'
+    Removed(String),  // line content after leading '-'
+    Context(String),  // unchanged context line
+}
+
+struct GitDiffState {
+    path:    String,
+    lines:   Vec<DiffLine>,
+    scroll:  usize,
+    loading: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -961,6 +983,7 @@ pub enum UserEvent {
     LspResponse    { server_id: usize, id: u64, result: serde_json::Value },
     FormatterDone  { path: PathBuf },
     GitStatusResult { staged: Vec<GitEntry>, unstaged: Vec<GitEntry>, is_git_repo: bool },
+    GitDiffResult   { path: String, lines: Vec<DiffLine> },
     GitOpDone,
     Redraw,
 }
@@ -1029,6 +1052,7 @@ struct State {
     quick_finder: QuickFinder,
     global_find:  GlobalFind,
     git_panel:    GitPanel,
+    git_diff:     Option<GitDiffState>,
     scroll_frac_y: f64,  // fractional pixel accumulator for PixelDelta scroll events
 
     status_msg: Option<String>,
@@ -3359,6 +3383,39 @@ fn refresh_git_status(proxy: winit::event_loop::EventLoopProxy<UserEvent>, root:
     });
 }
 
+fn refresh_git_diff(
+    proxy: winit::event_loop::EventLoopProxy<UserEvent>,
+    root:  PathBuf,
+    path:  String,
+) {
+    std::thread::spawn(move || {
+        let stdout = std::process::Command::new("git")
+            .args(["diff", "--", &path])
+            .current_dir(&root)
+            .output()
+            .map(|o| o.stdout)
+            .unwrap_or_default();
+        let text = String::from_utf8_lossy(&stdout).into_owned();
+        let lines: Vec<DiffLine> = text.lines().filter_map(|l| {
+            if l.starts_with('+') && !l.starts_with("+++") {
+                Some(DiffLine::Added(l[1..].to_owned()))
+            } else if l.starts_with('-') && !l.starts_with("---") {
+                Some(DiffLine::Removed(l[1..].to_owned()))
+            } else if l.starts_with("@@") {
+                Some(DiffLine::Hunk(l.to_owned()))
+            } else if l.starts_with("diff ") || l.starts_with("--- ")
+                || l.starts_with("+++ ") || l.starts_with("index ")
+                || l.starts_with("Binary ")
+            {
+                None  // skip file meta lines — not useful in the viewer
+            } else {
+                Some(DiffLine::Context(l.to_owned()))
+            }
+        }).collect();
+        let _ = proxy.send_event(UserEvent::GitDiffResult { path, lines });
+    });
+}
+
 fn global_search(root: &std::path::Path, query: &str, include: &str, exclude: &str, case_sensitive: bool) -> Vec<GlobalFindResult> {
     let mut all_files = Vec::new();
     walk_files(root, &mut all_files, 0);
@@ -3605,6 +3662,7 @@ impl ApplicationHandler<UserEvent> for App {
                 sel_anchor_q: None, sel_anchor_r: None, sel_anchor_inc: None, sel_anchor_exc: None,
             },
             git_panel: GitPanel::new(),
+            git_diff: None,
             scroll_frac_y: 0.0,
             status_msg: startup_status,
         };
@@ -4320,14 +4378,17 @@ impl ApplicationHandler<UserEvent> for App {
                                 let path = s.git_panel.unstaged[i].path.clone();
                                 let root = s.explorer.as_ref().map(|e| e.root.clone())
                                     .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-                                let proxy = s.proxy.clone();
-                                std::thread::spawn(move || {
-                                    let _ = std::process::Command::new("git")
-                                        .args(["add", "--", &path])
-                                        .current_dir(&root)
-                                        .status();
-                                    let _ = proxy.send_event(UserEvent::GitOpDone);
+                                let reset_scroll = s.git_diff.as_ref()
+                                    .map(|d| d.path != path).unwrap_or(true);
+                                s.git_diff = Some(GitDiffState {
+                                    path:    path.clone(),
+                                    lines:   vec![],
+                                    scroll:  if reset_scroll { 0 } else {
+                                        s.git_diff.as_ref().map(|d| d.scroll).unwrap_or(0)
+                                    },
+                                    loading: true,
                                 });
+                                refresh_git_diff(s.proxy.clone(), root, path);
                             }
                         } else if my >= commit_field_y && my < commit_field_y + lh {
                             s.git_panel.commit_focused = true;
@@ -4463,6 +4524,40 @@ impl ApplicationHandler<UserEvent> for App {
 
                 // Status bar — ignore
                 if my >= s.h as i32 - s.status_h() { return; }
+
+                // Diff overlay: intercept clicks in the editor area when diff is open
+                if s.git_diff.is_some() {
+                    let area = s.pane_area();
+                    if mx >= area.x {
+                        let lh_g  = s.glyphs.lh;
+                        let cw_g  = s.glyphs.cw;
+                        let header_h = lh_g + 6;
+                        let close_x  = area.x + area.w - cw_g * 3;
+                        let stage_x  = close_x - cw_g * 9;
+                        if my < header_h {
+                            if mx >= close_x {
+                                s.git_diff = None;
+                            } else if mx >= stage_x {
+                                if let Some(ref gd) = s.git_diff {
+                                    let path = gd.path.clone();
+                                    let root = s.explorer.as_ref().map(|e| e.root.clone())
+                                        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                                    let proxy = s.proxy.clone();
+                                    s.git_diff = None;
+                                    std::thread::spawn(move || {
+                                        let _ = std::process::Command::new("git")
+                                            .args(["add", "--", &path])
+                                            .current_dir(&root)
+                                            .status();
+                                        let _ = proxy.send_event(UserEvent::GitOpDone);
+                                    });
+                                }
+                            }
+                        }
+                        { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                        return;
+                    }
+                }
 
                 // Which pane was clicked?
                 let area = s.pane_area();
@@ -4941,6 +5036,21 @@ impl ApplicationHandler<UserEvent> for App {
                         (dx_int, dy_int)
                     }
                 };
+                // Diff overlay scroll interception
+                let mx = s.mouse_x as i32;
+                let my = s.mouse_y as i32;
+                if s.git_diff.is_some() {
+                    let area = s.pane_area();
+                    let sh   = s.status_h();
+                    if let Some(ref mut gd) = s.git_diff {
+                        if mx >= area.x && my < s.h as i32 - sh && dy != 0 {
+                            let max_scroll = gd.lines.len().saturating_sub(1);
+                            gd.scroll = (gd.scroll as i32 + dy).clamp(0, max_scroll as i32) as usize;
+                            { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                            return;
+                        }
+                    }
+                }
                 // Scroll global find results when hovering over the left panel
                 let act_w = s.activity_bar_w();
                 let mx = s.mouse_x as i32;
@@ -5251,6 +5361,36 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                     return;
+                }
+
+                // Diff overlay keyboard (Escape to close, arrows to scroll)
+                if s.git_diff.is_some() {
+                    match &event.logical_key {
+                        Key::Named(NamedKey::Escape) => {
+                            s.git_diff = None;
+                            s.needs_redraw = true;
+                            self.dirty.store(true, Ordering::Release);
+                            return;
+                        }
+                        Key::Named(NamedKey::ArrowUp) => {
+                            if let Some(ref mut gd) = s.git_diff {
+                                gd.scroll = gd.scroll.saturating_sub(1);
+                            }
+                            s.needs_redraw = true;
+                            self.dirty.store(true, Ordering::Release);
+                            return;
+                        }
+                        Key::Named(NamedKey::ArrowDown) => {
+                            if let Some(ref mut gd) = s.git_diff {
+                                let max_scroll = gd.lines.len().saturating_sub(1);
+                                gd.scroll = (gd.scroll + 1).min(max_scroll);
+                            }
+                            s.needs_redraw = true;
+                            self.dirty.store(true, Ordering::Release);
+                            return;
+                        }
+                        _ => {}
+                    }
                 }
 
                 // Context menu keyboard (Escape to close)
@@ -6183,7 +6323,17 @@ impl ApplicationHandler<UserEvent> for App {
                 s.git_panel.loading     = false;
                 s.needs_redraw = true;
             }
+            UserEvent::GitDiffResult { path, lines } => {
+                if let Some(ref mut d) = s.git_diff {
+                    if d.path == path {
+                        d.lines   = lines;
+                        d.loading = false;
+                    }
+                }
+                s.needs_redraw = true;
+            }
             UserEvent::GitOpDone => {
+                s.git_diff = None;
                 let root = s.explorer.as_ref().map(|e| e.root.clone())
                     .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
                 s.git_panel.loading = true;
@@ -6778,6 +6928,11 @@ fn render(s: &mut State) {
     let err_count: usize = s.diagnostics.values()
         .map(|v| v.iter().filter(|d| d.severity == DiagSeverity::Error).count())
         .sum();
+
+    // Diff overlay snapshot
+    let diff_snap: Option<(String, Vec<DiffLine>, usize, bool)> = s.git_diff.as_ref().map(|d| {
+        (d.path.clone(), d.lines.clone(), d.scroll, d.loading)
+    });
 
     // Context menu snapshot
     let ctx_menu_snap: Option<(i32, i32, Vec<ContextMenuItem>, usize)> =
@@ -7786,6 +7941,58 @@ fn render(s: &mut State) {
             draw_str(buf, w, h, g, &lc_str, w as i32 - lc_w, sbase, FG_DIM, w as i32);
         } else if let Some(snap) = md_snaps.iter().find(|p| p.is_active) {
             draw_str(buf, w, h, g, &format!("  {}", snap.title), 0, sbase, FG_DIM, w as i32);
+        }
+
+        // ── Diff overlay ──────────────────────────────────────────────────
+        if let Some((ref ds_path, ref ds_lines, ds_scroll, ds_loading)) = diff_snap {
+            let area_x  = area.x;
+            let area_w  = area.w;
+            let full_h  = h as i32 - status_h;
+            let header_h = lh + 6;
+
+            fill(buf, w, h, area_x, 0, area_w, full_h, BG2);
+            fill(buf, w, h, area_x, 0, 1, full_h, BORDER);
+            fill(buf, w, h, area_x, 0, area_w, header_h, SEL_BG);
+            fill(buf, w, h, area_x, header_h, area_w, 1, BORDER);
+
+            let label_clip = area_x + area_w - cw * 13;
+            draw_str(buf, w, h, g, &format!("  {ds_path}"), area_x, asc + 3, ACCENT, label_clip);
+
+            let stage_x = area_x + area_w - cw * 12;
+            draw_str(buf, w, h, g, "[Stage]", stage_x, asc + 3, FG, stage_x + cw * 7);
+
+            let close_x = area_x + area_w - cw * 3;
+            draw_str(buf, w, h, g, "[x]", close_x, asc + 3, FG_DIM, area_x + area_w - 1);
+
+            let content_y = header_h + 1;
+            if ds_loading {
+                draw_str(buf, w, h, g, "  Loading...", area_x, content_y + asc, FG_DIM, area_x + area_w - 1);
+            } else if ds_lines.is_empty() {
+                draw_str(buf, w, h, g, "  (no changes)", area_x, content_y + asc, FG_DIM, area_x + area_w - 1);
+            } else {
+                let mut ry = content_y;
+                for line in ds_lines.iter().skip(ds_scroll) {
+                    if ry + lh > full_h { break; }
+                    match line {
+                        DiffLine::Added(s) => {
+                            fill(buf, w, h, area_x, ry, area_w, lh, DIFF_ADD_BG);
+                            draw_str(buf, w, h, g, &format!(" +{s}"), area_x + 2, ry + asc, DIFF_ADD_FG, area_x + area_w - 1);
+                        }
+                        DiffLine::Removed(s) => {
+                            fill(buf, w, h, area_x, ry, area_w, lh, DIFF_DEL_BG);
+                            draw_str(buf, w, h, g, &format!(" -{s}"), area_x + 2, ry + asc, DIFF_DEL_FG, area_x + area_w - 1);
+                        }
+                        DiffLine::Context(s) => {
+                            draw_str(buf, w, h, g, &format!("  {s}"), area_x + 2, ry + asc, FG_DIM, area_x + area_w - 1);
+                        }
+                        DiffLine::Hunk(s) => {
+                            fill(buf, w, h, area_x, ry, area_w, lh, BG);
+                            draw_str(buf, w, h, g, &format!("  {s}"), area_x + 2, ry + asc, DIFF_HUNK, area_x + area_w - 1);
+                        }
+                    }
+                    ry += lh;
+                }
+            }
         }
 
         // ── Context menu ──────────────────────────────────────────────────
