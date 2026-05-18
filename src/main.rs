@@ -3692,8 +3692,8 @@ impl ApplicationHandler<UserEvent> for App {
 
         let win = Arc::new(el.create_window(attrs).unwrap());
         let renderer = match loaded_settings.renderer {
-            settings::RendererBackend::Gpu => platform::Renderer::new_gpu(&win),
-            settings::RendererBackend::Cpu => platform::Renderer::new_cpu(&win),
+            settings::RendererBackend::Gpu => platform::Renderer::new_gpu(&win, loaded_settings.gpu_drawable_count),
+            settings::RendererBackend::Cpu => platform::Renderer::new_cpu(&win, loaded_settings.cpu_double_buffer),
         };
 
         let font_size = loaded_settings.font_size;
@@ -4937,7 +4937,9 @@ impl ApplicationHandler<UserEvent> for App {
                         .map_or(0, |t| t.scroll as i32 * lh);
                     let btn_x     = pane_rect.x + 14 * cw;
                     let ry        = content_y + lh + 8 - scroll_px;
-                    let vy        = ry + lh + 4;
+                    let cpu_db_y  = ry + lh + 4;
+                    let gpu_dc_y  = cpu_db_y + lh + 4;
+                    let vy        = gpu_dc_y + lh + 4;
                     let sy        = vy + lh + 4;
                     let rb_y      = sy + lh + 4;
                     let gc_y      = rb_y + lh + 4;
@@ -4946,13 +4948,26 @@ impl ApplicationHandler<UserEvent> for App {
                     if my >= ry && my < ry + lh {
                         if mx >= btn_x && mx < btn_x + 5 * cw && s.renderer.is_gpu() {
                             s.settings.renderer = settings::RendererBackend::Cpu;
-                            s.renderer = platform::Renderer::new_cpu(&s.win);
+                            s.renderer = platform::Renderer::new_cpu(&s.win, s.settings.cpu_double_buffer);
                             s.renderer.resize(s.w, s.h);
                             s.settings.save();
                         } else if mx >= btn_x + 6 * cw && mx < btn_x + 11 * cw && !s.renderer.is_gpu() {
                             s.settings.renderer = settings::RendererBackend::Gpu;
-                            s.renderer = platform::Renderer::new_gpu(&s.win);
+                            s.renderer = platform::Renderer::new_gpu(&s.win, s.settings.gpu_drawable_count);
                             s.renderer.resize(s.w, s.h);
+                            s.settings.save();
+                        }
+                    } else if my >= cpu_db_y && my < cpu_db_y + lh && mx >= btn_x && mx < btn_x + 8 * cw {
+                        s.settings.cpu_double_buffer = !s.settings.cpu_double_buffer;
+                        s.renderer.set_cpu_double_buffer(s.settings.cpu_double_buffer);
+                        s.settings.save();
+                    } else if my >= gpu_dc_y && my < gpu_dc_y + lh {
+                        let new_count: u8 = if mx >= btn_x && mx < btn_x + 3 * cw { 2 }
+                                            else if mx >= btn_x + 4 * cw && mx < btn_x + 7 * cw { 3 }
+                                            else { s.settings.gpu_drawable_count };
+                        if new_count != s.settings.gpu_drawable_count {
+                            s.settings.gpu_drawable_count = new_count;
+                            s.renderer.set_gpu_drawable_count(new_count);
                             s.settings.save();
                         }
                     } else if my >= vy && my < vy + lh && mx >= btn_x && mx < btn_x + 8 * cw {
@@ -5349,7 +5364,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 let lh = s.glyphs.lh as usize;
                                 let pane_rect = s.active_pane_rect();
                                 let visible_h = (pane_rect.h - s.tab_h()).max(0) as usize;
-                                let content_h = if s.settings.undo_limit.is_some() { 22 * lh + 96 } else { 21 * lh + 92 };
+                                let content_h = if s.settings.undo_limit.is_some() { 24 * lh + 104 } else { 23 * lh + 100 };
                                 let max_scroll = content_h.saturating_sub(visible_h) / lh + 1;
                                 let t = s.tab_mut();
                                 if dy < 0 {
@@ -6312,7 +6327,7 @@ impl ApplicationHandler<UserEvent> for App {
                                     let lh = s.glyphs.lh as usize;
                                     let pane_rect = s.active_pane_rect();
                                     let visible_h = (pane_rect.h - s.tab_h()).max(0) as usize;
-                                    let content_h = if s.settings.undo_limit.is_some() { 22 * lh + 96 } else { 21 * lh + 92 };
+                                    let content_h = if s.settings.undo_limit.is_some() { 24 * lh + 104 } else { 23 * lh + 100 };
                                     let max_scroll = content_h.saturating_sub(visible_h) / lh + 1;
                                     let step = if matches!(&event.logical_key, Key::Named(NamedKey::PageDown)) { 5 } else { 1 };
                                     s.tab_mut().scroll = (s.tab().scroll + step).min(max_scroll);
@@ -7050,6 +7065,8 @@ fn render(s: &mut State) {
     let organize_imports_on_save = s.settings.organize_imports_on_save.clone();
     let format_command          = s.settings.format_command.clone();
     let glyph_cache_limit       = s.settings.glyph_cache_limit;
+    let cpu_double_buffer       = s.settings.cpu_double_buffer;
+    let gpu_drawable_count      = s.settings.gpu_drawable_count;
     let settings_edit_field     = s.settings_edit_field;
     let settings_edit_text      = s.settings_edit_text.clone();
     let settings_edit_cursor    = s.settings_edit_cursor;
@@ -7669,8 +7686,30 @@ fn render(s: &mut State) {
                     fc(buf, btn_x + 6 * cw, ry, 5 * cw, lh, gpu_bg);
                     draw_str(buf, w, h, g, " GPU ", btn_x + 6 * cw, ry + asc, gpu_fg, btn_x + 11 * cw);
                 }
+                // CPU Double-Buffer row
+                let cpu_db_y = ry + lh + 4;
+                if row_vis(cpu_db_y) {
+                    draw_str(buf, w, h, g, "  CPU Double-Buffer", r.x, cpu_db_y + asc, FG, btn_x - cw);
+                    let (db_bg, db_fg) = if cpu_double_buffer { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
+                    let db_label = if cpu_double_buffer { " [x] On " } else { " [ ] Off" };
+                    fc(buf, btn_x, cpu_db_y, 8 * cw, lh, db_bg);
+                    draw_str(buf, w, h, g, db_label, btn_x, cpu_db_y + asc, db_fg, btn_x + 8 * cw);
+                }
+                // GPU Drawables row
+                let gpu_dc_y = cpu_db_y + lh + 4;
+                if row_vis(gpu_dc_y) {
+                    draw_str(buf, w, h, g, "  GPU Drawables", r.x, gpu_dc_y + asc, FG, btn_x - cw);
+                    for (i, &count) in [2u8, 3u8].iter().enumerate() {
+                        let off = i as i32 * 4;
+                        let active = gpu_drawable_count == count;
+                        let (bg, fg) = if active { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
+                        let label = if count == 2 { " 2 " } else { " 3 " };
+                        fc(buf, btn_x + off * cw, gpu_dc_y, 3 * cw, lh, bg);
+                        draw_str(buf, w, h, g, label, btn_x + off * cw, gpu_dc_y + asc, fg, btn_x + (off + 3) * cw);
+                    }
+                }
                 // VSync row
-                let vy = ry + lh + 4;
+                let vy = gpu_dc_y + lh + 4;
                 if row_vis(vy) {
                     draw_str(buf, w, h, g, "  VSync", r.x, vy + asc, FG, btn_x - cw);
                     let (vs_bg, vs_fg) = if vsync_on { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };

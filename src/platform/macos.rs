@@ -158,25 +158,27 @@ impl Drop for DisplayLink {
 // (original implementation — see module-level comment)
 
 struct CpuRenderer {
-    layer:          Retained<CALayer>,
-    surface:        IOSurfaceRef,
-    width:          u32,
-    height:         u32,
-    view:           *mut AnyObject,
-    frame_count:    u64,
-    needs_reimport: bool,
+    layer:         Retained<CALayer>,
+    surfaces:      [IOSurfaceRef; 2],  // [0] and [1]; only [1] used when double_buffer=true
+    back:          usize,              // index of the surface to write to next
+    double_buffer: bool,               // when false back stays 0 (single-surface legacy mode)
+    width:         u32,
+    height:        u32,
+    view:          *mut AnyObject,
 }
 
 unsafe impl Send for CpuRenderer {}
 
 impl Drop for CpuRenderer {
     fn drop(&mut self) {
-        if !self.surface.is_null() { unsafe { CFRelease(self.surface.cast()) }; }
+        for s in &self.surfaces {
+            if !s.is_null() { unsafe { CFRelease(s.cast()) }; }
+        }
     }
 }
 
 impl CpuRenderer {
-    fn new(window: &Window) -> Self {
+    fn new(window: &Window, double_buffer: bool) -> Self {
         let layer = CALayer::new();
         layer.setGeometryFlipped(true);
         layer.setOpaque(true);
@@ -196,18 +198,18 @@ impl CpuRenderer {
             _ => panic!("unsupported window handle"),
         };
 
-        CpuRenderer { layer, surface: ptr::null_mut(), width: 0, height: 0,
-                      view: view_ptr, frame_count: 0, needs_reimport: false }
+        CpuRenderer { layer, surfaces: [ptr::null_mut(); 2], back: 0,
+                      double_buffer, width: 0, height: 0, view: view_ptr }
     }
 
     fn resize(&mut self, width: u32, height: u32) {
         if width == self.width && height == self.height { return; }
         self.width  = width;
         self.height = height;
-        if !self.surface.is_null() {
-            unsafe { CFRelease(self.surface.cast()) };
-            self.surface = ptr::null_mut();
+        for s in &mut self.surfaces {
+            if !s.is_null() { unsafe { CFRelease(s.cast()) }; *s = ptr::null_mut(); }
         }
+        self.back = 0;
     }
 
     fn render_frame<F: FnOnce(&mut [u32], u32, u32)>(&mut self, draw: F) {
@@ -225,42 +227,53 @@ impl CpuRenderer {
             }
         }
 
-        let is_recovery = self.needs_reimport && !self.surface.is_null();
-        if is_recovery {
-            unsafe { CFRelease(self.surface.cast()) };
-            self.surface = ptr::null_mut();
+        // Allocate the back surface on demand
+        if self.surfaces[self.back].is_null() {
+            self.surfaces[self.back] = create_surface(w, h);
         }
-        self.needs_reimport = false;
 
-        let new_surface = self.surface.is_null();
-        if new_surface { self.surface = create_surface(w, h); }
-
+        let surf = self.surfaces[self.back];
         unsafe {
-            IOSurfaceLock(self.surface, 0, ptr::null_mut());
-            let bpr    = IOSurfaceGetBytesPerRow(self.surface);
-            let stride = (bpr / 4) as u32; // u32s per row (>= w when aligned)
-            let base   = IOSurfaceGetBaseAddress(self.surface) as *mut u32;
+            IOSurfaceLock(surf, 0, ptr::null_mut());
+            let bpr    = IOSurfaceGetBytesPerRow(surf);
+            let stride = (bpr / 4) as u32; // u32s per row (>= w when 16-byte aligned)
+            let base   = IOSurfaceGetBaseAddress(surf) as *mut u32;
             let pixels = std::slice::from_raw_parts_mut(base, (stride * h) as usize);
             draw(pixels, stride, h);
-            IOSurfaceUnlock(self.surface, 0, ptr::null_mut());
+            IOSurfaceUnlock(surf, 0, ptr::null_mut());
         }
 
-        self.frame_count += 1;
+        // Present the freshly-written back surface.  setContents hands ownership of the
+        // surface reference to CALayer; the compositor reads this surface until we call
+        // setContents again with a different surface (at the next frame, when double-
+        // buffering is on), so there is never a concurrent read/write race.
         CATransaction::begin();
         CATransaction::setDisableActions(true);
-        if new_surface {
-            if !is_recovery { self.needs_reimport = true; }
-            let any: &AnyObject = unsafe { &*(self.surface as *const AnyObject) };
-            unsafe { self.layer.setContents(Some(any)) };
-        } else {
-            unsafe { let _: () = msg_send![&*self.layer, setContentsChanged]; }
-        }
+        let any: &AnyObject = unsafe { &*(surf as *const AnyObject) };
+        unsafe { self.layer.setContents(Some(any)) };
         CATransaction::commit();
-
         unsafe {
             use objc2::ClassType;
             let _: () = msg_send![CATransaction::class(), flush];
         }
+
+        // Flip to the other surface for the next frame (double-buffer only)
+        if self.double_buffer { self.back = 1 - self.back; }
+    }
+
+    fn set_double_buffer(&mut self, enabled: bool) {
+        if enabled == self.double_buffer { return; }
+        if !enabled {
+            // Free the surface that won't be used in single-buffer mode
+            let other = 1 - self.back;
+            if !self.surfaces[other].is_null() {
+                unsafe { CFRelease(self.surfaces[other].cast()) };
+                self.surfaces[other] = ptr::null_mut();
+            }
+            self.back = 0;
+        }
+        self.double_buffer = enabled;
+        // When enabling, the second surface is allocated lazily on the next render_frame call.
     }
 }
 
@@ -288,7 +301,7 @@ impl Drop for GpuRenderer {
 }
 
 impl GpuRenderer {
-    fn new(window: &Window) -> Option<Self> {
+    fn new(window: &Window, drawable_count: u8) -> Option<Self> {
         let device = MTLCreateSystemDefaultDevice()?;
 
         let cmd_queue = device.newCommandQueue()?;
@@ -303,6 +316,9 @@ impl GpuRenderer {
             let _: () = msg_send![&*metal_layer, setFramebufferOnly: Bool::NO];
             // Scale so 1 Metal pixel == 1 screen pixel
             let _: () = msg_send![&*metal_layer, setContentsScale: window.scale_factor()];
+            // Drawable pool size: 2 saves ~33 MiB vs 3 at 4K. Apple requires 2–3.
+            let count = (drawable_count as usize).clamp(2, 3);
+            let _: () = msg_send![&*metal_layer, setMaximumDrawableCount: count];
         }
 
         let view_ptr = match window.window_handle().unwrap().as_raw() {
@@ -432,6 +448,11 @@ impl GpuRenderer {
         }
         cmd_buf.commit();
     }
+
+    fn set_drawable_count(&mut self, count: u8) {
+        let n = (count as usize).clamp(2, 3);
+        unsafe { let _: () = msg_send![&*self.metal_layer, setMaximumDrawableCount: n]; }
+    }
 }
 
 // ── Public Renderer (wraps either backend) ────────────────────────────────────
@@ -444,24 +465,32 @@ enum RendererImpl {
 pub struct Renderer(RendererImpl);
 
 impl Renderer {
-    pub fn new_cpu(window: &Window) -> Self {
+    pub fn new_cpu(window: &Window, double_buffer: bool) -> Self {
         let _mtm = MainThreadMarker::new()
             .expect("Renderer must be created on the main thread");
-        Renderer(RendererImpl::Cpu(CpuRenderer::new(window)))
+        Renderer(RendererImpl::Cpu(CpuRenderer::new(window, double_buffer)))
     }
 
-    pub fn new_gpu(window: &Window) -> Self {
+    pub fn new_gpu(window: &Window, drawable_count: u8) -> Self {
         let _mtm = MainThreadMarker::new()
             .expect("Renderer must be created on the main thread");
-        if let Some(g) = GpuRenderer::new(window) {
+        if let Some(g) = GpuRenderer::new(window, drawable_count) {
             Renderer(RendererImpl::Gpu(g))
         } else {
             // Fallback to CPU if Metal isn't available
-            Renderer(RendererImpl::Cpu(CpuRenderer::new(window)))
+            Renderer(RendererImpl::Cpu(CpuRenderer::new(window, true)))
         }
     }
 
     pub fn is_gpu(&self) -> bool { matches!(self.0, RendererImpl::Gpu(_)) }
+
+    pub fn set_cpu_double_buffer(&mut self, enabled: bool) {
+        if let RendererImpl::Cpu(r) = &mut self.0 { r.set_double_buffer(enabled); }
+    }
+
+    pub fn set_gpu_drawable_count(&mut self, count: u8) {
+        if let RendererImpl::Gpu(r) = &mut self.0 { r.set_drawable_count(count); }
+    }
 
     pub fn resize(&mut self, width: u32, height: u32) {
         match &mut self.0 {

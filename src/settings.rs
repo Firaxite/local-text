@@ -84,15 +84,21 @@ pub struct Settings {
     pub format_command:           String,  // e.g. "rustfmt" or "prettier --write {file}"
     #[serde(default)]
     pub glyph_cache_limit: GlyphCacheLimit,
+    #[serde(default = "Settings::default_cpu_double_buffer")]
+    pub cpu_double_buffer: bool,   // true = 2 IOSurfaces (tear-free); false = legacy single-buffer
+    #[serde(default = "Settings::default_gpu_drawable_count")]
+    pub gpu_drawable_count: u8,    // Metal drawable pool size: 2 or 3 (Apple minimum is 2)
 }
 
 impl Default for Settings {
-    fn default() -> Self { Settings { renderer: RendererBackend::Cpu, vsync: true, font_size: Self::default_font_size(), rainbow_brackets: false, undo_limit: Self::default_undo_limit(), term_copy_paste: false, term_cmd_bs: false, term_alt_bs: false, term_word_select: TermWordSelect::Whitespace, format_on_save: String::new(), organize_imports_on_save: String::new(), format_command: String::new(), glyph_cache_limit: GlyphCacheLimit::Unlimited } }
+    fn default() -> Self { Settings { renderer: RendererBackend::Cpu, vsync: true, font_size: Self::default_font_size(), rainbow_brackets: false, undo_limit: Self::default_undo_limit(), term_copy_paste: false, term_cmd_bs: false, term_alt_bs: false, term_word_select: TermWordSelect::Whitespace, format_on_save: String::new(), organize_imports_on_save: String::new(), format_command: String::new(), glyph_cache_limit: GlyphCacheLimit::Unlimited, cpu_double_buffer: Self::default_cpu_double_buffer(), gpu_drawable_count: Self::default_gpu_drawable_count() } }
 }
 
 impl Settings {
     pub fn default_font_size() -> f32 { 14.0 }
     pub fn default_undo_limit() -> Option<usize> { Some(200) }
+    pub fn default_cpu_double_buffer() -> bool { true }
+    pub fn default_gpu_drawable_count() -> u8 { 2 }
 
     fn config_path() -> Option<PathBuf> {
         let home = std::env::var("HOME").ok()?;
