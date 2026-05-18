@@ -228,6 +228,10 @@ struct FindBar {
     cursor_replace: usize,
     sel_anchor_q:   Option<usize>,
     sel_anchor_r:   Option<usize>,
+    // Cached match positions — recomputed only when query/flags/file changes.
+    match_cache:     Vec<(usize, usize)>,
+    match_cache_gen: u64,                    // edit_generation when cache was built
+    match_cache_key: (String, bool, bool),   // (query, case_sensitive, whole_word)
 }
 
 impl FindBar {
@@ -239,6 +243,8 @@ impl FindBar {
             focus: FindFocus::Query,
             cursor_query: 0, cursor_replace: 0,
             sel_anchor_q: None, sel_anchor_r: None,
+            match_cache: Vec::new(), match_cache_gen: 0,
+            match_cache_key: (String::new(), false, false),
         }
     }
 }
@@ -6892,6 +6898,18 @@ fn render(s: &mut State) {
                 tab.hl_dirty_from = need_up_to;
             }
         }
+
+        // Refresh find-match cache if the query, flags, or file content changed.
+        // Doing this in the mutable pre-pass means the snapshot pass just clones it.
+        if pane.find.open && !pane.find.query.is_empty() {
+            let key = (pane.find.query.clone(), pane.find.case_sensitive, pane.find.whole_word);
+            let gen = tab.edit_generation;
+            if pane.find.match_cache_gen != gen || pane.find.match_cache_key != key {
+                pane.find.match_cache = find_matches(&tab.text, &key.0, key.1, key.2);
+                pane.find.match_cache_gen = gen;
+                pane.find.match_cache_key = key;
+            }
+        }
     }
 
     // Build per-pane snapshots (editor panes only)
@@ -6981,7 +6999,7 @@ fn render(s: &mut State) {
 
         let fq = pane.find.query.clone();
         let match_ranges: Vec<(usize, usize)> = if pane.find.open && !fq.is_empty() {
-            find_matches(&tab.text, &fq, pane.find.case_sensitive, pane.find.whole_word)
+            pane.find.match_cache.clone()
         } else { vec![] };
 
         // Syntax highlight lines — use hl_cache for pre-scroll state (populated in pre-pass above)
