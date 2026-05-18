@@ -61,7 +61,7 @@ const RAINBOW: [u32; 6] = [0xFF79C6, 0xFFB86C, 0xF1FA8C, 0x50FA7B, 0x8BE9FD, 0xB
 
 // ── Language detection ────────────────────────────────────────────────────────
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-enum Lang { None, Rust, Python, TypeScript, Json, Jsonc }
+enum Lang { None, Rust, Python, TypeScript, Json, Jsonc, Markdown }
 
 impl Lang {
     fn from_path(path: &std::path::Path) -> Self {
@@ -71,6 +71,7 @@ impl Lang {
             Some("ts" | "tsx" | "js" | "jsx")   => Lang::TypeScript,
             Some("json")                        => Lang::Json,
             Some("jsonc")                       => Lang::Jsonc,
+            Some("md" | "markdown")             => Lang::Markdown,
             _                                   => Lang::None,
         }
     }
@@ -84,6 +85,7 @@ enum MlState {
     TemplateStr,
     PyTripleSingle,
     PyTripleDouble,
+    CodeFence,
 }
 
 // ── Layout ────────────────────────────────────────────────────────────────────
@@ -220,7 +222,38 @@ impl FindBar {
 
 // ── Left panel / activity bar ─────────────────────────────────────────────────
 #[derive(Clone, Copy, PartialEq)]
-enum LeftView { FileTree, GlobalSearch, Diagnostics }
+enum LeftView { FileTree, GlobalSearch, Diagnostics, Git }
+
+#[derive(Clone)]
+pub struct GitEntry {
+    xy:   (char, char),  // X=staged col, Y=working-tree col from --porcelain
+    path: String,
+}
+
+#[derive(Clone, PartialEq)]
+enum GitSel { None, Staged(usize), Unstaged(usize) }
+
+struct GitPanel {
+    staged:         Vec<GitEntry>,
+    unstaged:       Vec<GitEntry>,
+    commit_msg:     String,
+    commit_cursor:  usize,
+    commit_focused: bool,
+    sel:            GitSel,
+    is_git_repo:    bool,
+    loading:        bool,
+}
+
+impl GitPanel {
+    fn new() -> Self {
+        GitPanel {
+            staged: vec![], unstaged: vec![],
+            commit_msg: String::new(), commit_cursor: 0,
+            commit_focused: false, sel: GitSel::None,
+            is_git_repo: true, loading: false,
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum CtxAction {
@@ -231,6 +264,10 @@ enum CtxAction {
     FormatDocument,
     OrganizeImports,
     Copy, Cut, Paste,
+    TabCopyRelPath, TabCopyFullPath,
+    TabOpenPreview,
+    TabClose,
+    TabSplitRight, TabSplitLeft, TabSplitDown, TabSplitUp,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -245,10 +282,11 @@ struct ContextMenuItem {
 }
 
 struct ContextMenu {
-    x:       i32,
-    y:       i32,
-    items:   Vec<ContextMenuItem>,
-    hovered: usize,
+    x:          i32,
+    y:          i32,
+    items:      Vec<ContextMenuItem>,
+    hovered:    usize,
+    tab_source: Option<(usize, usize)>,  // (pane_id, tab_idx) for tab bar menus
 }
 
 // ── Quick file finder ─────────────────────────────────────────────────────────
@@ -267,12 +305,13 @@ struct QuickFinder {
 // ── Command palette ───────────────────────────────────────────────────────────
 #[derive(Clone, Copy)]
 enum CommandAction {
-    Save, CloseTab, SplitRight, SplitDown, OpenTerminal, GoToSettings,
-    ToggleFind, ToggleReplace, ToggleExplorer, IncreaseFontSize, DecreaseFontSize,
+    Save, CloseTab, SplitRight, SplitDown, SplitLeft, SplitUp, OpenTerminal, GoToSettings,
+    ToggleFind, ToggleReplace, ToggleExplorer, ToggleSidebar, IncreaseFontSize, DecreaseFontSize,
     GotoDefinition, FindReferences,
     Copy, Cut, Paste,
     CursorBack, CursorForward,
     FormatDocument, OrganizeImports,
+    OpenMarkdownPreview,
 }
 
 struct CommandEntry { name: &'static str, shortcut: &'static str, action: CommandAction }
@@ -286,15 +325,19 @@ const COMMANDS: &[CommandEntry] = &[
     CommandEntry { name: "Open Terminal",         shortcut: "Ctrl+`",        action: CommandAction::OpenTerminal },
     CommandEntry { name: "Split Right",           shortcut: "",              action: CommandAction::SplitRight },
     CommandEntry { name: "Split Down",            shortcut: "",              action: CommandAction::SplitDown },
+    CommandEntry { name: "Split Left",            shortcut: "",              action: CommandAction::SplitLeft },
+    CommandEntry { name: "Split Up",              shortcut: "",              action: CommandAction::SplitUp },
     CommandEntry { name: "Toggle Find",           shortcut: "Cmd+F",         action: CommandAction::ToggleFind },
     CommandEntry { name: "Toggle Find+Replace",   shortcut: "Cmd+H",         action: CommandAction::ToggleReplace },
     CommandEntry { name: "Toggle File Explorer",  shortcut: "",              action: CommandAction::ToggleExplorer },
+    CommandEntry { name: "Toggle Sidebar",        shortcut: "Cmd+B",         action: CommandAction::ToggleSidebar },
     CommandEntry { name: "Increase Font Size",    shortcut: "Cmd+=",         action: CommandAction::IncreaseFontSize },
     CommandEntry { name: "Decrease Font Size",    shortcut: "Cmd+-",         action: CommandAction::DecreaseFontSize },
     CommandEntry { name: "Go to Definition",      shortcut: "F12",           action: CommandAction::GotoDefinition },
     CommandEntry { name: "Find All References",   shortcut: "Cmd+Shift+F12", action: CommandAction::FindReferences },
     CommandEntry { name: "Format Document",       shortcut: "Opt+Shift+F",   action: CommandAction::FormatDocument },
     CommandEntry { name: "Organize Imports",      shortcut: "Opt+Shift+O",   action: CommandAction::OrganizeImports },
+    CommandEntry { name: "Open Markdown Preview", shortcut: "Cmd+Shift+M",   action: CommandAction::OpenMarkdownPreview },
 ];
 
 // ── Global find/replace ───────────────────────────────────────────────────────
@@ -532,7 +575,7 @@ enum PaneTree {
 }
 
 #[derive(Clone, PartialEq)]
-enum PaneKind { Editor, Terminal, LspOutput }
+enum PaneKind { Editor, Terminal, LspOutput, MarkdownPreview }
 
 struct Pane {
     id:       usize,
@@ -748,6 +791,7 @@ fn perform_drop(s: &mut State, drag: DragState) {
                 s.active_pane = new_id;
             }
             if s.panes.get(&src_pid).map_or(false, |p| p.tabs.is_empty()) && src_pid != dst_pid {
+                s.md_panes.remove(&src_pid);
                 s.panes.remove(&src_pid);
                 let old_tree = std::mem::replace(&mut s.pane_tree, PaneTree::Leaf(0));
                 if let Some(t) = remove_pane_from_tree(old_tree, src_pid) { s.pane_tree = t; }
@@ -835,6 +879,34 @@ fn open_terminal_pane(s: &mut State) {
     s.active_pane = pane_id;
 }
 
+fn open_markdown_preview(s: &mut State) {
+    let Some(pane) = s.panes.get(&s.active_pane) else { return };
+    if pane.kind != PaneKind::Editor { return };
+    let tab = pane.tab();
+    let is_md = tab.path.as_deref()
+        .map(|p| matches!(p.extension().and_then(|e| e.to_str()), Some("md" | "markdown")))
+        .unwrap_or(false);
+    if !is_md { return };
+    let source_buf_id = tab.buf_id;
+    let title = tab.display_name().to_owned() + " [Preview]";
+
+    if let Some((&pid, _)) = s.md_panes.iter().find(|(_, mp)| mp.source_buf_id == source_buf_id) {
+        s.active_pane = pid;
+        return;
+    }
+
+    let pane_id = s.next_pane_id; s.next_pane_id += 1;
+    s.md_panes.insert(pane_id, MarkdownPane { id: pane_id, source_buf_id, scroll: 0, title });
+    s.panes.insert(pane_id, Pane {
+        id: pane_id, kind: PaneKind::MarkdownPreview,
+        tabs: vec![], term_ids: vec![], active: 0, find: FindBar::new(),
+    });
+    let active = s.active_pane;
+    let old_tree = std::mem::replace(&mut s.pane_tree, PaneTree::Leaf(0));
+    s.pane_tree = insert_pane(old_tree, active, pane_id, DropZone::Right);
+    s.active_pane = pane_id;
+}
+
 fn check_lsp_binaries(s: &mut State) {
     for (lang, bin) in &[(Lang::TypeScript, "typescript-language-server"), (Lang::Rust, "rust-analyzer"), (Lang::Python, "pylsp")] {
         let installed = std::process::Command::new("which").arg(bin).output()
@@ -875,12 +947,21 @@ pub struct OutputPane {
     pub title:  String,
 }
 
+pub struct MarkdownPane {
+    pub id:            usize,
+    pub source_buf_id: usize,
+    pub scroll:        usize,
+    pub title:         String,
+}
+
 pub enum UserEvent {
     TermOutput     { pane_id: usize, data: Vec<u8> },
     LspOutput      { pane_id: usize, data: Vec<u8> },
     LspDiagnostics { path: PathBuf, diagnostics: Vec<Diagnostic> },
     LspResponse    { server_id: usize, id: u64, result: serde_json::Value },
     FormatterDone  { path: PathBuf },
+    GitStatusResult { staged: Vec<GitEntry>, unstaged: Vec<GitEntry>, is_git_repo: bool },
+    GitOpDone,
     Redraw,
 }
 
@@ -901,6 +982,7 @@ struct State {
 
     term_panes:     HashMap<usize, terminal::TermPane>,
     lsp_panes:      HashMap<usize, OutputPane>,
+    md_panes:       HashMap<usize, MarkdownPane>,
     lsp:            lsp::LspManager,
     diagnostics:    HashMap<PathBuf, Vec<Diagnostic>>,
     lsp_installed:  HashMap<Lang, bool>,
@@ -940,11 +1022,14 @@ struct State {
     cursor_back: Vec<(PathBuf, usize)>,
     cursor_fwd:  Vec<(PathBuf, usize)>,
 
-    left_view:      LeftView,
+    left_view:          LeftView,
+    left_panel_visible: bool,
     diag_panel_sel: usize,
     context_menu: Option<ContextMenu>,
     quick_finder: QuickFinder,
     global_find:  GlobalFind,
+    git_panel:    GitPanel,
+    scroll_frac_y: f64,  // fractional pixel accumulator for PixelDelta scroll events
 
     status_msg: Option<String>,
 }
@@ -1004,7 +1089,7 @@ impl State {
     }
 
     fn explorer_w(&self) -> i32 {
-        if self.explorer.is_some() { self.explorer_w } else { 0 }
+        if self.explorer.is_some() && self.left_panel_visible { self.explorer_w } else { 0 }
     }
 
     fn tab_h(&self)    -> i32 { self.glyphs.lh + 4 }
@@ -1928,7 +2013,7 @@ fn is_keyword(word: &str, lang: Lang) -> bool {
             "satisfies"|"static"|"super"|"switch"|"this"|"throw"|"true"|"try"|
             "type"|"typeof"|"undefined"|"var"|"void"|"while"|"with"|"yield"
         ),
-        Lang::None | Lang::Json | Lang::Jsonc => false,
+        Lang::None | Lang::Json | Lang::Jsonc | Lang::Markdown => false,
     }
 }
 
@@ -1946,7 +2031,7 @@ fn is_type_kw(word: &str, lang: Lang) -> bool {
         Lang::TypeScript => matches!(word,
             "boolean"|"bigint"|"never"|"number"|"string"|"symbol"|"unknown"
         ),
-        Lang::None | Lang::Json | Lang::Jsonc => false,
+        Lang::None | Lang::Json | Lang::Jsonc | Lang::Markdown => false,
     }
 }
 
@@ -2094,9 +2179,213 @@ fn highlight_json_line(chars: &[char], jsonc: bool, mut state: MlState, rainbow:
     (out, state, bracket_depth)
 }
 
+fn highlight_markdown_line(chars: &[char], state: MlState, _rainbow: bool, bracket_depth: i32) -> (Vec<u32>, MlState, i32) {
+    let len = chars.len();
+    let mut out = vec![FG; len];
+    macro_rules! fill_range { ($from:expr, $to:expr, $color:expr) => { for k in $from..($to).min(len) { out[k] = $color; } }; }
+
+    // Inside a fenced code block
+    if state == MlState::CodeFence {
+        let is_fence = len >= 3 && chars[0] == '`' && chars[1] == '`' && chars[2] == '`';
+        if is_fence {
+            fill_range!(0, len, HL_COMMENT);
+            return (out, MlState::Normal, bracket_depth);
+        }
+        fill_range!(0, len, HL_NUMBER);
+        return (out, MlState::CodeFence, bracket_depth);
+    }
+
+    // Skip pure whitespace lines
+    if chars.iter().all(|c| c.is_whitespace()) {
+        return (out, MlState::Normal, bracket_depth);
+    }
+
+    // ATX heading: 1-6 '#' followed by space or end
+    let heading_hashes = chars.iter().take_while(|&&c| c == '#').count();
+    if heading_hashes >= 1 && heading_hashes <= 6
+        && (len == heading_hashes || chars[heading_hashes] == ' ')
+    {
+        fill_range!(0, len, HL_FUNC);
+        return (out, MlState::Normal, bracket_depth);
+    }
+
+    // Fenced code block opening: line starts with ```
+    if len >= 3 && chars[0] == '`' && chars[1] == '`' && chars[2] == '`' {
+        fill_range!(0, len, HL_COMMENT);
+        return (out, MlState::CodeFence, bracket_depth);
+    }
+
+    // Blockquote: starts with '>'
+    if chars[0] == '>' {
+        fill_range!(0, len, HL_COMMENT);
+        return (out, MlState::Normal, bracket_depth);
+    }
+
+    // Horizontal rule: 3+ repeated '-', '*', or '_' (possibly with spaces), nothing else
+    {
+        let trimmed: Vec<char> = chars.iter().filter(|&&c| !c.is_whitespace()).cloned().collect();
+        if trimmed.len() >= 3 && trimmed.iter().all(|&c| c == trimmed[0]) && matches!(trimmed[0], '-' | '*' | '_') {
+            fill_range!(0, len, FG_DIM);
+            return (out, MlState::Normal, bracket_depth);
+        }
+    }
+
+    // List marker: starts with '- ', '* ', '+ ', or '<digits>. '
+    {
+        let mut li = 0;
+        while li < len && chars[li] == ' ' { li += 1; }  // leading indent
+        let marker_start = li;
+        let is_unordered = li < len && matches!(chars[li], '-' | '*' | '+') && li + 1 < len && chars[li + 1] == ' ';
+        let mut is_ordered = false;
+        if !is_unordered && li < len && chars[li].is_ascii_digit() {
+            let num_start = li;
+            while li < len && chars[li].is_ascii_digit() { li += 1; }
+            if li < len && chars[li] == '.' && li + 1 < len && chars[li + 1] == ' ' {
+                is_ordered = true;
+                li += 1; // include the '.'
+            } else {
+                li = num_start; // reset
+            }
+        }
+        if is_unordered || is_ordered {
+            let marker_end = if is_unordered { marker_start + 1 } else { li };
+            fill_range!(marker_start, marker_end + 1, FG_DIM);
+            // rest gets inline scan below — but for simplicity just color rest FG (already set)
+            // We still need to scan the rest for inline markup, so don't return here
+        }
+    }
+
+    // Inline scan
+    let mut i = 0;
+    while i < len {
+        // HTML comment <!-- ... -->
+        if i + 3 < len && chars[i] == '<' && chars[i+1] == '!' && chars[i+2] == '-' && chars[i+3] == '-' {
+            let start = i;
+            i += 4;
+            while i + 2 < len && !(chars[i] == '-' && chars[i+1] == '-' && chars[i+2] == '>') { i += 1; }
+            let end = (i + 3).min(len);
+            fill_range!(start, end, HL_COMMENT);
+            i = end;
+            continue;
+        }
+        // Inline code: `...`
+        if chars[i] == '`' {
+            let start = i;
+            i += 1;
+            while i < len && chars[i] != '`' { i += 1; }
+            let end = (i + 1).min(len);
+            fill_range!(start, end, HL_STRING);
+            i = end;
+            continue;
+        }
+        // Image: ![alt](url)
+        if chars[i] == '!' && i + 1 < len && chars[i+1] == '[' {
+            out[i] = FG_DIM;
+            i += 1;
+            let start = i;
+            i += 1;
+            while i < len && chars[i] != ']' { i += 1; }
+            fill_range!(start, i + 1, HL_FUNC);
+            i = (i + 1).min(len);
+            if i < len && chars[i] == '(' {
+                let url_open = i;
+                i += 1;
+                while i < len && chars[i] != ')' { i += 1; }
+                out[url_open] = FG_DIM;
+                fill_range!(url_open + 1, i, HL_COMMENT);
+                if i < len { out[i] = FG_DIM; i += 1; }
+            }
+            continue;
+        }
+        // Link: [text](url)
+        if chars[i] == '[' {
+            let start = i;
+            i += 1;
+            while i < len && chars[i] != ']' { i += 1; }
+            fill_range!(start, i + 1, HL_FUNC);
+            i = (i + 1).min(len);
+            if i < len && chars[i] == '(' {
+                let url_open = i;
+                i += 1;
+                while i < len && chars[i] != ')' { i += 1; }
+                out[url_open] = FG_DIM;
+                fill_range!(url_open + 1, i, HL_COMMENT);
+                if i < len { out[i] = FG_DIM; i += 1; }
+            }
+            continue;
+        }
+        // Bold+italic: ***text*** or ___text___
+        if i + 2 < len && ((chars[i] == '*' && chars[i+1] == '*' && chars[i+2] == '*')
+                        || (chars[i] == '_' && chars[i+1] == '_' && chars[i+2] == '_'))
+        {
+            let delim = chars[i];
+            let start = i;
+            i += 3;
+            while i + 2 < len && !(chars[i] == delim && chars[i+1] == delim && chars[i+2] == delim) { i += 1; }
+            let end = (i + 3).min(len);
+            fill_range!(start, end, HL_FUNC);
+            i = end;
+            continue;
+        }
+        // Bold: **text** or __text__
+        if i + 1 < len && ((chars[i] == '*' && chars[i+1] == '*') || (chars[i] == '_' && chars[i+1] == '_')) {
+            let delim = chars[i];
+            let start = i;
+            i += 2;
+            while i + 1 < len && !(chars[i] == delim && chars[i+1] == delim) { i += 1; }
+            let end = (i + 2).min(len);
+            fill_range!(start, end, HL_TYPE);
+            i = end;
+            continue;
+        }
+        // Italic: *text* (guard: preceded by whitespace or line start)
+        if chars[i] == '*' && i + 1 < len && chars[i+1] != '*' && chars[i+1] != ' '
+            && (i == 0 || chars[i-1].is_whitespace())
+        {
+            let start = i;
+            i += 1;
+            while i < len && chars[i] != '*' { i += 1; }
+            let end = (i + 1).min(len);
+            fill_range!(start, end, HL_STRING);
+            i = end;
+            continue;
+        }
+        // Italic: _text_ (guard: preceded by whitespace or line start, not inside word)
+        if chars[i] == '_' && i + 1 < len && chars[i+1] != '_' && chars[i+1] != ' '
+            && (i == 0 || chars[i-1].is_whitespace())
+        {
+            let start = i;
+            i += 1;
+            while i < len && chars[i] != '_' { i += 1; }
+            let end = (i + 1).min(len);
+            fill_range!(start, end, HL_STRING);
+            i = end;
+            continue;
+        }
+        i += 1;
+    }
+
+    (out, MlState::Normal, bracket_depth)
+}
+
+fn render_markdown_to_lines(text: &ropey::Rope) -> Vec<(String, Vec<u32>)> {
+    let mut state = MlState::Normal;
+    (0..text.len_lines()).map(|li| {
+        let chars: Vec<char> = text.line(li)
+            .chars().take_while(|&c| c != '\n' && c != '\r').collect();
+        let line_str: String = chars.iter().collect();
+        let (colors, ns, _) = highlight_markdown_line(&chars, state, false, 0);
+        state = ns;
+        (line_str, colors)
+    }).collect()
+}
+
 fn highlight_line(chars: &[char], lang: Lang, mut state: MlState, rainbow: bool, mut bracket_depth: i32) -> (Vec<u32>, MlState, i32) {
     if matches!(lang, Lang::Json | Lang::Jsonc) {
         return highlight_json_line(chars, lang == Lang::Jsonc, state, rainbow, bracket_depth);
+    }
+    if lang == Lang::Markdown {
+        return highlight_markdown_line(chars, state, rainbow, bracket_depth);
     }
     let len = chars.len();
     let mut out = vec![FG; len];
@@ -2135,6 +2424,10 @@ fn highlight_line(chars: &[char], lang: Lang, mut state: MlState, rainbow: bool,
                     out[i] = HL_STRING;
                     i += 1;
                 }
+            }
+            MlState::CodeFence => {
+                // CodeFence is only used by highlight_markdown_line; treat as normal here
+                state = MlState::Normal;
             }
             MlState::Normal => {
                 let py_comment = lang == Lang::Python && chars[i] == '#';
@@ -2832,6 +3125,32 @@ fn execute_command(s: &mut State, action: CommandAction) {
             s.pane_tree = insert_pane(old, active, new_id, DropZone::Bottom);
             s.active_pane = new_id;
         }
+        CommandAction::SplitLeft      => {
+            let active = s.active_pane;
+            let new_id = s.next_pane_id; s.next_pane_id += 1;
+            let bid    = s.next_buf_id;  s.next_buf_id += 1;
+            let mut p  = Pane::new(new_id, bid);
+            p.tabs[0].text = s.tab().text.clone();
+            p.tabs[0].path = s.tab().path.clone();
+            p.tabs[0].buf_id = s.tab().buf_id;
+            s.panes.insert(new_id, p);
+            let old = std::mem::replace(&mut s.pane_tree, PaneTree::Leaf(0));
+            s.pane_tree = insert_pane(old, active, new_id, DropZone::Left);
+            s.active_pane = new_id;
+        }
+        CommandAction::SplitUp        => {
+            let active = s.active_pane;
+            let new_id = s.next_pane_id; s.next_pane_id += 1;
+            let bid    = s.next_buf_id;  s.next_buf_id += 1;
+            let mut p  = Pane::new(new_id, bid);
+            p.tabs[0].text = s.tab().text.clone();
+            p.tabs[0].path = s.tab().path.clone();
+            p.tabs[0].buf_id = s.tab().buf_id;
+            s.panes.insert(new_id, p);
+            let old = std::mem::replace(&mut s.pane_tree, PaneTree::Leaf(0));
+            s.pane_tree = insert_pane(old, active, new_id, DropZone::Top);
+            s.active_pane = new_id;
+        }
         CommandAction::ToggleFind     => { s.find_mut().open = !s.find().open; }
         CommandAction::ToggleReplace  => {
             let open = s.find().open;
@@ -2844,6 +3163,11 @@ fn execute_command(s: &mut State, action: CommandAction) {
                 s.explorer = Some(FileExplorer::new(root));
             } else {
                 s.explorer = None;
+            }
+        }
+        CommandAction::ToggleSidebar => {
+            if s.explorer.is_some() {
+                s.left_panel_visible = !s.left_panel_visible;
             }
         }
         CommandAction::IncreaseFontSize => {
@@ -2946,6 +3270,7 @@ fn execute_command(s: &mut State, action: CommandAction) {
                 }
             }
         }
+        CommandAction::OpenMarkdownPreview => open_markdown_preview(s),
     }
 }
 
@@ -2994,6 +3319,44 @@ fn glob_match_impl(pat: &[char], txt: &[char]) -> bool {
         return glob_match_impl(&pat[1..], &txt[1..]);
     }
     false
+}
+
+fn refresh_git_status(proxy: winit::event_loop::EventLoopProxy<UserEvent>, root: PathBuf) {
+    std::thread::spawn(move || {
+        let out = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&root)
+            .output();
+        let (staged, unstaged, is_git_repo) = match out {
+            Err(_) => (vec![], vec![], false),
+            Ok(o) if o.status.code() == Some(128) => (vec![], vec![], false),
+            Ok(o) => {
+                let text = String::from_utf8_lossy(&o.stdout).into_owned();
+                let mut staged   = vec![];
+                let mut unstaged = vec![];
+                for line in text.lines() {
+                    if line.len() < 4 { continue; }
+                    let mut chars = line.chars();
+                    let x = chars.next().unwrap_or(' ');
+                    let y = chars.next().unwrap_or(' ');
+                    let path_part = &line[3..];
+                    let path = if (x == 'R' || y == 'R') && path_part.contains(" -> ") {
+                        path_part.split(" -> ").last().unwrap_or(path_part).to_owned()
+                    } else {
+                        path_part.to_owned()
+                    };
+                    if x != ' ' && x != '?' {
+                        staged.push(GitEntry { xy: (x, y), path: path.clone() });
+                    }
+                    if (y != ' ' && y != '?') || (x == '?' && y == '?') {
+                        unstaged.push(GitEntry { xy: (x, y), path });
+                    }
+                }
+                (staged, unstaged, true)
+            }
+        };
+        let _ = proxy.send_event(UserEvent::GitStatusResult { staged, unstaged, is_git_repo });
+    });
 }
 
 fn global_search(root: &std::path::Path, query: &str, include: &str, exclude: &str, case_sensitive: bool) -> Vec<GlobalFindResult> {
@@ -3185,7 +3548,8 @@ impl ApplicationHandler<UserEvent> for App {
             drag_pending: None,
             resize_drag:  None,
             term_panes:  HashMap::new(),
-            lsp_panes:     HashMap::new(),
+            lsp_panes:   HashMap::new(),
+            md_panes:    HashMap::new(),
             lsp:           lsp::LspManager::new(),
             diagnostics:   HashMap::new(),
             lsp_installed: HashMap::new(),
@@ -3222,7 +3586,8 @@ impl ApplicationHandler<UserEvent> for App {
             cursor_back: Vec::new(),
             cursor_fwd:  Vec::new(),
 
-            left_view:      LeftView::FileTree,
+            left_view:          LeftView::FileTree,
+            left_panel_visible: true,
             diag_panel_sel: 0,
             context_menu: None,
             quick_finder: QuickFinder {
@@ -3239,6 +3604,8 @@ impl ApplicationHandler<UserEvent> for App {
                 cursor_query: 0, cursor_replace: 0, cursor_include: 0, cursor_exclude: 0,
                 sel_anchor_q: None, sel_anchor_r: None, sel_anchor_inc: None, sel_anchor_exc: None,
             },
+            git_panel: GitPanel::new(),
+            scroll_frac_y: 0.0,
             status_msg: startup_status,
         };
 
@@ -3362,27 +3729,39 @@ impl ApplicationHandler<UserEvent> for App {
                 }
 
                 // Cursor icon: border hover → resize, editor area → text, else default
-                let area = s.pane_area();
-                let on_border = mx >= area.x && my >= area.y && my < area.y + area.h
-                    && find_border_at(&s.pane_tree, area, mx, my).is_some();
-                if on_border {
-                    let axis = find_border_at(&s.pane_tree, area, mx, my).unwrap().1;
-                    s.win.set_cursor(if axis == Axis::H { CursorIcon::EwResize } else { CursorIcon::NsResize });
+                let act_w_c = s.activity_bar_w();
+                let ew_c = s.explorer_w();
+                // Wide hit zone: 8px inside panel + 4px outside, so the cursor change
+                // is clearly visible when approaching the border from either side.
+                let near_explorer_border = s.explorer.is_some() && ew_c > 0
+                    && mx >= act_w_c + ew_c - 8
+                    && mx <= act_w_c + ew_c + 4
+                    && my < s.h as i32 - s.status_h();
+                if near_explorer_border {
+                    s.win.set_cursor(CursorIcon::EwResize);
                 } else {
-                    let r     = s.active_pane_rect();
-                    let fh    = s.find_h();
-                    let in_ed = my >= r.y + s.tab_h() && my < r.y + r.h - fh && mx >= r.x;
-                    let cmd   = s.mods.super_key();
-                    // When Cmd is held and mouse is in the editor content area, use pointer cursor
-                    // to signal that Cmd+Click will navigate (goto definition)
-                    let cursor = if !in_ed {
-                        CursorIcon::Default
-                    } else if cmd {
-                        CursorIcon::Pointer
+                    let area = s.pane_area();
+                    let on_border = mx >= area.x && my >= area.y && my < area.y + area.h
+                        && find_border_at(&s.pane_tree, area, mx, my).is_some();
+                    if on_border {
+                        let axis = find_border_at(&s.pane_tree, area, mx, my).unwrap().1;
+                        s.win.set_cursor(if axis == Axis::H { CursorIcon::EwResize } else { CursorIcon::NsResize });
                     } else {
-                        CursorIcon::Text
-                    };
-                    s.win.set_cursor(cursor);
+                        let r     = s.active_pane_rect();
+                        let fh    = s.find_h();
+                        let in_ed = my >= r.y + s.tab_h() && my < r.y + r.h - fh && mx >= r.x;
+                        let cmd   = s.mods.super_key();
+                        // When Cmd is held and mouse is in the editor content area, use pointer cursor
+                        // to signal that Cmd+Click will navigate (goto definition)
+                        let cursor = if !in_ed {
+                            CursorIcon::Default
+                        } else if cmd {
+                            CursorIcon::Pointer
+                        } else {
+                            CursorIcon::Text
+                        };
+                        s.win.set_cursor(cursor);
+                    }
                 }
                 if s.mouse_down && s.panes.contains_key(&s.active_pane) {
                     let pos = s.xy_to_char(mx, my);
@@ -3521,29 +3900,83 @@ impl ApplicationHandler<UserEvent> for App {
                 let mx = s.mouse_x as i32;
                 let my = s.mouse_y as i32;
                 s.context_menu = None;
-                // Only show editor context menu when clicking in editor content area
                 let area = s.pane_area();
-                if let Some(pid) = pane_at_pos(&s.pane_tree, mx, my, area) {
-                    if s.panes.get(&pid).map_or(false, |p| p.kind == PaneKind::Editor) {
-                        s.active_pane = pid;
-                        let lang = s.tab().path.as_deref().map(Lang::from_path).unwrap_or(Lang::None);
-                        let lsp_avail = lang != Lang::None && s.lsp.has_server_for(lang)
-                            && s.lsp.server_for_lang_mut(lang).map_or(false, |srv| srv.initialized);
-                        let has_sel = s.tab().cursors.iter().any(|c| c.has_sel());
-                        s.context_menu = Some(ContextMenu {
-                            x: mx, y: my,
-                            hovered: 0,
-                            items: vec![
-                                ContextMenuItem { label: "Go to Definition",   shortcut: "Cmd+Click / F12",   action: CtxAction::GotoDefinition,  enabled: lsp_avail },
-                                ContextMenuItem { label: "Find All References", shortcut: "Cmd+Shift+F12",   action: CtxAction::FindReferences,   enabled: lsp_avail },
-                                ContextMenuItem { label: "Format Document",    shortcut: "Opt+Shift+F",       action: CtxAction::FormatDocument,  enabled: lsp_avail },
-                                ContextMenuItem { label: "Organize Imports",   shortcut: "Opt+Shift+O",       action: CtxAction::OrganizeImports, enabled: lsp_avail },
-                                ContextMenuItem { label: "",                   shortcut: "",                  action: CtxAction::Separator,        enabled: true },
-                                ContextMenuItem { label: "Copy",               shortcut: "Cmd+C",             action: CtxAction::Copy,            enabled: has_sel },
-                                ContextMenuItem { label: "Cut",                shortcut: "Cmd+X",             action: CtxAction::Cut,             enabled: has_sel },
-                                ContextMenuItem { label: "Paste",              shortcut: "Cmd+V",             action: CtxAction::Paste,           enabled: true },
-                            ],
-                        });
+                let tab_h = s.tab_h();
+                let cw = s.glyphs.cw;
+                let layout = layout_tree(&s.pane_tree, area);
+
+                // Check if click lands in a tab bar — collect hit info without long borrow
+                struct TabHit { pid: usize, ti: usize, has_path: bool, is_md: bool }
+                let tab_hit: Option<TabHit> = 'find: {
+                    for &(pid, rect) in &layout {
+                        if !(my >= rect.y && my < rect.y + tab_h) { continue; }
+                        let pane = match s.panes.get(&pid) {
+                            Some(p) if p.kind == PaneKind::Editor => p,
+                            _ => continue,
+                        };
+                        let mut tx = rect.x;
+                        for (ti, tab) in pane.tabs.iter().enumerate() {
+                            let label_chars = tab.display_name().chars().count() + if tab.dirty { 4 } else { 3 };
+                            let tw = label_chars as i32 * cw + 1;
+                            if mx >= tx && mx < tx + tw {
+                                let has_path = tab.path.is_some();
+                                let is_md = tab.path.as_deref()
+                                    .map(|p| matches!(p.extension().and_then(|e| e.to_str()), Some("md" | "markdown")))
+                                    .unwrap_or(false);
+                                break 'find Some(TabHit { pid, ti, has_path, is_md });
+                            }
+                            tx += tw;
+                        }
+                    }
+                    None
+                };
+
+                if let Some(hit) = tab_hit {
+                    s.active_pane = hit.pid;
+                    let mut items: Vec<ContextMenuItem> = vec![];
+                    if hit.has_path {
+                        items.push(ContextMenuItem { label: "Copy Relative Path", shortcut: "",            action: CtxAction::TabCopyRelPath,  enabled: true });
+                        items.push(ContextMenuItem { label: "Copy Full Path",     shortcut: "",            action: CtxAction::TabCopyFullPath, enabled: true });
+                        items.push(ContextMenuItem { label: "",                   shortcut: "",            action: CtxAction::Separator,       enabled: true });
+                    }
+                    if hit.is_md {
+                        items.push(ContextMenuItem { label: "Open Preview",       shortcut: "Cmd+Shift+M", action: CtxAction::TabOpenPreview,  enabled: true });
+                        items.push(ContextMenuItem { label: "",                   shortcut: "",            action: CtxAction::Separator,       enabled: true });
+                    }
+                    items.push(ContextMenuItem { label: "Split Right", shortcut: "", action: CtxAction::TabSplitRight, enabled: true });
+                    items.push(ContextMenuItem { label: "Split Down",  shortcut: "", action: CtxAction::TabSplitDown,  enabled: true });
+                    items.push(ContextMenuItem { label: "Split Left",  shortcut: "", action: CtxAction::TabSplitLeft,  enabled: true });
+                    items.push(ContextMenuItem { label: "Split Up",    shortcut: "", action: CtxAction::TabSplitUp,    enabled: true });
+                    items.push(ContextMenuItem { label: "",            shortcut: "", action: CtxAction::Separator,     enabled: true });
+                    items.push(ContextMenuItem { label: "Close",       shortcut: "Cmd+W", action: CtxAction::TabClose, enabled: true });
+                    s.context_menu = Some(ContextMenu {
+                        x: mx, y: my, hovered: 0, tab_source: Some((hit.pid, hit.ti)), items,
+                    });
+                } else {
+                    // Editor text-area context menu
+                    if let Some(pid) = pane_at_pos(&s.pane_tree, mx, my, area) {
+                        if s.panes.get(&pid).map_or(false, |p| p.kind == PaneKind::Editor) {
+                            s.active_pane = pid;
+                            let lang = s.tab().path.as_deref().map(Lang::from_path).unwrap_or(Lang::None);
+                            let lsp_avail = lang != Lang::None && s.lsp.has_server_for(lang)
+                                && s.lsp.server_for_lang_mut(lang).map_or(false, |srv| srv.initialized);
+                            let has_sel = s.tab().cursors.iter().any(|c| c.has_sel());
+                            s.context_menu = Some(ContextMenu {
+                                x: mx, y: my,
+                                hovered: 0,
+                                tab_source: None,
+                                items: vec![
+                                    ContextMenuItem { label: "Go to Definition",   shortcut: "Cmd+Click / F12",   action: CtxAction::GotoDefinition,  enabled: lsp_avail },
+                                    ContextMenuItem { label: "Find All References", shortcut: "Cmd+Shift+F12",    action: CtxAction::FindReferences,   enabled: lsp_avail },
+                                    ContextMenuItem { label: "Format Document",    shortcut: "Opt+Shift+F",       action: CtxAction::FormatDocument,  enabled: lsp_avail },
+                                    ContextMenuItem { label: "Organize Imports",   shortcut: "Opt+Shift+O",       action: CtxAction::OrganizeImports, enabled: lsp_avail },
+                                    ContextMenuItem { label: "",                   shortcut: "",                  action: CtxAction::Separator,       enabled: true },
+                                    ContextMenuItem { label: "Copy",               shortcut: "Cmd+C",             action: CtxAction::Copy,            enabled: has_sel },
+                                    ContextMenuItem { label: "Cut",                shortcut: "Cmd+X",             action: CtxAction::Cut,             enabled: has_sel },
+                                    ContextMenuItem { label: "Paste",              shortcut: "Cmd+V",             action: CtxAction::Paste,           enabled: true },
+                                ],
+                            });
+                        }
                     }
                 }
                 { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
@@ -3613,10 +4046,11 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                             iy += ih;
                         }
+                        let tab_source = cm.tab_source;
                         s.context_menu = None;
                         if let Some(action) = action_taken {
                             match action {
-                                CtxAction::OpenSettings   => open_settings_tab(s),
+                                CtxAction::OpenSettings    => open_settings_tab(s),
                                 CtxAction::GotoDefinition  => execute_command(s, CommandAction::GotoDefinition),
                                 CtxAction::FindReferences  => execute_command(s, CommandAction::FindReferences),
                                 CtxAction::FormatDocument  => execute_command(s, CommandAction::FormatDocument),
@@ -3624,6 +4058,64 @@ impl ApplicationHandler<UserEvent> for App {
                                 CtxAction::Copy  => { execute_command(s, CommandAction::Copy); }
                                 CtxAction::Cut   => { execute_command(s, CommandAction::Cut); }
                                 CtxAction::Paste => { execute_command(s, CommandAction::Paste); }
+                                CtxAction::TabCopyRelPath => {
+                                    if let Some((pid, ti)) = tab_source {
+                                        let path = s.panes.get(&pid)
+                                            .and_then(|p| p.tabs.get(ti))
+                                            .and_then(|t| t.path.clone());
+                                        if let Some(path) = path {
+                                            let rel = std::env::current_dir().ok()
+                                                .and_then(|cwd| path.strip_prefix(&cwd).ok().map(|p| p.to_path_buf()))
+                                                .unwrap_or(path);
+                                            clipboard_set(&rel.to_string_lossy());
+                                        }
+                                    }
+                                }
+                                CtxAction::TabCopyFullPath => {
+                                    if let Some((pid, ti)) = tab_source {
+                                        let path = s.panes.get(&pid)
+                                            .and_then(|p| p.tabs.get(ti))
+                                            .and_then(|t| t.path.as_deref().map(|p| p.to_string_lossy().into_owned()));
+                                        if let Some(path) = path { clipboard_set(&path); }
+                                    }
+                                }
+                                CtxAction::TabOpenPreview => {
+                                    if let Some((pid, _)) = tab_source {
+                                        s.active_pane = pid;
+                                        open_markdown_preview(s);
+                                    }
+                                }
+                                CtxAction::TabSplitRight => {
+                                    if let Some((pid, _)) = tab_source { s.active_pane = pid; execute_command(s, CommandAction::SplitRight); }
+                                }
+                                CtxAction::TabSplitDown => {
+                                    if let Some((pid, _)) = tab_source { s.active_pane = pid; execute_command(s, CommandAction::SplitDown); }
+                                }
+                                CtxAction::TabSplitLeft => {
+                                    if let Some((pid, _)) = tab_source { s.active_pane = pid; execute_command(s, CommandAction::SplitLeft); }
+                                }
+                                CtxAction::TabSplitUp => {
+                                    if let Some((pid, _)) = tab_source { s.active_pane = pid; execute_command(s, CommandAction::SplitUp); }
+                                }
+                                CtxAction::TabClose => {
+                                    if let Some((pid, ti)) = tab_source {
+                                        s.active_pane = pid;
+                                        if s.panes.get(&pid).map_or(0, |p| p.tabs.len()) > 1 {
+                                            let pane = s.panes.get_mut(&pid).unwrap();
+                                            pane.tabs.remove(ti);
+                                            if pane.active >= pane.tabs.len() { pane.active = pane.tabs.len() - 1; }
+                                        } else if s.panes.len() > 1 {
+                                            s.md_panes.remove(&pid);
+                                            s.panes.remove(&pid);
+                                            let old_tree = std::mem::replace(&mut s.pane_tree, PaneTree::Leaf(0));
+                                            if let Some(t) = remove_pane_from_tree(old_tree, pid) { s.pane_tree = t; }
+                                            s.active_pane = layout_tree(&s.pane_tree, s.pane_area()).first().map(|(id, _)| *id).unwrap_or(0);
+                                        } else {
+                                            s.panes.clear();
+                                            el.exit();
+                                        }
+                                    }
+                                }
                                 CtxAction::Separator => {}
                             }
                         }
@@ -3642,14 +4134,37 @@ impl ApplicationHandler<UserEvent> for App {
                     let file_icon_y = 8;
                     let srch_icon_y = file_icon_y + lh + 4;
                     let diag_icon_y = srch_icon_y + lh + 4;
+                    let git_icon_y  = diag_icon_y + lh + 4;
                     let gear_y      = s.h as i32 - s.status_h() - lh - 8;
-                    if my >= file_icon_y && my < file_icon_y + lh {
-                        s.left_view = LeftView::FileTree;
+                    let clicked_view = if my >= file_icon_y && my < file_icon_y + lh {
+                        Some(LeftView::FileTree)
                     } else if my >= srch_icon_y && my < srch_icon_y + lh {
-                        s.left_view = LeftView::GlobalSearch;
-                        s.global_find.focus = GlobalFindFocus::Query;
+                        Some(LeftView::GlobalSearch)
                     } else if my >= diag_icon_y && my < diag_icon_y + lh {
-                        s.left_view = LeftView::Diagnostics;
+                        Some(LeftView::Diagnostics)
+                    } else if my >= git_icon_y && my < git_icon_y + lh {
+                        Some(LeftView::Git)
+                    } else {
+                        None
+                    };
+                    if let Some(view) = clicked_view {
+                        if s.left_panel_visible && s.left_view == view {
+                            s.left_panel_visible = false;
+                        } else {
+                            s.left_view = view;
+                            s.left_panel_visible = true;
+                            if view == LeftView::GlobalSearch {
+                                s.global_find.focus = GlobalFindFocus::Query;
+                            }
+                            if view == LeftView::Git {
+                                let root = s.explorer.as_ref().map(|e| e.root.clone())
+                                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                                s.git_panel.loading = true;
+                                refresh_git_status(s.proxy.clone(), root);
+                            } else {
+                                s.git_panel.commit_focused = false;
+                            }
+                        }
                     } else if my >= gear_y && my < gear_y + lh {
                         if s.context_menu.is_some() {
                             s.context_menu = None;
@@ -3658,6 +4173,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 x: act_w, y: gear_y,
                                 items: vec![ContextMenuItem { label: "Open Settings", shortcut: "", action: CtxAction::OpenSettings, enabled: true }],
                                 hovered: 0,
+                                tab_source: None,
                             });
                         }
                     }
@@ -3765,6 +4281,94 @@ impl ApplicationHandler<UserEvent> for App {
                                 s.tab_mut().cursors = vec![Cursor::new(pos)];
                                 s.ensure_visible();
                             }
+                        }
+                    } else if s.left_view == LeftView::Git {
+                        // Git panel click
+                        let panel_h = s.h as i32 - s.status_h();
+                        let staged_header_y  = 4;
+                        let staged_start_y   = staged_header_y + lh;
+                        let staged_count     = s.git_panel.staged.len();
+                        let staged_rows      = staged_count.max(1);  // includes "(none)"
+                        let changes_header_y = staged_start_y + staged_rows as i32 * lh + 2;
+                        let unstaged_start_y = changes_header_y + lh;
+                        let commit_area_top  = panel_h - lh * 3 - 8;
+                        let commit_field_y   = commit_area_top + 4 + lh;
+                        let commit_btn_y     = commit_field_y + lh + 2;
+                        let cw_g = s.glyphs.cw;
+
+                        if my >= staged_start_y && my < staged_start_y + staged_count as i32 * lh && staged_count > 0 {
+                            let i = ((my - staged_start_y) / lh) as usize;
+                            if i < staged_count {
+                                s.git_panel.sel = GitSel::Staged(i);
+                                let path = s.git_panel.staged[i].path.clone();
+                                let root = s.explorer.as_ref().map(|e| e.root.clone())
+                                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                                let proxy = s.proxy.clone();
+                                std::thread::spawn(move || {
+                                    let _ = std::process::Command::new("git")
+                                        .args(["restore", "--staged", "--", &path])
+                                        .current_dir(&root)
+                                        .status();
+                                    let _ = proxy.send_event(UserEvent::GitOpDone);
+                                });
+                            }
+                        } else if my >= unstaged_start_y && my < commit_area_top {
+                            let unstaged_count = s.git_panel.unstaged.len();
+                            let i = ((my - unstaged_start_y) / lh) as usize;
+                            if i < unstaged_count {
+                                s.git_panel.sel = GitSel::Unstaged(i);
+                                let path = s.git_panel.unstaged[i].path.clone();
+                                let root = s.explorer.as_ref().map(|e| e.root.clone())
+                                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                                let proxy = s.proxy.clone();
+                                std::thread::spawn(move || {
+                                    let _ = std::process::Command::new("git")
+                                        .args(["add", "--", &path])
+                                        .current_dir(&root)
+                                        .status();
+                                    let _ = proxy.send_event(UserEvent::GitOpDone);
+                                });
+                            }
+                        } else if my >= commit_field_y && my < commit_field_y + lh {
+                            s.git_panel.commit_focused = true;
+                            let commit_msg = s.git_panel.commit_msg.clone();
+                            let field_x = act_w + 4;
+                            let vis = ((explorer_w - 8) / cw_g).max(0) as usize;
+                            let cur_chars = commit_msg[..s.git_panel.commit_cursor].chars().count();
+                            let new_byte = field_click_to_byte(&commit_msg, mx, field_x, cw_g, cur_chars, vis);
+                            s.git_panel.commit_cursor = new_byte;
+                        } else if my >= commit_btn_y && my < commit_btn_y + lh {
+                            let can_commit = !s.git_panel.staged.is_empty() && !s.git_panel.commit_msg.is_empty();
+                            let has_unstaged = !s.git_panel.unstaged.is_empty();
+                            if mx < act_w + explorer_w / 2 && can_commit {
+                                let msg = s.git_panel.commit_msg.clone();
+                                let root = s.explorer.as_ref().map(|e| e.root.clone())
+                                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                                let proxy = s.proxy.clone();
+                                s.git_panel.commit_msg.clear();
+                                s.git_panel.commit_cursor = 0;
+                                s.git_panel.commit_focused = false;
+                                std::thread::spawn(move || {
+                                    let _ = std::process::Command::new("git")
+                                        .args(["commit", "-m", &msg])
+                                        .current_dir(&root)
+                                        .status();
+                                    let _ = proxy.send_event(UserEvent::GitOpDone);
+                                });
+                            } else if mx >= act_w + explorer_w / 2 && has_unstaged {
+                                let root = s.explorer.as_ref().map(|e| e.root.clone())
+                                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                                let proxy = s.proxy.clone();
+                                std::thread::spawn(move || {
+                                    let _ = std::process::Command::new("git")
+                                        .args(["add", "."])
+                                        .current_dir(&root)
+                                        .status();
+                                    let _ = proxy.send_event(UserEvent::GitOpDone);
+                                });
+                            }
+                        } else {
+                            s.git_panel.commit_focused = false;
                         }
                     } else {
                         // Global search panel click — determine which field was clicked
@@ -4328,9 +4932,13 @@ impl ApplicationHandler<UserEvent> for App {
                 let (dx, dy) = match delta {
                     MouseScrollDelta::LineDelta(x, y) => (-x as i32, -y as i32),
                     MouseScrollDelta::PixelDelta(p)   => {
-                        let cw = s.glyphs.cw;
-                        let lh = s.glyphs.lh;
-                        (-(p.x as i32) / cw, -(p.y as i32) / lh)
+                        let lh = s.glyphs.lh as f64;
+                        let cw = s.glyphs.cw as f64;
+                        s.scroll_frac_y -= p.y;
+                        let dy_int = (s.scroll_frac_y / lh).trunc() as i32;
+                        s.scroll_frac_y -= dy_int as f64 * lh;
+                        let dx_int = -(p.x / cw).trunc() as i32;
+                        (dx_int, dy_int)
                     }
                 };
                 // Scroll global find results when hovering over the left panel
@@ -4415,6 +5023,24 @@ impl ApplicationHandler<UserEvent> for App {
                             { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                         }
                     }
+                    PaneKind::MarkdownPreview => {
+                        if dy != 0 {
+                            let source_buf_id = s.md_panes[&s.active_pane].source_buf_id;
+                            let total = s.panes.values()
+                                .find_map(|p| p.tabs.iter()
+                                    .find(|t| t.buf_id == source_buf_id)
+                                    .map(|t| t.text.len_lines()))
+                                .unwrap_or(1);
+                            let mp = s.md_panes.get_mut(&s.active_pane).unwrap();
+                            let max_scroll = total.saturating_sub(1);
+                            if dy < 0 {
+                                mp.scroll = (mp.scroll + (-dy) as usize).min(max_scroll);
+                            } else {
+                                mp.scroll = mp.scroll.saturating_sub(dy as usize);
+                            }
+                            { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                        }
+                    }
                     PaneKind::Editor => {
                         let is_settings = s.panes.get(&s.active_pane)
                             .and_then(|p| p.tabs.get(p.active))
@@ -4483,6 +5109,22 @@ impl ApplicationHandler<UserEvent> for App {
                     s.quick_finder.query  = ">".to_string();
                     s.quick_finder.cursor = 1;
                     refilter_quick_finder(s);
+                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                    return;
+                }
+
+                // Cmd+B — toggle left panel visibility
+                if cmd && !shift && matches!(&event.logical_key, Key::Character(c) if matches!(c.as_str(), "b" | "B")) {
+                    if s.explorer.is_some() {
+                        s.left_panel_visible = !s.left_panel_visible;
+                        { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                        return;
+                    }
+                }
+
+                // Cmd+Shift+M — open/toggle markdown preview
+                if cmd && shift && matches!(&event.logical_key, Key::Character(c) if matches!(c.as_str(), "m" | "M")) {
+                    open_markdown_preview(s);
                     { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                     return;
                 }
@@ -4615,6 +5257,51 @@ impl ApplicationHandler<UserEvent> for App {
                 if s.context_menu.is_some() {
                     if matches!(&event.logical_key, Key::Named(NamedKey::Escape)) {
                         s.context_menu = None;
+                    }
+                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                    return;
+                }
+
+                // Git panel commit field input routing
+                if s.explorer.is_some() && s.left_view == LeftView::Git && s.git_panel.commit_focused {
+                    match &event.logical_key {
+                        Key::Named(NamedKey::Escape) => {
+                            s.git_panel.commit_focused = false;
+                        }
+                        Key::Named(NamedKey::Enter) => {
+                            let can_commit = !s.git_panel.staged.is_empty()
+                                && !s.git_panel.commit_msg.is_empty();
+                            if can_commit {
+                                let msg = s.git_panel.commit_msg.clone();
+                                let root = s.explorer.as_ref().map(|e| e.root.clone())
+                                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                                let proxy = s.proxy.clone();
+                                s.git_panel.commit_msg.clear();
+                                s.git_panel.commit_cursor = 0;
+                                s.git_panel.commit_focused = false;
+                                std::thread::spawn(move || {
+                                    let _ = std::process::Command::new("git")
+                                        .args(["commit", "-m", &msg])
+                                        .current_dir(&root)
+                                        .status();
+                                    let _ = proxy.send_event(UserEvent::GitOpDone);
+                                });
+                            }
+                        }
+                        key => {
+                            if let Key::Character(c) = key {
+                                if !cmd && !ctrl {
+                                    for ch in c.chars() { s.glyphs.load(ch); }
+                                }
+                            }
+                            let mut sel: Option<usize> = None;
+                            input_field_edit(
+                                &mut s.git_panel.commit_msg,
+                                &mut s.git_panel.commit_cursor,
+                                &mut sel,
+                                key, cmd, alt, ctrl, shift,
+                            );
+                        }
                     }
                     { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                     return;
@@ -4945,6 +5632,28 @@ impl ApplicationHandler<UserEvent> for App {
                                 if tp.pty_fd >= 0 { let _ = unsafe { libc::write(tp.pty_fd, bytes.as_ptr().cast(), bytes.len()) }; }
                             }
                         }
+                    }
+                    return;
+                }
+
+                // MarkdownPreview pane: Cmd+W closes it, all other input ignored
+                if s.panes.get(&s.active_pane).map_or(false, |p| p.kind == PaneKind::MarkdownPreview) {
+                    if cmd && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "w") {
+                        let pane_id = s.active_pane;
+                        s.md_panes.remove(&pane_id);
+                        s.panes.remove(&pane_id);
+                        if s.panes.is_empty() {
+                            s.pane_tree  = PaneTree::Leaf(0);
+                            s.active_pane = 0;
+                            el.exit();
+                            return;
+                        }
+                        let old_tree = std::mem::replace(&mut s.pane_tree, PaneTree::Leaf(0));
+                        if let Some(t) = remove_pane_from_tree(old_tree, pane_id) { s.pane_tree = t; }
+                        let new_active = layout_tree(&s.pane_tree, s.pane_area())
+                            .first().map(|(id, _)| *id).unwrap_or(0);
+                        s.active_pane = new_active;
+                        { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                     }
                     return;
                 }
@@ -5459,6 +6168,26 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     }
                 }
+                if s.left_view == LeftView::Git && s.left_panel_visible {
+                    let root = s.explorer.as_ref().map(|e| e.root.clone())
+                        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                    s.git_panel.loading = true;
+                    refresh_git_status(s.proxy.clone(), root);
+                }
+                s.needs_redraw = true;
+            }
+            UserEvent::GitStatusResult { staged, unstaged, is_git_repo } => {
+                s.git_panel.staged      = staged;
+                s.git_panel.unstaged    = unstaged;
+                s.git_panel.is_git_repo = is_git_repo;
+                s.git_panel.loading     = false;
+                s.needs_redraw = true;
+            }
+            UserEvent::GitOpDone => {
+                let root = s.explorer.as_ref().map(|e| e.root.clone())
+                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                s.git_panel.loading = true;
+                refresh_git_status(s.proxy.clone(), root);
                 s.needs_redraw = true;
             }
             UserEvent::Redraw => {}
@@ -5687,6 +6416,34 @@ fn render(s: &mut State) {
         })
     }).collect();
 
+    // Build markdown preview pane snapshots
+    struct MdPaneSnap {
+        rect:        Rect,
+        is_active:   bool,
+        lines:       Vec<(String, Vec<u32>)>,
+        title:       String,
+        total_lines: usize,
+        scroll:      usize,
+    }
+    let md_snaps: Vec<MdPaneSnap> = layout.iter().filter_map(|&(pid, rect)| {
+        let pane = s.panes.get(&pid)?;
+        if pane.kind != PaneKind::MarkdownPreview { return None; }
+        let mp = s.md_panes.get(&pid)?;
+        let source_text = s.panes.values()
+            .find_map(|p| p.tabs.iter()
+                .find(|t| t.buf_id == mp.source_buf_id)
+                .map(|t| t.text.clone()))?;
+        let all_lines = render_markdown_to_lines(&source_text);
+        let total_lines = all_lines.len();
+        let content_h = (rect.h - tab_h).max(0);
+        let vis = (content_h / lh).max(1) as usize;
+        let lines = all_lines.into_iter().skip(mp.scroll).take(vis).collect();
+        Some(MdPaneSnap {
+            rect, is_active: pid == active_pane_id,
+            lines, title: mp.title.clone(), total_lines, scroll: mp.scroll,
+        })
+    }).collect();
+
     let rainbow = s.settings.rainbow_brackets;
 
     // Pre-pass: update hl_cache and max_line_len for all visible editor panes (mutable pass)
@@ -5878,6 +6635,7 @@ fn render(s: &mut State) {
     let explorer_drag    = s.explorer_drag;
     let ui_scale         = s.font_size / FONT_PX;
     let left_view        = s.left_view;
+    let left_panel_visible = s.left_panel_visible;
     let act_w            = s.activity_bar_w();
     let status_msg       = s.status_msg.clone();
 
@@ -5991,6 +6749,31 @@ fn render(s: &mut State) {
             Some(items)
         } else { None };
 
+    // Git panel snapshot
+    struct GitSnap {
+        staged:         Vec<GitEntry>,
+        unstaged:       Vec<GitEntry>,
+        commit_msg:     String,
+        commit_cursor:  usize,
+        commit_focused: bool,
+        is_git_repo:    bool,
+        sel:            GitSel,
+        loading:        bool,
+    }
+    let git_snap: Option<GitSnap> = if s.explorer.is_some() && left_view == LeftView::Git && left_panel_visible {
+        let gp = &s.git_panel;
+        Some(GitSnap {
+            staged:         gp.staged.clone(),
+            unstaged:       gp.unstaged.clone(),
+            commit_msg:     gp.commit_msg.clone(),
+            commit_cursor:  gp.commit_cursor,
+            commit_focused: gp.commit_focused,
+            is_git_repo:    gp.is_git_repo,
+            sel:            gp.sel.clone(),
+            loading:        gp.loading,
+        })
+    } else { None };
+
     // Error count for activity bar badge
     let err_count: usize = s.diagnostics.values()
         .map(|v| v.iter().filter(|d| d.severity == DiagSeverity::Error).count())
@@ -6072,22 +6855,24 @@ fn render(s: &mut State) {
             let diag_icon_y = srch_icon_y + icon_size + 4;
             let gear_y      = panel_h - icon_size - 8;
 
+            let git_icon_y  = diag_icon_y + icon_size + 4;
+
             // File tree icon
-            let ft_active = left_view == LeftView::FileTree;
+            let ft_active = left_view == LeftView::FileTree && left_panel_visible;
             if ft_active { fill(buf, w, h, 0, file_icon_y, 2, icon_size, ACCENT); }
             let ft_bg = if ft_active { SEL_BG } else { BG };
             fill(buf, w, h, 2, file_icon_y, act_w - 3, icon_size, ft_bg);
             draw_str(buf, w, h, g, " [F]", 2, file_icon_y + asc, if ft_active { ACCENT } else { FG_DIM }, act_w - 1);
 
             // Search icon
-            let gs_active = left_view == LeftView::GlobalSearch;
+            let gs_active = left_view == LeftView::GlobalSearch && left_panel_visible;
             if gs_active { fill(buf, w, h, 0, srch_icon_y, 2, icon_size, ACCENT); }
             let gs_bg = if gs_active { SEL_BG } else { BG };
             fill(buf, w, h, 2, srch_icon_y, act_w - 3, icon_size, gs_bg);
             draw_str(buf, w, h, g, " [S]", 2, srch_icon_y + asc, if gs_active { ACCENT } else { FG_DIM }, act_w - 1);
 
             // Diagnostics icon
-            let dg_active = left_view == LeftView::Diagnostics;
+            let dg_active = left_view == LeftView::Diagnostics && left_panel_visible;
             if dg_active { fill(buf, w, h, 0, diag_icon_y, 2, icon_size, ACCENT); }
             let dg_bg = if dg_active { SEL_BG } else { BG };
             fill(buf, w, h, 2, diag_icon_y, act_w - 3, icon_size, dg_bg);
@@ -6099,12 +6884,20 @@ fn render(s: &mut State) {
             let dg_color = if err_count > 0 { 0xFF5555u32 } else if dg_active { ACCENT } else { FG_DIM };
             draw_str(buf, w, h, g, &dg_label, 2, diag_icon_y + asc, dg_color, act_w - 1);
 
+            // Git icon
+            let gt_active = left_view == LeftView::Git && left_panel_visible;
+            if gt_active { fill(buf, w, h, 0, git_icon_y, 2, icon_size, ACCENT); }
+            let gt_bg = if gt_active { SEL_BG } else { BG };
+            fill(buf, w, h, 2, git_icon_y, act_w - 3, icon_size, gt_bg);
+            draw_str(buf, w, h, g, " [G]", 2, git_icon_y + asc, if gt_active { ACCENT } else { FG_DIM }, act_w - 1);
+
             // Gear icon — centered, full-width
             fill(buf, w, h, 2, gear_y, act_w - 3, icon_size, SEL_BG);
             let gear_x = 2 + (act_w - 3 - cw) / 2;
             draw_str(buf, w, h, g, "⚙", gear_x, gear_y + asc, FG, act_w - 1);
 
-            // Left panel area (file tree or global search)
+            if left_panel_visible {
+            // Left panel area (file tree, global search, diagnostics, or git)
             let px = act_w; // panel x
             let pw = explorer_w; // panel width
             fill(buf, w, h, px, 0, pw, panel_h, BG2);
@@ -6285,7 +7078,93 @@ fn render(s: &mut State) {
                     draw_str(buf, w, h, g, &preview, px + 2 + hlen, ry + asc, FG_DIM, px + pw - 1);
                     ry += lh;
                 }
+            } else if let Some(ref gs) = git_snap {
+                // Git panel
+                let px = act_w;
+                let pw = explorer_w;
+                if !gs.is_git_repo {
+                    draw_str(buf, w, h, g, " Not a git repo", px + 2, asc + 4, FG_DIM, px + pw - 1);
+                } else if gs.loading {
+                    draw_str(buf, w, h, g, " Loading...", px + 2, asc + 4, FG_DIM, px + pw - 1);
+                } else {
+                    let mut ry = 4i32;
+                    // STAGED header
+                    draw_str(buf, w, h, g, " STAGED", px + 2, ry + asc, FG_DIM, px + pw - 1);
+                    fill(buf, w, h, px, ry + lh - 1, pw - 1, 1, BORDER);
+                    ry += lh;
+                    let staged_start_y = ry;
+                    if gs.staged.is_empty() {
+                        draw_str(buf, w, h, g, "  (none)", px + 2, ry + asc, FG_DIM, px + pw - 1);
+                        ry += lh;
+                    } else {
+                        for (i, entry) in gs.staged.iter().enumerate() {
+                            if ry + lh > panel_h { break; }
+                            let is_sel = gs.sel == GitSel::Staged(i);
+                            if is_sel { fill(buf, w, h, px, ry, pw - 1, lh, SEL_BG); }
+                            let avail = ((pw - 6) / cw).max(0) as usize;
+                            let label = format!("  {} {}", entry.xy.0, entry.path);
+                            let disp: String = label.chars().take(avail).collect();
+                            draw_str(buf, w, h, g, &disp, px + 2, ry + asc, FG, px + pw - 1);
+                            ry += lh;
+                        }
+                    }
+                    let _ = staged_start_y;
+
+                    // CHANGES header
+                    ry += 2;
+                    draw_str(buf, w, h, g, " CHANGES", px + 2, ry + asc, FG_DIM, px + pw - 1);
+                    fill(buf, w, h, px, ry + lh - 1, pw - 1, 1, BORDER);
+                    ry += lh;
+                    let commit_area_top = panel_h - lh * 3 - 8;
+                    if gs.unstaged.is_empty() {
+                        draw_str(buf, w, h, g, "  (none)", px + 2, ry + asc, FG_DIM, px + pw - 1);
+                    } else {
+                        for (i, entry) in gs.unstaged.iter().enumerate() {
+                            if ry + lh > commit_area_top { break; }
+                            let is_sel = gs.sel == GitSel::Unstaged(i);
+                            if is_sel { fill(buf, w, h, px, ry, pw - 1, lh, SEL_BG); }
+                            let avail = ((pw - 6) / cw).max(0) as usize;
+                            let xy_char = if entry.xy.0 == '?' { '?' } else { entry.xy.1 };
+                            let label = format!("  {} {}", xy_char, entry.path);
+                            let disp: String = label.chars().take(avail).collect();
+                            draw_str(buf, w, h, g, &disp, px + 2, ry + asc, FG, px + pw - 1);
+                            ry += lh;
+                        }
+                    }
+
+                    // COMMIT area (anchored from bottom)
+                    fill(buf, w, h, px, commit_area_top, pw - 1, 1, BORDER);
+                    let ca = commit_area_top + 4;
+                    draw_str(buf, w, h, g, " COMMIT", px + 2, ca + asc, FG_DIM, px + pw - 1);
+                    let ca = ca + lh;
+                    // Commit message field
+                    let field_bg = if gs.commit_focused { SEL_BG } else { BG };
+                    fill(buf, w, h, px + 2, ca, pw - 4, lh, field_bg);
+                    let vis = ((pw - 8) / cw).max(0) as usize;
+                    let commit_cursor_chars = gs.commit_msg[..gs.commit_cursor].chars().count();
+                    let hscroll = commit_cursor_chars.saturating_sub(vis.saturating_sub(1));
+                    let disp_msg: String = gs.commit_msg.chars().skip(hscroll).take(vis).collect();
+                    if disp_msg.is_empty() && !gs.commit_focused {
+                        draw_str(buf, w, h, g, "commit message", px + 4, ca + asc, FG_DIM, px + pw - 3);
+                    } else {
+                        draw_str(buf, w, h, g, &disp_msg, px + 4, ca + asc, FG, px + pw - 3);
+                    }
+                    if gs.commit_focused {
+                        let cur_col = (commit_cursor_chars - hscroll) as i32;
+                        fill(buf, w, h, px + 4 + cur_col * cw, ca, 1, lh, ACCENT);
+                        fill(buf, w, h, px + 2, ca + lh - 1, pw - 4, 1, ACCENT);
+                    }
+                    // Buttons row
+                    let btn_y = ca + lh + 2;
+                    let can_commit = !gs.staged.is_empty() && !gs.commit_msg.is_empty();
+                    let commit_btn_fg = if can_commit { ACCENT } else { FG_DIM };
+                    draw_str(buf, w, h, g, "[Commit]", px + 2, btn_y + asc, commit_btn_fg, px + pw / 2);
+                    let has_unstaged = !gs.unstaged.is_empty();
+                    let stage_all_fg = if has_unstaged { FG } else { FG_DIM };
+                    draw_str(buf, w, h, g, "[Stage All]", px + pw / 2, btn_y + asc, stage_all_fg, px + pw - 1);
+                }
             }
+            } // end if left_panel_visible
         }
 
         // ── Per-pane rendering ────────────────────────────────────────────
@@ -6814,6 +7693,36 @@ fn render(s: &mut State) {
             }
         }
 
+        // ── Markdown preview panes ────────────────────────────────────────
+        for snap in &md_snaps {
+            let r = snap.rect;
+            fill(buf, w, h, r.x, r.y, r.w, tab_h, BG2);
+            fill(buf, w, h, r.x, r.y + tab_h - 1, r.w, 1, BORDER);
+            if snap.is_active { fill(buf, w, h, r.x, r.y, 2, tab_h - 1, ACCENT); }
+            draw_str(buf, w, h, g, &format!(" {}", snap.title), r.x + 4, r.y + tab_h * 3 / 4, FG_DIM, r.x + r.w);
+            for (vi, (text, colors)) in snap.lines.iter().enumerate() {
+                let baseline = r.y + tab_h + vi as i32 * lh + asc;
+                let mut x = r.x + 4;
+                for (ci, ch) in text.chars().enumerate() {
+                    if x >= r.x + r.w { break; }
+                    let color = colors.get(ci).copied().unwrap_or(FG);
+                    if let Some((m, bmap)) = g.get(ch) { blit(buf, w, h, bmap, m, x, baseline, color); }
+                    x += cw;
+                }
+            }
+            let content_h = (r.h - tab_h).max(0);
+            let vis = (content_h / lh).max(1) as usize;
+            if snap.total_lines > vis {
+                let thumb_h = ((content_h * vis as i32) / snap.total_lines as i32).max(SB_W);
+                let scroll_max = snap.total_lines - vis;
+                let thumb_y = r.y + tab_h + if scroll_max > 0 {
+                    (snap.scroll as i32 * (content_h - thumb_h)) / scroll_max as i32
+                } else { 0 };
+                fill(buf, w, h, r.x + r.w - SB_W, r.y + tab_h, SB_W, content_h, BG2);
+                fill(buf, w, h, r.x + r.w - SB_W, thumb_y, SB_W, thumb_h, SB_THUMB);
+            }
+        }
+
         // ── Pane border dividers ──────────────────────────────────────────
         for snap in &pane_snaps {
             // 1px right border (between H-split panes)
@@ -6827,6 +7736,10 @@ fn render(s: &mut State) {
             fill(buf, w, h, snap.rect.x, snap.rect.y + snap.rect.h, snap.rect.w, 1, BORDER);
         }
         for snap in &out_snaps {
+            fill(buf, w, h, snap.rect.x + snap.rect.w, snap.rect.y, 1, snap.rect.h, BORDER);
+            fill(buf, w, h, snap.rect.x, snap.rect.y + snap.rect.h, snap.rect.w, 1, BORDER);
+        }
+        for snap in &md_snaps {
             fill(buf, w, h, snap.rect.x + snap.rect.w, snap.rect.y, 1, snap.rect.h, BORDER);
             fill(buf, w, h, snap.rect.x, snap.rect.y + snap.rect.h, snap.rect.w, 1, BORDER);
         }
@@ -6871,6 +7784,8 @@ fn render(s: &mut State) {
             let lc_str = format!("Ln {}, Col {}  ", snap.cur_line + 1, snap.cur_col + 1);
             let lc_w   = lc_str.chars().count() as i32 * cw;
             draw_str(buf, w, h, g, &lc_str, w as i32 - lc_w, sbase, FG_DIM, w as i32);
+        } else if let Some(snap) = md_snaps.iter().find(|p| p.is_active) {
+            draw_str(buf, w, h, g, &format!("  {}", snap.title), 0, sbase, FG_DIM, w as i32);
         }
 
         // ── Context menu ──────────────────────────────────────────────────
