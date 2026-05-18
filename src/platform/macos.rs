@@ -268,16 +268,18 @@ impl CpuRenderer {
     fn set_double_buffer(&mut self, enabled: bool) {
         if enabled == self.double_buffer { return; }
         if !enabled {
-            // Free the surface that won't be used in single-buffer mode
-            let other = 1 - self.back;
-            if !self.surfaces[other].is_null() {
-                unsafe { CFRelease(self.surfaces[other].cast()) };
-                self.surfaces[other] = ptr::null_mut();
+            // Single-buffer mode always writes to surfaces[0]; always free surfaces[1].
+            // When back==1: surfaces[1] is the write target — CA doesn't hold it, freed immediately.
+            // When back==0: surfaces[1] is displayed — CA holds it; our CFRelease drops refcount
+            //   to 1. CA releases it on the next frame when setContents(surfaces[0]) is called.
+            if !self.surfaces[1].is_null() {
+                unsafe { CFRelease(self.surfaces[1].cast()) };
+                self.surfaces[1] = ptr::null_mut();
             }
             self.back = 0;
         }
         self.double_buffer = enabled;
-        // When enabling, the second surface is allocated lazily on the next render_frame call.
+        // When enabling, surfaces[1] is allocated lazily on the next render_frame call.
     }
 }
 
