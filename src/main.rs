@@ -103,20 +103,21 @@ const SB_THUMB:   u32 = 0x414868;
 
 // ── Glyph cache ───────────────────────────────────────────────────────────────
 struct Glyphs {
-    font:      Font,
-    fallbacks: Vec<Font>,
-    px:        f32,
-    map:       HashMap<char, (Metrics, Vec<u8>)>,
-    pub cw: i32,
-    pub lh: i32,
-    pub asc: i32,
+    font:       Font,
+    fallbacks:  Vec<Font>,
+    px:         f32,
+    map:        HashMap<char, (Metrics, Vec<u8>)>,
+    pub cw:     i32,
+    pub lh:     i32,
+    pub asc:    i32,
+    pub max_entries: Option<usize>,
 }
 
 impl Glyphs {
     fn new(bytes: &[u8], px: f32) -> Self {
         let font = Font::from_bytes(bytes, FontSettings::default()).unwrap();
         let fallbacks = Self::load_fallbacks();
-        let mut s = Self { font, fallbacks, px, map: HashMap::new(), cw: 0, lh: 0, asc: 0 };
+        let mut s = Self { font, fallbacks, px, map: HashMap::new(), cw: 0, lh: 0, asc: 0, max_entries: None };
         s.rebuild_cache(px);
         s
     }
@@ -154,17 +155,27 @@ impl Glyphs {
         if self.font.lookup_glyph_index(ch) != 0 {
             let (m, b) = self.font.rasterize(ch, self.px);
             self.map.insert(ch, (m, b));
+            self.evict_if_over_cap();
             return;
         }
         // Try fallback fonts for characters not in primary
-        for fb in &self.fallbacks {
-            if fb.lookup_glyph_index(ch) != 0 {
-                let (m, b) = fb.rasterize(ch, self.px);
+        for i in 0..self.fallbacks.len() {
+            if self.fallbacks[i].lookup_glyph_index(ch) != 0 {
+                let (m, b) = self.fallbacks[i].rasterize(ch, self.px);
                 self.map.insert(ch, (m, b));
+                self.evict_if_over_cap();
                 return;
             }
         }
         // Character not found in any font — leave absent so render skips it
+    }
+
+    fn evict_if_over_cap(&mut self) {
+        if let Some(cap) = self.max_entries {
+            if self.map.len() > cap {
+                self.map.retain(|&c, _| c <= '\u{007E}');
+            }
+        }
     }
 
     fn get(&self, ch: char) -> Option<(&Metrics, &[u8])> {
@@ -417,9 +428,11 @@ struct Tab {
     undo_stack:   Vec<UndoEntry>,
     redo_stack:   Vec<UndoEntry>,
     last_typing:  bool, // for coalescing consecutive single-char inserts
-    hl_cache:     Vec<(MlState, i32)>, // (state, bracket_depth) at start of each line
-    hl_dirty_from: usize,              // first line index needing hl_cache recompute
-    max_line_len:  Option<usize>, // cached max line length (chars), None = needs recompute
+    hl_cache:      Vec<(MlState, i32)>, // (state, bracket_depth) at start of each line
+    hl_dirty_from: usize,               // first line index needing hl_cache recompute
+    hl_color_cache: Vec<Vec<u32>>,      // cached highlight color per char, indexed by line
+    max_line_len:   Option<usize>, // cached max line length (chars), None = needs recompute
+    edit_generation: u64, // incremented on every text mutation; used to skip redundant syncs
 }
 
 impl Tab {
@@ -427,7 +440,8 @@ impl Tab {
         Tab { kind: TabKind::Editor, buf_id, text: Rope::new(), path: None, dirty: false,
               cursors: vec![Cursor::new(0)], scroll: 0, hscroll: 0,
               undo_stack: Vec::new(), redo_stack: Vec::new(), last_typing: false,
-              hl_cache: Vec::new(), hl_dirty_from: 0, max_line_len: Some(0) }
+              hl_cache: Vec::new(), hl_dirty_from: 0, hl_color_cache: Vec::new(),
+              max_line_len: Some(0), edit_generation: 0 }
     }
 
     fn settings() -> Self {
@@ -435,7 +449,8 @@ impl Tab {
               path: None, dirty: false, cursors: vec![Cursor::new(0)],
               scroll: 0, hscroll: 0,
               undo_stack: Vec::new(), redo_stack: Vec::new(), last_typing: false,
-              hl_cache: Vec::new(), hl_dirty_from: 0, max_line_len: Some(0) }
+              hl_cache: Vec::new(), hl_dirty_from: 0, hl_color_cache: Vec::new(),
+              max_line_len: Some(0), edit_generation: 0 }
     }
 
     fn display_name(&self) -> &str {
@@ -489,7 +504,9 @@ impl Tab {
                 self.last_typing = false;
                 self.hl_cache.clear();
                 self.hl_dirty_from = 0;
+                self.hl_color_cache.clear();
                 self.max_line_len = None;
+                self.edit_generation += 1;
                 true
             }
             Err(e) => { eprintln!("open error: {e}"); false }
@@ -925,7 +942,7 @@ fn open_markdown_preview(s: &mut State) {
     }
 
     let pane_id = s.next_pane_id; s.next_pane_id += 1;
-    s.md_panes.insert(pane_id, MarkdownPane { id: pane_id, source_buf_id, scroll: 0, title });
+    s.md_panes.insert(pane_id, MarkdownPane { id: pane_id, source_buf_id, scroll: 0, title, lines_cache: Vec::new(), source_edit_gen: u64::MAX });
     s.panes.insert(pane_id, Pane {
         id: pane_id, kind: PaneKind::MarkdownPreview,
         tabs: vec![], term_ids: vec![], active: 0, find: FindBar::new(),
@@ -981,10 +998,12 @@ pub struct MarkdownPane {
     pub source_buf_id: usize,
     pub scroll:        usize,
     pub title:         String,
+    pub lines_cache:   Vec<(String, Vec<u32>)>, // cached rendered lines; rebuilt on source edit
+    pub source_edit_gen: u64, // edit_generation of source tab when cache was last built
 }
 
 pub enum UserEvent {
-    TermOutput     { pane_id: usize, data: Vec<u8> },
+    TermOutput     { pane_id: usize, data: Box<[u8]> },
     LspOutput      { pane_id: usize, data: Vec<u8> },
     LspDiagnostics { path: PathBuf, diagnostics: Vec<Diagnostic> },
     LspResponse    { server_id: usize, id: u64, result: serde_json::Value },
@@ -1063,6 +1082,10 @@ struct State {
     scroll_frac_y: f64,  // fractional pixel accumulator for PixelDelta scroll events
 
     status_msg: Option<String>,
+
+    last_sync_pane: usize,  // active pane at last sibling-tab sync
+    last_sync_tab:  usize,  // active tab index at last sibling-tab sync
+    last_sync_gen:  u64,    // edit_generation of active tab at last sync
 }
 
 #[derive(Clone)]
@@ -1248,6 +1271,8 @@ impl State {
         let tab = self.tab_mut();
         tab.max_line_len = None;
         tab.hl_dirty_from = 0;
+        tab.hl_color_cache.clear();
+        tab.edit_generation += 1;
         if !coalesce || !tab.last_typing {
             if let Some(lim) = limit {
                 if tab.undo_stack.len() >= lim { tab.undo_stack.remove(0); }
@@ -1271,6 +1296,8 @@ impl State {
         tab.last_typing = false;
         tab.max_line_len = None;
         tab.hl_dirty_from = 0;
+        tab.hl_color_cache.clear();
+        tab.edit_generation += 1;
         self.ensure_visible();
     }
 
@@ -1287,6 +1314,8 @@ impl State {
         tab.last_typing = false;
         tab.max_line_len = None;
         tab.hl_dirty_from = 0;
+        tab.hl_color_cache.clear();
+        tab.edit_generation += 1;
         self.ensure_visible();
     }
 
@@ -1859,6 +1888,9 @@ fn apply_text_edits(s: &mut State, path: &PathBuf, result: &serde_json::Value) {
                 t.text.insert(start, &new_text);
             }
             t.dirty = true;
+            t.hl_dirty_from = 0;
+            t.hl_color_cache.clear();
+            t.edit_generation += 1;
             return;
         }
     }
@@ -2128,7 +2160,9 @@ fn format_json_document(s: &mut State) {
     t.text.insert(0, &pretty);
     t.dirty = true;
     t.hl_dirty_from = 0;
+    t.hl_color_cache.clear();
     t.max_line_len = None;
+    t.edit_generation += 1;
 }
 
 fn highlight_json_line(chars: &[char], jsonc: bool, mut state: MlState, rainbow: bool, mut bracket_depth: i32) -> (Vec<u32>, MlState, i32) {
@@ -2676,6 +2710,7 @@ fn find_matches(text: &Rope, query: &str, case_sensitive: bool, whole_word: bool
     let mut out = vec![];
     let mut line_start_char: usize = 0;
     let mut line_buf = String::new();
+    let query_chars: Vec<char> = qstr.chars().collect(); // hoist: same for every line
     for line in text.lines() {
         line_buf.clear();
         if case_sensitive {
@@ -2687,7 +2722,6 @@ fn find_matches(text: &Rope, query: &str, case_sensitive: bool, whole_word: bool
         }
         let line_chars: Vec<char> = line_buf.chars().collect();
         let llen = line_chars.len();
-        let query_chars: Vec<char> = qstr.chars().collect();
         let mut i = 0;
         while i + qlen <= llen {
             if line_chars[i..i + qlen] == query_chars[..] {
@@ -3663,7 +3697,8 @@ impl ApplicationHandler<UserEvent> for App {
         };
 
         let font_size = loaded_settings.font_size;
-        let glyphs = Glyphs::new(include_bytes!("../assets/JetBrainsMono-Regular.ttf"), font_size);
+        let mut glyphs = Glyphs::new(include_bytes!("../assets/JetBrainsMono-Regular.ttf"), font_size);
+        glyphs.max_entries = loaded_settings.glyph_cache_limit.cap();
 
         let mut initial_pane = Pane::new(0, 0); // pane 0, buf 0
         let mut startup_status: Option<String> = None;
@@ -3752,6 +3787,10 @@ impl ApplicationHandler<UserEvent> for App {
             git_diff_tabs: HashMap::new(),
             scroll_frac_y: 0.0,
             status_msg: startup_status,
+
+            last_sync_pane: usize::MAX,
+            last_sync_tab:  usize::MAX,
+            last_sync_gen:  u64::MAX,
         };
 
         s.win.request_redraw();
@@ -3971,6 +4010,7 @@ impl ApplicationHandler<UserEvent> for App {
                                     let sgr = tp.grid.mouse_sgr;
                                     let pty_fd = tp.pty_fd;
                                     let bytes = terminal::encode_mouse(term_col, term_row, cb, true, sgr);
+                                    // SAFETY: pty_fd is valid (>= 0 checked); bytes slice lives for this synchronous call.
                                     if pty_fd >= 0 { let _ = unsafe { libc::write(pty_fd, bytes.as_ptr().cast(), bytes.len()) }; }
                                 }
                             }
@@ -4030,6 +4070,7 @@ impl ApplicationHandler<UserEvent> for App {
                                     let pty_fd = tp.pty_fd;
                                     let bytes = terminal::encode_mouse(term_col, term_row,
                                         if sgr { mod_bits } else { 3 | mod_bits }, false, sgr);
+                                    // SAFETY: pty_fd is valid (>= 0 checked); bytes slice lives for this synchronous call.
                                     if pty_fd >= 0 { let _ = unsafe { libc::write(pty_fd, bytes.as_ptr().cast(), bytes.len()) }; }
                                 }
                             }
@@ -4325,7 +4366,13 @@ impl ApplicationHandler<UserEvent> for App {
                                         s.active_pane = pid;
                                         if s.panes.get(&pid).map_or(0, |p| p.tabs.len()) > 1 {
                                             let pane = s.panes.get_mut(&pid).unwrap();
-                                            pane.tabs.remove(ti);
+                                            let closed = pane.tabs.remove(ti);
+                                            if let Some(ref p) = closed.path {
+                                                let lang = Lang::from_path(p);
+                                                if let Some(srv) = s.lsp.server_for_lang_mut(lang) {
+                                                    lsp::notify_did_close(srv, p);
+                                                }
+                                            }
                                             if pane.active >= pane.tabs.len() { pane.active = pane.tabs.len() - 1; }
                                         } else if s.panes.len() > 1 {
                                             s.md_panes.remove(&pid);
@@ -4820,6 +4867,7 @@ impl ApplicationHandler<UserEvent> for App {
                                     let sgr = tp.grid.mouse_sgr;
                                     let pty_fd = tp.pty_fd;
                                     let bytes = terminal::encode_mouse(term_col, term_row, mod_bits, true, sgr);
+                                    // SAFETY: pty_fd is valid (>= 0 checked); bytes slice lives for this synchronous call.
                                     if pty_fd >= 0 { let _ = unsafe { libc::write(pty_fd, bytes.as_ptr().cast(), bytes.len()) }; }
                                     s.term_buttons_held |= 1;
                                 } else {
@@ -4892,7 +4940,8 @@ impl ApplicationHandler<UserEvent> for App {
                     let vy        = ry + lh + 4;
                     let sy        = vy + lh + 4;
                     let rb_y      = sy + lh + 4;
-                    let ul_y      = rb_y + lh + 4;
+                    let gc_y      = rb_y + lh + 4;
+                    let ul_y      = gc_y + lh + 4;
                     let ul_num_y  = ul_y + lh + 4;
                     if my >= ry && my < ry + lh {
                         if mx >= btn_x && mx < btn_x + 5 * cw && s.renderer.is_gpu() {
@@ -4918,6 +4967,26 @@ impl ApplicationHandler<UserEvent> for App {
                     } else if my >= rb_y && my < rb_y + lh && mx >= btn_x && mx < btn_x + 8 * cw {
                         s.settings.rainbow_brackets = !s.settings.rainbow_brackets;
                         s.settings.save();
+                        for pane in s.panes.values_mut() {
+                            for tab in pane.tabs.iter_mut() { tab.hl_color_cache.clear(); tab.hl_dirty_from = 0; }
+                        }
+                    } else if my >= gc_y && my < gc_y + lh {
+                        // Glyph cache limit buttons — offsets must match gc_btns in render
+                        let gc_offsets: [(i32, i32, settings::GlyphCacheLimit); 5] = [
+                            (0, 11, settings::GlyphCacheLimit::Unlimited),
+                            (12, 5, settings::GlyphCacheLimit::N512),
+                            (18, 6, settings::GlyphCacheLimit::N1024),
+                            (25, 6, settings::GlyphCacheLimit::N2048),
+                            (32, 6, settings::GlyphCacheLimit::N4096),
+                        ];
+                        for (off, wid, variant) in gc_offsets {
+                            if mx >= btn_x + off * cw && mx < btn_x + (off + wid) * cw {
+                                s.settings.glyph_cache_limit = variant;
+                                s.glyphs.max_entries = variant.cap();
+                                s.settings.save();
+                                break;
+                            }
+                        }
                     } else if my >= ul_y && my < ul_y + lh && mx >= btn_x && mx < btn_x + 12 * cw {
                         s.settings.undo_limit = if s.settings.undo_limit.is_none() { settings::Settings::default_undo_limit() } else { None };
                         s.settings.save();
@@ -4973,6 +5042,7 @@ impl ApplicationHandler<UserEvent> for App {
                                     if let Some(&tid) = s.panes.get(&pane_id).and_then(|p| p.term_ids.get(p.active)) {
                                         if let Some(tp) = s.term_panes.get(&tid) {
                                             let bytes = cmd.as_bytes();
+                                            // SAFETY: pty_fd is valid (>= 0 checked); bytes slice lives for this synchronous call.
                                             if tp.pty_fd >= 0 { unsafe { libc::write(tp.pty_fd, bytes.as_ptr().cast(), bytes.len()); } }
                                         }
                                     }
@@ -5224,6 +5294,7 @@ impl ApplicationHandler<UserEvent> for App {
                                     .clamp(0, tp.grid.rows as i32 - 1) as usize;
                                 for _ in 0..n {
                                     let bytes = terminal::encode_mouse(term_col, term_row, cb, true, sgr);
+                                    // SAFETY: pty_fd is valid (>= 0 checked); bytes slice lives for this synchronous call.
                                     if pty_fd >= 0 { let _ = unsafe { libc::write(pty_fd, bytes.as_ptr().cast(), bytes.len()) }; }
                                 }
                             } else {
@@ -5278,7 +5349,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 let lh = s.glyphs.lh as usize;
                                 let pane_rect = s.active_pane_rect();
                                 let visible_h = (pane_rect.h - s.tab_h()).max(0) as usize;
-                                let content_h = if s.settings.undo_limit.is_some() { 21 * lh + 92 } else { 20 * lh + 88 };
+                                let content_h = if s.settings.undo_limit.is_some() { 22 * lh + 96 } else { 21 * lh + 92 };
                                 let max_scroll = content_h.saturating_sub(visible_h) / lh + 1;
                                 let t = s.tab_mut();
                                 if dy < 0 {
@@ -5824,6 +5895,7 @@ impl ApplicationHandler<UserEvent> for App {
                             if let Some(&tid) = p.term_ids.get(p.active) {
                                 if let Some(tp) = s.term_panes.get(&tid) {
                                     let bytes = text.as_bytes();
+                                    // SAFETY: pty_fd is valid (>= 0 checked); bytes slice lives for this synchronous call.
                                     if tp.pty_fd >= 0 { let _ = unsafe { libc::write(tp.pty_fd, bytes.as_ptr().cast(), bytes.len()) }; }
                                 }
                             }
@@ -5835,6 +5907,7 @@ impl ApplicationHandler<UserEvent> for App {
                         let p = &s.panes[&s.active_pane];
                         if let Some(&tid) = p.term_ids.get(p.active) {
                             if let Some(tp) = s.term_panes.get(&tid) {
+                                // SAFETY: pty_fd is valid (>= 0 checked); byte literal lives for this synchronous call.
                                 if tp.pty_fd >= 0 { let _ = unsafe { libc::write(tp.pty_fd, b"\x15".as_ptr().cast(), 1) }; }
                             }
                         }
@@ -5845,6 +5918,7 @@ impl ApplicationHandler<UserEvent> for App {
                         let p = &s.panes[&s.active_pane];
                         if let Some(&tid) = p.term_ids.get(p.active) {
                             if let Some(tp) = s.term_panes.get(&tid) {
+                                // SAFETY: pty_fd is valid (>= 0 checked); byte literal lives for this synchronous call.
                                 if tp.pty_fd >= 0 { let _ = unsafe { libc::write(tp.pty_fd, b"\x17".as_ptr().cast(), 1) }; }
                             }
                         }
@@ -5857,6 +5931,7 @@ impl ApplicationHandler<UserEvent> for App {
                         let p = &s.panes[&s.active_pane];
                         if let Some(&tid) = p.term_ids.get(p.active) {
                             if let Some(tp) = s.term_panes.get(&tid) {
+                                // SAFETY: pty_fd is valid (>= 0 checked); bytes slice lives for this synchronous call.
                                 if tp.pty_fd >= 0 { let _ = unsafe { libc::write(tp.pty_fd, bytes.as_ptr().cast(), bytes.len()) }; }
                             }
                         }
@@ -6065,7 +6140,13 @@ impl ApplicationHandler<UserEvent> for App {
                             // Terminal panes are handled before PTY forwarding; only editor/lsp reach here
                             let pane = s.panes.get_mut(&pane_id).unwrap();
                             if pane.tabs.len() > 1 {
-                                pane.tabs.remove(pane.active);
+                                let closed = pane.tabs.remove(pane.active);
+                                if let Some(ref p) = closed.path {
+                                    let lang = Lang::from_path(p);
+                                    if let Some(srv) = s.lsp.server_for_lang_mut(lang) {
+                                        lsp::notify_did_close(srv, p);
+                                    }
+                                }
                                 if pane.active >= pane.tabs.len() { pane.active = pane.tabs.len() - 1; }
                             } else if s.panes.len() > 1 {
                                 s.panes.remove(&pane_id);
@@ -6231,7 +6312,7 @@ impl ApplicationHandler<UserEvent> for App {
                                     let lh = s.glyphs.lh as usize;
                                     let pane_rect = s.active_pane_rect();
                                     let visible_h = (pane_rect.h - s.tab_h()).max(0) as usize;
-                                    let content_h = if s.settings.undo_limit.is_some() { 21 * lh + 92 } else { 20 * lh + 88 };
+                                    let content_h = if s.settings.undo_limit.is_some() { 22 * lh + 96 } else { 21 * lh + 92 };
                                     let max_scroll = content_h.saturating_sub(visible_h) / lh + 1;
                                     let step = if matches!(&event.logical_key, Key::Named(NamedKey::PageDown)) { 5 } else { 1 };
                                     s.tab_mut().scroll = (s.tab().scroll + step).min(max_scroll);
@@ -6391,7 +6472,9 @@ impl ApplicationHandler<UserEvent> for App {
                                 tab.text = ropey::Rope::from_str(&text);
                                 tab.dirty = false;
                                 tab.hl_dirty_from = 0;
+                                tab.hl_color_cache.clear();
                                 tab.max_line_len = None;
+                                tab.edit_generation += 1;
                             }
                         }
                     }
@@ -6570,22 +6653,28 @@ fn render(s: &mut State) {
 
     // Sync shared buffers: propagate the active tab's text/path/dirty to all
     // other tabs with the same buf_id (O(1) Rope clone per sibling).
-    // Only applies to editor panes (terminal/output panes have no tabs).
+    // Skipped when the active pane/tab and text version are unchanged since last sync.
     if s.panes.get(&s.active_pane).map_or(false, |p| p.kind == PaneKind::Editor) {
-        let ap = s.active_pane;
-        let at = s.panes[&ap].active;
-        let buf_id = s.panes[&ap].tabs[at].buf_id;
-        let text   = s.panes[&ap].tabs[at].text.clone();
-        let path   = s.panes[&ap].tabs[at].path.clone();
-        let dirty  = s.panes[&ap].tabs[at].dirty;
-        for (pid, p) in s.panes.iter_mut() {
-            for (tidx, t) in p.tabs.iter_mut().enumerate() {
-                if t.buf_id == buf_id && (*pid != ap || tidx != at) {
-                    t.text  = text.clone();
-                    t.path  = path.clone();
-                    t.dirty = dirty;
+        let ap  = s.active_pane;
+        let at  = s.panes[&ap].active;
+        let gen = s.panes[&ap].tabs.get(at).map_or(0, |t| t.edit_generation);
+        if ap != s.last_sync_pane || at != s.last_sync_tab || gen != s.last_sync_gen {
+            let buf_id = s.panes[&ap].tabs[at].buf_id;
+            let text   = s.panes[&ap].tabs[at].text.clone();
+            let path   = s.panes[&ap].tabs[at].path.clone();
+            let dirty  = s.panes[&ap].tabs[at].dirty;
+            for (pid, p) in s.panes.iter_mut() {
+                for (tidx, t) in p.tabs.iter_mut().enumerate() {
+                    if t.buf_id == buf_id && (*pid != ap || tidx != at) {
+                        t.text  = text.clone();
+                        t.path  = path.clone();
+                        t.dirty = dirty;
+                    }
                 }
             }
+            s.last_sync_pane = ap;
+            s.last_sync_tab  = at;
+            s.last_sync_gen  = gen;
         }
     }
 
@@ -6677,7 +6766,7 @@ fn render(s: &mut State) {
         })
     }).collect();
 
-    // Build markdown preview pane snapshots
+    // Build markdown preview pane snapshots (with per-pane line cache)
     struct MdPaneSnap {
         rect:        Rect,
         is_active:   bool,
@@ -6686,19 +6775,39 @@ fn render(s: &mut State) {
         total_lines: usize,
         scroll:      usize,
     }
+    // Cache-update pass: re-render only when source text changed.
+    let md_pane_ids: Vec<usize> = layout.iter()
+        .filter_map(|&(pid, _)| s.panes.get(&pid)
+            .filter(|p| p.kind == PaneKind::MarkdownPreview)
+            .map(|_| pid))
+        .collect();
+    for pid in md_pane_ids {
+        let source_buf_id = match s.md_panes.get(&pid) { Some(m) => m.source_buf_id, None => continue };
+        let source_gen = s.panes.values()
+            .flat_map(|p| p.tabs.iter())
+            .filter(|t| t.buf_id == source_buf_id)
+            .map(|t| t.edit_generation)
+            .max()
+            .unwrap_or(0);
+        if s.md_panes.get(&pid).map_or(true, |m| m.source_edit_gen != source_gen) {
+            let source_text = s.panes.values()
+                .find_map(|p| p.tabs.iter()
+                    .find(|t| t.buf_id == source_buf_id)
+                    .map(|t| t.text.clone()));
+            if let (Some(mp), Some(text)) = (s.md_panes.get_mut(&pid), source_text) {
+                mp.lines_cache = render_markdown_to_lines(&text);
+                mp.source_edit_gen = source_gen;
+            }
+        }
+    }
     let md_snaps: Vec<MdPaneSnap> = layout.iter().filter_map(|&(pid, rect)| {
         let pane = s.panes.get(&pid)?;
         if pane.kind != PaneKind::MarkdownPreview { return None; }
         let mp = s.md_panes.get(&pid)?;
-        let source_text = s.panes.values()
-            .find_map(|p| p.tabs.iter()
-                .find(|t| t.buf_id == mp.source_buf_id)
-                .map(|t| t.text.clone()))?;
-        let all_lines = render_markdown_to_lines(&source_text);
-        let total_lines = all_lines.len();
+        let total_lines = mp.lines_cache.len();
         let content_h = (rect.h - tab_h).max(0);
         let vis = (content_h / lh).max(1) as usize;
-        let lines = all_lines.into_iter().skip(mp.scroll).take(vis).collect();
+        let lines = mp.lines_cache.iter().skip(mp.scroll).take(vis).cloned().collect();
         Some(MdPaneSnap {
             rect, is_active: pid == active_pane_id,
             lines, title: mp.title.clone(), total_lines, scroll: mp.scroll,
@@ -6738,13 +6847,17 @@ fn render(s: &mut State) {
                 };
                 let mut state = start_state;
                 let mut depth = start_depth;
+                if tab.hl_color_cache.len() < need_up_to {
+                    tab.hl_color_cache.resize(need_up_to, Vec::new());
+                }
                 for li in tab.hl_dirty_from..need_up_to {
                     tab.hl_cache[li] = (state, depth);
                     let chars: Vec<char> = tab.text.line(li)
                         .chars().take_while(|&c| c != '\n' && c != '\r').collect();
-                    let (_, ns, nd) = highlight_line(&chars, lang, state, rainbow, depth);
+                    let (colors, ns, nd) = highlight_line(&chars, lang, state, rainbow, depth);
                     state = ns;
                     depth = nd;
+                    tab.hl_color_cache[li] = colors;
                 }
                 tab.hl_dirty_from = need_up_to;
             }
@@ -6856,13 +6969,20 @@ fn render(s: &mut State) {
             char_buf.clear();
             char_buf.extend(tab.text.line(li).chars().take_while(|&c| c != '\n' && c != '\r'));
             let text: String = char_buf.iter().collect();
-            let (colors, ns, bd) = if lang != Lang::None {
-                highlight_line(&char_buf, lang, hl_state, rainbow, bracket_depth)
+            let colors = if let Some(cached) = tab.hl_color_cache.get(li).filter(|v| !v.is_empty()) {
+                if let Some(&(ns, nd)) = tab.hl_cache.get(li + 1) {
+                    hl_state = ns;
+                    bracket_depth = nd;
+                }
+                cached.clone()
+            } else if lang != Lang::None {
+                let (c, ns, bd) = highlight_line(&char_buf, lang, hl_state, rainbow, bracket_depth);
+                hl_state = ns;
+                bracket_depth = bd;
+                c
             } else {
-                (vec![FG; char_buf.len()], hl_state, bracket_depth)
+                vec![FG; char_buf.len()]
             };
-            hl_state = ns;
-            bracket_depth = bd;
             lines.push((text, line_start, colors));
         }
 
@@ -6929,6 +7049,7 @@ fn render(s: &mut State) {
     let format_on_save          = s.settings.format_on_save.clone();
     let organize_imports_on_save = s.settings.organize_imports_on_save.clone();
     let format_command          = s.settings.format_command.clone();
+    let glyph_cache_limit       = s.settings.glyph_cache_limit;
     let settings_edit_field     = s.settings_edit_field;
     let settings_edit_text      = s.settings_edit_text.clone();
     let settings_edit_cursor    = s.settings_edit_cursor;
@@ -7139,6 +7260,7 @@ fn render(s: &mut State) {
     let glyphs = &s.glyphs as *const Glyphs;
 
     s.renderer.render_frame(move |buf, w, h| {
+        // SAFETY: glyphs points into s.glyphs which outlives this synchronous closure; no mutation occurs during the frame.
         let g = unsafe { &*glyphs };
 
         for p in buf.iter_mut() { *p = BG; }
@@ -7571,8 +7693,27 @@ fn render(s: &mut State) {
                     fc(buf, btn_x, rb_y, 8 * cw, lh, rb_bg);
                     draw_str(buf, w, h, g, if rainbow_brackets { " [x] On " } else { " [ ] Off" }, btn_x, rb_y + asc, rb_fg, btn_x + 8 * cw);
                 }
+                // Glyph Cache row
+                let gc_y = rb_y + lh + 4;
+                if row_vis(gc_y) {
+                    draw_str(buf, w, h, g, "  Glyph Cache", r.x, gc_y + asc, FG, btn_x - cw);
+                    // Button offsets (in cw from btn_x), widths, labels — must match GlyphCacheLimit::ALL order
+                    let gc_btns: [(i32, i32, &str); 5] = [
+                        (0, 11, " Unlimited "),
+                        (12, 5, " 512 "),
+                        (18, 6, " 1024 "),
+                        (25, 6, " 2048 "),
+                        (32, 6, " 4096 "),
+                    ];
+                    for (i, (off, wid, label)) in gc_btns.iter().enumerate() {
+                        let active = glyph_cache_limit == settings::GlyphCacheLimit::ALL[i];
+                        let (bg, fg) = if active { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
+                        fc(buf, btn_x + off * cw, gc_y, wid * cw, lh, bg);
+                        draw_str(buf, w, h, g, label, btn_x + off * cw, gc_y + asc, fg, btn_x + (off + wid) * cw);
+                    }
+                }
                 // Undo History toggle row
-                let ul_y = rb_y + lh + 4;
+                let ul_y = gc_y + lh + 4;
                 if row_vis(ul_y) {
                     draw_str(buf, w, h, g, "  Undo History", r.x, ul_y + asc, FG, btn_x - cw);
                     let unlimited = undo_limit.is_none();

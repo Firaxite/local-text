@@ -6,6 +6,7 @@
 // The main thread calls feed_bytes() in user_event(), which runs the vte parser
 // and updates the grid in-place.
 
+use std::collections::VecDeque;
 use std::ffi::CString;
 use vte::{Perform, Parser};
 use winit::event_loop::EventLoopProxy;
@@ -67,8 +68,8 @@ pub struct TermGrid {
     pub cells: Vec<Cell>,
     pub cur_col: usize,
     pub cur_row: usize,
-    /// Scrollback: oldest at index 0, newest at the end.
-    pub scrollback: Vec<Vec<Cell>>,
+    /// Scrollback: oldest at front, newest at back. VecDeque gives O(1) pop_front.
+    pub scrollback: VecDeque<Vec<Cell>>,
     /// How many lines of scrollback the user has scrolled up (0 = live).
     pub scroll_offset: usize,
     /// Current SGR state applied to new cells.
@@ -98,7 +99,7 @@ impl TermGrid {
         let rows_m1 = rows.saturating_sub(1);
         TermGrid {
             cols, rows, cells, cur_col: 0, cur_row: 0,
-            scrollback: Vec::new(), scroll_offset: 0,
+            scrollback: VecDeque::new(), scroll_offset: 0,
             cur_fg: DEFAULT_FG, cur_bg: DEFAULT_BG, cur_bold: false, cur_visible: true,
             mouse_report: MouseReportMode::None, mouse_sgr: false,
             scroll_top: 0, scroll_bot: rows_m1,
@@ -114,8 +115,8 @@ impl TermGrid {
     fn scroll_up(&mut self) {
         if self.scroll_top == 0 && self.scroll_bot == self.rows - 1 {
             let row: Vec<Cell> = self.cells[0..self.cols].to_vec();
-            if self.scrollback.len() >= 1000 { self.scrollback.remove(0); }
-            self.scrollback.push(row);
+            if self.scrollback.len() >= 1000 { self.scrollback.pop_front(); }
+            self.scrollback.push_back(row);
         }
         let top = self.scroll_top * self.cols;
         let bot = (self.scroll_bot + 1) * self.cols;
@@ -165,9 +166,9 @@ impl TermGrid {
             let sb_len = self.scrollback.len();
             let start = sb_len.saturating_sub(offset);
             let mut result: Vec<Vec<Cell>> = Vec::with_capacity(self.rows);
-            for i in start..sb_len {
+            for row in self.scrollback.iter().skip(start) {
                 if result.len() == self.rows { return result; }
-                result.push(self.scrollback[i].clone());
+                result.push(row.clone());
             }
             for r in 0..self.rows {
                 if result.len() == self.rows { return result; }
@@ -493,6 +494,7 @@ pub struct TermPane {
 impl Drop for TermPane {
     fn drop(&mut self) {
         if self.pty_fd >= 0 {
+            // SAFETY: pty_fd is a valid open file descriptor owned by this TermPane.
             unsafe { libc::close(self.pty_fd); }
         }
     }
@@ -510,6 +512,7 @@ pub fn feed_bytes(pane: &mut TermPane, data: &[u8]) {
 pub fn resize_pty(pane: &mut TermPane, cols: usize, rows: usize) {
     if cols == pane.grid.cols && rows == pane.grid.rows { return; }
     let ws = libc::winsize { ws_col: cols as u16, ws_row: rows as u16, ws_xpixel: 0, ws_ypixel: 0 };
+    // SAFETY: pty_fd is a valid open PTY master fd; ws is a correctly-sized winsize struct.
     unsafe { libc::ioctl(pane.pty_fd, libc::TIOCSWINSZ, &ws); }
     pane.grid.resize(cols, rows);
 }
@@ -539,6 +542,7 @@ pub fn spawn_terminal_with_shell(pane_id: usize, cols: usize, rows: usize,
     };
 
     let mut master_fd: libc::c_int = -1;
+    // SAFETY: forkpty is a POSIX API; master_fd is out-param, ws is valid winsize.
     let pid = unsafe {
         libc::forkpty(&mut master_fd, ptr::null_mut(), ptr::null_mut(), &mut ws)
     };
@@ -546,6 +550,9 @@ pub fn spawn_terminal_with_shell(pane_id: usize, cols: usize, rows: usize,
 
     if pid == 0 {
         let shell_c = CString::new(shell.as_str()).unwrap();
+        // SAFETY: we are in the forked child process; the NUL-terminated literals and
+        // argv array are valid for the duration of these calls. execvp replaces the
+        // process image so no cleanup is needed on success; exit(1) handles failure.
         unsafe {
             libc::setenv(
                 b"TERM\0".as_ptr().cast(),
@@ -561,12 +568,15 @@ pub fn spawn_terminal_with_shell(pane_id: usize, cols: usize, rows: usize,
     let reader = std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
         loop {
+            // SAFETY: master_fd is a valid open PTY master fd; buf is a mutable
+            // stack-allocated slice sized to match the length argument.
             let n = unsafe { libc::read(master_fd, buf.as_mut_ptr().cast(), buf.len()) };
             if n <= 0 {
                 let _ = proxy.send_event(UserEvent::Redraw);
                 break;
             }
-            let data = buf[..n as usize].to_vec();
+            // Box<[u8]> carries exactly n bytes with no excess capacity.
+            let data: Box<[u8]> = buf[..n as usize].into();
             if proxy.send_event(UserEvent::TermOutput { pane_id, data }).is_err() { break; }
         }
     });

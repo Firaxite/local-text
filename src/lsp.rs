@@ -298,6 +298,15 @@ pub fn send_initialized(server: &mut LspServer) {
     server.initialized = true;
 }
 
+/// Send textDocument/didClose and remove the tracked document version.
+pub fn notify_did_close(server: &mut LspServer, path: &PathBuf) {
+    let params = serde_json::json!({
+        "textDocument": { "uri": uri_from_path(path) }
+    });
+    send_notification(server, "textDocument/didClose", params);
+    server.doc_version.remove(path);
+}
+
 pub fn request_definition(srv: &mut LspServer, path: &PathBuf, line: usize, col: usize) -> u64 {
     let id = send_request(srv, "textDocument/definition", serde_json::json!({
         "textDocument": { "uri": uri_from_path(path) },

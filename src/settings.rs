@@ -16,6 +16,48 @@ pub enum TermWordSelect {
     Word,        // alphanumeric + underscore (editor-style)
 }
 
+// Maximum number of entries in the glyph rasterization cache.
+// Unlimited lets the cache grow without bound; Bounded(N) evicts non-ASCII
+// glyphs when the entry count exceeds N. N must be a power of two >= 512.
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+pub enum GlyphCacheLimit {
+    #[default]
+    #[serde(rename = "unlimited")]
+    Unlimited,
+    #[serde(rename = "512")]
+    N512,
+    #[serde(rename = "1024")]
+    N1024,
+    #[serde(rename = "2048")]
+    N2048,
+    #[serde(rename = "4096")]
+    N4096,
+}
+
+impl GlyphCacheLimit {
+    pub fn cap(self) -> Option<usize> {
+        match self {
+            Self::Unlimited => None,
+            Self::N512  => Some(512),
+            Self::N1024 => Some(1024),
+            Self::N2048 => Some(2048),
+            Self::N4096 => Some(4096),
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unlimited => "Unlimited",
+            Self::N512      => "512",
+            Self::N1024     => "1024",
+            Self::N2048     => "2048",
+            Self::N4096     => "4096",
+        }
+    }
+    pub const ALL: [GlyphCacheLimit; 5] = [
+        Self::Unlimited, Self::N512, Self::N1024, Self::N2048, Self::N4096,
+    ];
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Settings {
     pub renderer:         RendererBackend,
@@ -40,10 +82,12 @@ pub struct Settings {
     pub organize_imports_on_save: String,  // comma-separated globs
     #[serde(default)]
     pub format_command:           String,  // e.g. "rustfmt" or "prettier --write {file}"
+    #[serde(default)]
+    pub glyph_cache_limit: GlyphCacheLimit,
 }
 
 impl Default for Settings {
-    fn default() -> Self { Settings { renderer: RendererBackend::Cpu, vsync: true, font_size: Self::default_font_size(), rainbow_brackets: false, undo_limit: Self::default_undo_limit(), term_copy_paste: false, term_cmd_bs: false, term_alt_bs: false, term_word_select: TermWordSelect::Whitespace, format_on_save: String::new(), organize_imports_on_save: String::new(), format_command: String::new() } }
+    fn default() -> Self { Settings { renderer: RendererBackend::Cpu, vsync: true, font_size: Self::default_font_size(), rainbow_brackets: false, undo_limit: Self::default_undo_limit(), term_copy_paste: false, term_cmd_bs: false, term_alt_bs: false, term_word_select: TermWordSelect::Whitespace, format_on_save: String::new(), organize_imports_on_save: String::new(), format_command: String::new(), glyph_cache_limit: GlyphCacheLimit::Unlimited } }
 }
 
 impl Settings {
