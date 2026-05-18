@@ -249,6 +249,7 @@ struct GitPanel {
     sel:            GitSel,
     is_git_repo:    bool,
     loading:        bool,
+    scroll:         usize,
 }
 
 impl GitPanel {
@@ -257,7 +258,7 @@ impl GitPanel {
             staged: vec![], unstaged: vec![],
             commit_msg: String::new(), commit_cursor: 0,
             commit_focused: false, sel: GitSel::None,
-            is_git_repo: true, loading: false,
+            is_git_repo: true, loading: false, scroll: 0,
         }
     }
 }
@@ -270,10 +271,10 @@ enum DiffLine {
     Context(String),  // unchanged context line
 }
 
-struct GitDiffState {
+struct GitDiffTabData {
     path:    String,
+    staged:  bool,
     lines:   Vec<DiffLine>,
-    scroll:  usize,
     loading: bool,
 }
 
@@ -290,6 +291,7 @@ enum CtxAction {
     TabOpenPreview,
     TabClose,
     TabSplitRight, TabSplitLeft, TabSplitDown, TabSplitUp,
+    GitOpenFile, GitViewDiff, GitStage, GitUnstage,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -309,6 +311,7 @@ struct ContextMenu {
     items:      Vec<ContextMenuItem>,
     hovered:    usize,
     tab_source: Option<(usize, usize)>,  // (pane_id, tab_idx) for tab bar menus
+    git_entry:  Option<(bool, String)>,  // (staged, path)
 }
 
 // ── Quick file finder ─────────────────────────────────────────────────────────
@@ -399,7 +402,7 @@ struct GlobalFind {
 
 // ── Tab (per-file state) ──────────────────────────────────────────────────────
 #[derive(Clone, PartialEq)]
-enum TabKind { Editor, Settings }
+enum TabKind { Editor, Settings, GitDiff }
 
 #[derive(Clone)]
 struct Tab {
@@ -438,6 +441,10 @@ impl Tab {
     fn display_name(&self) -> &str {
         match self.kind {
             TabKind::Settings => "Settings",
+            TabKind::GitDiff  => self.path.as_deref()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .unwrap_or("Diff"),
             TabKind::Editor   => self.path.as_deref()
                 .and_then(|p| p.file_name())
                 .and_then(|n| n.to_str())
@@ -983,7 +990,7 @@ pub enum UserEvent {
     LspResponse    { server_id: usize, id: u64, result: serde_json::Value },
     FormatterDone  { path: PathBuf },
     GitStatusResult { staged: Vec<GitEntry>, unstaged: Vec<GitEntry>, is_git_repo: bool },
-    GitDiffResult   { path: String, lines: Vec<DiffLine> },
+    GitDiffResult   { buf_id: usize, path: String, lines: Vec<DiffLine> },
     GitOpDone,
     Redraw,
 }
@@ -1052,7 +1059,7 @@ struct State {
     quick_finder: QuickFinder,
     global_find:  GlobalFind,
     git_panel:    GitPanel,
-    git_diff:     Option<GitDiffState>,
+    git_diff_tabs: HashMap<usize, GitDiffTabData>,
     scroll_frac_y: f64,  // fractional pixel accumulator for PixelDelta scroll events
 
     status_msg: Option<String>,
@@ -1708,7 +1715,13 @@ impl State {
     fn is_word_char(c: char) -> bool { c.is_alphanumeric() || c == '_' }
 
     fn scroll_by(&mut self, delta: i32) {
-        let last = { let t = self.tab(); Self::last_line(&t.text) };
+        let (kind, buf_id) = { let t = self.tab(); (t.kind.clone(), t.buf_id) };
+        let last = if kind == TabKind::GitDiff {
+            self.git_diff_tabs.get(&buf_id).map_or(0, |d| d.lines.len().saturating_sub(1))
+        } else {
+            let t = self.tab();
+            Self::last_line(&t.text)
+        };
         let t = self.tab_mut();
         if delta < 0 {
             t.scroll = t.scroll.saturating_sub((-delta) as usize);
@@ -1769,12 +1782,13 @@ fn open_or_reuse_tab(s: &mut State, path: PathBuf) {
     };
     let pane = s.panes.get_mut(&ap).unwrap();
     for i in 0..pane.tabs.len() {
+        if pane.tabs[i].kind == TabKind::GitDiff { continue; }
         if pane.tabs[i].path.as_deref() == Some(path.as_path()) {
             pane.active = i;
             return;
         }
     }
-    let loaded = if pane.tab().is_empty_untitled() {
+    let loaded = if pane.tab().kind != TabKind::GitDiff && pane.tab().is_empty_untitled() {
         pane.tab_mut().load_file(path.clone())
     } else {
         let mut tab = Tab::untitled(s.next_buf_id);
@@ -3384,13 +3398,20 @@ fn refresh_git_status(proxy: winit::event_loop::EventLoopProxy<UserEvent>, root:
 }
 
 fn refresh_git_diff(
-    proxy: winit::event_loop::EventLoopProxy<UserEvent>,
-    root:  PathBuf,
-    path:  String,
+    proxy:  winit::event_loop::EventLoopProxy<UserEvent>,
+    root:   PathBuf,
+    path:   String,
+    staged: bool,
+    buf_id: usize,
 ) {
     std::thread::spawn(move || {
+        let args: &[&str] = if staged {
+            &["diff", "--cached", "--", &path]
+        } else {
+            &["diff", "--", &path]
+        };
         let stdout = std::process::Command::new("git")
-            .args(["diff", "--", &path])
+            .args(args)
             .current_dir(&root)
             .output()
             .map(|o| o.stdout)
@@ -3407,13 +3428,79 @@ fn refresh_git_diff(
                 || l.starts_with("+++ ") || l.starts_with("index ")
                 || l.starts_with("Binary ")
             {
-                None  // skip file meta lines — not useful in the viewer
+                None
             } else {
                 Some(DiffLine::Context(l.to_owned()))
             }
         }).collect();
-        let _ = proxy.send_event(UserEvent::GitDiffResult { path, lines });
+        let _ = proxy.send_event(UserEvent::GitDiffResult { buf_id, path, lines });
     });
+}
+
+fn parse_hunk_header(s: &str) -> Option<(usize, usize)> {
+    // Parses "@@ -old_start[,count] +new_start[,count] @@..."
+    let inner = s.trim_start_matches('@').trim();
+    let old_part = inner.split_whitespace().find(|p| p.starts_with('-'))?;
+    let new_part = inner.split_whitespace().find(|p| p.starts_with('+'))?;
+    let old: usize = old_part.trim_start_matches('-').split(',').next()?.parse().ok()?;
+    let new: usize = new_part.trim_start_matches('+').split(',').next()?.parse().ok()?;
+    Some((old, new))
+}
+
+fn compute_line_nums_at(lines: &[DiffLine], skip: usize) -> (usize, usize) {
+    let mut old = 0usize;
+    let mut new = 0usize;
+    for line in lines.iter().take(skip) {
+        match line {
+            DiffLine::Hunk(h) => { if let Some((o, n)) = parse_hunk_header(h) { old = o; new = n; } }
+            DiffLine::Added(_)   => { new += 1; }
+            DiffLine::Removed(_) => { old += 1; }
+            DiffLine::Context(_) => { old += 1; new += 1; }
+        }
+    }
+    (old, new)
+}
+
+fn open_diff_tab(s: &mut State, path: String, staged: bool) {
+    // Find target editor pane
+    let ap = if s.panes.get(&s.active_pane).map_or(false, |p| p.kind == PaneKind::Editor) {
+        s.active_pane
+    } else {
+        let area = s.pane_area();
+        let Some(id) = layout_tree(&s.pane_tree, area).into_iter()
+            .find(|(id, _)| s.panes.get(id).map_or(false, |p| p.kind == PaneKind::Editor))
+            .map(|(id, _)| id)
+        else { return; };
+        s.active_pane = id;
+        id
+    };
+    // Check if a GitDiff tab for this path already exists in the pane
+    {
+        let pane = s.panes.get(&ap).unwrap();
+        for i in 0..pane.tabs.len() {
+            let t = &pane.tabs[i];
+            if t.kind == TabKind::GitDiff {
+                if s.git_diff_tabs.get(&t.buf_id).map_or(false, |d| d.path == path) {
+                    s.panes.get_mut(&ap).unwrap().active = i;
+                    return;
+                }
+            }
+        }
+    }
+    // Create new GitDiff tab
+    let buf_id = s.next_buf_id;
+    s.next_buf_id += 1;
+    let mut tab = Tab::untitled(buf_id);
+    tab.kind = TabKind::GitDiff;
+    tab.path = Some(PathBuf::from(&path));
+    s.git_diff_tabs.insert(buf_id, GitDiffTabData { path: path.clone(), staged, lines: vec![], loading: true });
+    let pane = s.panes.get_mut(&ap).unwrap();
+    pane.tabs.push(tab);
+    pane.active = pane.tabs.len() - 1;
+    // Fetch diff in background
+    let root = s.explorer.as_ref().map(|e| e.root.clone())
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    refresh_git_diff(s.proxy.clone(), root, path, staged, buf_id);
 }
 
 fn global_search(root: &std::path::Path, query: &str, include: &str, exclude: &str, case_sensitive: bool) -> Vec<GlobalFindResult> {
@@ -3662,7 +3749,7 @@ impl ApplicationHandler<UserEvent> for App {
                 sel_anchor_q: None, sel_anchor_r: None, sel_anchor_inc: None, sel_anchor_exc: None,
             },
             git_panel: GitPanel::new(),
-            git_diff: None,
+            git_diff_tabs: HashMap::new(),
             scroll_frac_y: 0.0,
             status_msg: startup_status,
         };
@@ -3961,7 +4048,51 @@ impl ApplicationHandler<UserEvent> for App {
                 let area = s.pane_area();
                 let tab_h = s.tab_h();
                 let cw = s.glyphs.cw;
+                let lh = s.glyphs.lh;
                 let layout = layout_tree(&s.pane_tree, area);
+
+                // Git panel entry right-click
+                let act_w_r = s.activity_bar_w();
+                if s.explorer.is_some() && s.left_view == LeftView::Git && s.left_panel_visible
+                    && mx >= act_w_r && mx < act_w_r + s.explorer_w()
+                {
+                    let scroll_px       = s.git_panel.scroll as i32 * lh;
+                    let staged_header_y = 4 - scroll_px;
+                    let staged_start_y  = staged_header_y + lh;
+                    let staged_count    = s.git_panel.staged.len();
+                    let staged_rows     = staged_count.max(1);
+                    let changes_hdr_y   = staged_start_y + staged_rows as i32 * lh + 2;
+                    let unstaged_start_y = changes_hdr_y + lh;
+                    let panel_h         = s.h as i32 - s.status_h();
+                    let commit_area_top = panel_h - lh * 3 - 8;
+
+                    let git_entry_hit: Option<(bool, String)> =
+                        if my >= staged_start_y && my < staged_start_y + staged_count as i32 * lh && staged_count > 0 {
+                            let i = ((my - staged_start_y) / lh) as usize;
+                            s.git_panel.staged.get(i).map(|e| (true, e.path.clone()))
+                        } else if my >= unstaged_start_y && my < commit_area_top {
+                            let unstaged_count = s.git_panel.unstaged.len();
+                            let i = ((my - unstaged_start_y) / lh) as usize;
+                            if i < unstaged_count { s.git_panel.unstaged.get(i).map(|e| (false, e.path.clone())) } else { None }
+                        } else { None };
+
+                    if let Some((is_staged, entry_path)) = git_entry_hit {
+                        let stage_label:  &'static str = if is_staged { "Unstage" } else { "Stage" };
+                        let stage_action: CtxAction     = if is_staged { CtxAction::GitUnstage } else { CtxAction::GitStage };
+                        s.context_menu = Some(ContextMenu {
+                            x: mx, y: my, hovered: 0, tab_source: None,
+                            git_entry: Some((is_staged, entry_path)),
+                            items: vec![
+                                ContextMenuItem { label: "Open File", shortcut: "", action: CtxAction::GitOpenFile, enabled: true },
+                                ContextMenuItem { label: "View Diff", shortcut: "", action: CtxAction::GitViewDiff, enabled: true },
+                                ContextMenuItem { label: "",          shortcut: "", action: CtxAction::Separator,   enabled: true },
+                                ContextMenuItem { label: stage_label, shortcut: "", action: stage_action,           enabled: true },
+                            ],
+                        });
+                    }
+                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                    return;
+                }
 
                 // Check if click lands in a tab bar — collect hit info without long borrow
                 struct TabHit { pid: usize, ti: usize, has_path: bool, is_md: bool }
@@ -4008,7 +4139,7 @@ impl ApplicationHandler<UserEvent> for App {
                     items.push(ContextMenuItem { label: "",            shortcut: "", action: CtxAction::Separator,     enabled: true });
                     items.push(ContextMenuItem { label: "Close",       shortcut: "Cmd+W", action: CtxAction::TabClose, enabled: true });
                     s.context_menu = Some(ContextMenu {
-                        x: mx, y: my, hovered: 0, tab_source: Some((hit.pid, hit.ti)), items,
+                        x: mx, y: my, hovered: 0, tab_source: Some((hit.pid, hit.ti)), git_entry: None, items,
                     });
                 } else {
                     // Editor text-area context menu
@@ -4022,7 +4153,7 @@ impl ApplicationHandler<UserEvent> for App {
                             s.context_menu = Some(ContextMenu {
                                 x: mx, y: my,
                                 hovered: 0,
-                                tab_source: None,
+                                tab_source: None, git_entry: None,
                                 items: vec![
                                     ContextMenuItem { label: "Go to Definition",   shortcut: "Cmd+Click / F12",   action: CtxAction::GotoDefinition,  enabled: lsp_avail },
                                     ContextMenuItem { label: "Find All References", shortcut: "Cmd+Shift+F12",    action: CtxAction::FindReferences,   enabled: lsp_avail },
@@ -4105,9 +4236,43 @@ impl ApplicationHandler<UserEvent> for App {
                             iy += ih;
                         }
                         let tab_source = cm.tab_source;
+                        let git_entry  = cm.git_entry.clone();
                         s.context_menu = None;
                         if let Some(action) = action_taken {
+                            let root_ga = s.explorer.as_ref().map(|e| e.root.clone())
+                                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
                             match action {
+                                CtxAction::GitOpenFile => {
+                                    if let Some((_, ref path)) = git_entry {
+                                        let pb = root_ga.join(path);
+                                        open_or_reuse_tab(s, pb);
+                                    }
+                                }
+                                CtxAction::GitViewDiff => {
+                                    if let Some((staged, ref path)) = git_entry {
+                                        open_diff_tab(s, path.clone(), staged);
+                                    }
+                                }
+                                CtxAction::GitStage => {
+                                    if let Some((_, ref path)) = git_entry {
+                                        let path = path.clone(); let proxy = s.proxy.clone(); let root = root_ga;
+                                        std::thread::spawn(move || {
+                                            let _ = std::process::Command::new("git")
+                                                .args(["add", "--", &path]).current_dir(&root).status();
+                                            let _ = proxy.send_event(UserEvent::GitOpDone);
+                                        });
+                                    }
+                                }
+                                CtxAction::GitUnstage => {
+                                    if let Some((_, ref path)) = git_entry {
+                                        let path = path.clone(); let proxy = s.proxy.clone(); let root = root_ga;
+                                        std::thread::spawn(move || {
+                                            let _ = std::process::Command::new("git")
+                                                .args(["restore", "--staged", "--", &path]).current_dir(&root).status();
+                                            let _ = proxy.send_event(UserEvent::GitOpDone);
+                                        });
+                                    }
+                                }
                                 CtxAction::OpenSettings    => open_settings_tab(s),
                                 CtxAction::GotoDefinition  => execute_command(s, CommandAction::GotoDefinition),
                                 CtxAction::FindReferences  => execute_command(s, CommandAction::FindReferences),
@@ -4231,7 +4396,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 x: act_w, y: gear_y,
                                 items: vec![ContextMenuItem { label: "Open Settings", shortcut: "", action: CtxAction::OpenSettings, enabled: true }],
                                 hovered: 0,
-                                tab_source: None,
+                                tab_source: None, git_entry: None,
                             });
                         }
                     }
@@ -4341,9 +4506,10 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                         }
                     } else if s.left_view == LeftView::Git {
-                        // Git panel click
+                        // Git panel click — all y positions adjusted for panel scroll
                         let panel_h = s.h as i32 - s.status_h();
-                        let staged_header_y  = 4;
+                        let scroll_px        = s.git_panel.scroll as i32 * lh;
+                        let staged_header_y  = 4 - scroll_px;
                         let staged_start_y   = staged_header_y + lh;
                         let staged_count     = s.git_panel.staged.len();
                         let staged_rows      = staged_count.max(1);  // includes "(none)"
@@ -4376,19 +4542,7 @@ impl ApplicationHandler<UserEvent> for App {
                             if i < unstaged_count {
                                 s.git_panel.sel = GitSel::Unstaged(i);
                                 let path = s.git_panel.unstaged[i].path.clone();
-                                let root = s.explorer.as_ref().map(|e| e.root.clone())
-                                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-                                let reset_scroll = s.git_diff.as_ref()
-                                    .map(|d| d.path != path).unwrap_or(true);
-                                s.git_diff = Some(GitDiffState {
-                                    path:    path.clone(),
-                                    lines:   vec![],
-                                    scroll:  if reset_scroll { 0 } else {
-                                        s.git_diff.as_ref().map(|d| d.scroll).unwrap_or(0)
-                                    },
-                                    loading: true,
-                                });
-                                refresh_git_diff(s.proxy.clone(), root, path);
+                                open_diff_tab(s, path, false);
                             }
                         } else if my >= commit_field_y && my < commit_field_y + lh {
                             s.git_panel.commit_focused = true;
@@ -4524,40 +4678,6 @@ impl ApplicationHandler<UserEvent> for App {
 
                 // Status bar — ignore
                 if my >= s.h as i32 - s.status_h() { return; }
-
-                // Diff overlay: intercept clicks in the editor area when diff is open
-                if s.git_diff.is_some() {
-                    let area = s.pane_area();
-                    if mx >= area.x {
-                        let lh_g  = s.glyphs.lh;
-                        let cw_g  = s.glyphs.cw;
-                        let header_h = lh_g + 6;
-                        let close_x  = area.x + area.w - cw_g * 3;
-                        let stage_x  = close_x - cw_g * 9;
-                        if my < header_h {
-                            if mx >= close_x {
-                                s.git_diff = None;
-                            } else if mx >= stage_x {
-                                if let Some(ref gd) = s.git_diff {
-                                    let path = gd.path.clone();
-                                    let root = s.explorer.as_ref().map(|e| e.root.clone())
-                                        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-                                    let proxy = s.proxy.clone();
-                                    s.git_diff = None;
-                                    std::thread::spawn(move || {
-                                        let _ = std::process::Command::new("git")
-                                            .args(["add", "--", &path])
-                                            .current_dir(&root)
-                                            .status();
-                                        let _ = proxy.send_event(UserEvent::GitOpDone);
-                                    });
-                                }
-                            }
-                        }
-                        { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
-                        return;
-                    }
-                }
 
                 // Which pane was clicked?
                 let area = s.pane_area();
@@ -5036,21 +5156,6 @@ impl ApplicationHandler<UserEvent> for App {
                         (dx_int, dy_int)
                     }
                 };
-                // Diff overlay scroll interception
-                let mx = s.mouse_x as i32;
-                let my = s.mouse_y as i32;
-                if s.git_diff.is_some() {
-                    let area = s.pane_area();
-                    let sh   = s.status_h();
-                    if let Some(ref mut gd) = s.git_diff {
-                        if mx >= area.x && my < s.h as i32 - sh && dy != 0 {
-                            let max_scroll = gd.lines.len().saturating_sub(1);
-                            gd.scroll = (gd.scroll as i32 + dy).clamp(0, max_scroll as i32) as usize;
-                            { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
-                            return;
-                        }
-                    }
-                }
                 // Scroll global find results when hovering over the left panel
                 let act_w = s.activity_bar_w();
                 let mx = s.mouse_x as i32;
@@ -5062,6 +5167,19 @@ impl ApplicationHandler<UserEvent> for App {
                         s.global_find.scroll = (s.global_find.scroll + (-dy) as usize).min(n.saturating_sub(1));
                     } else {
                         s.global_find.scroll = s.global_find.scroll.saturating_sub(dy as usize);
+                    }
+                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                    return;
+                }
+                // Intercept scroll when mouse is over the left panel — don't pass to editor
+                if s.explorer.is_some() && s.left_panel_visible
+                    && mx >= act_w && mx < act_w + s.explorer_w() && dy != 0
+                {
+                    if s.left_view == LeftView::Git {
+                        let total = s.git_panel.staged.len() + s.git_panel.unstaged.len();
+                        s.git_panel.scroll = (s.git_panel.scroll as i32 + dy)
+                            .max(0) as usize;
+                        s.git_panel.scroll = s.git_panel.scroll.min(total.saturating_sub(1));
                     }
                     { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                     return;
@@ -5361,36 +5479,6 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                     return;
-                }
-
-                // Diff overlay keyboard (Escape to close, arrows to scroll)
-                if s.git_diff.is_some() {
-                    match &event.logical_key {
-                        Key::Named(NamedKey::Escape) => {
-                            s.git_diff = None;
-                            s.needs_redraw = true;
-                            self.dirty.store(true, Ordering::Release);
-                            return;
-                        }
-                        Key::Named(NamedKey::ArrowUp) => {
-                            if let Some(ref mut gd) = s.git_diff {
-                                gd.scroll = gd.scroll.saturating_sub(1);
-                            }
-                            s.needs_redraw = true;
-                            self.dirty.store(true, Ordering::Release);
-                            return;
-                        }
-                        Key::Named(NamedKey::ArrowDown) => {
-                            if let Some(ref mut gd) = s.git_diff {
-                                let max_scroll = gd.lines.len().saturating_sub(1);
-                                gd.scroll = (gd.scroll + 1).min(max_scroll);
-                            }
-                            s.needs_redraw = true;
-                            self.dirty.store(true, Ordering::Release);
-                            return;
-                        }
-                        _ => {}
-                    }
                 }
 
                 // Context menu keyboard (Escape to close)
@@ -6323,8 +6411,8 @@ impl ApplicationHandler<UserEvent> for App {
                 s.git_panel.loading     = false;
                 s.needs_redraw = true;
             }
-            UserEvent::GitDiffResult { path, lines } => {
-                if let Some(ref mut d) = s.git_diff {
+            UserEvent::GitDiffResult { buf_id, path, lines } => {
+                if let Some(d) = s.git_diff_tabs.get_mut(&buf_id) {
                     if d.path == path {
                         d.lines   = lines;
                         d.loading = false;
@@ -6333,7 +6421,20 @@ impl ApplicationHandler<UserEvent> for App {
                 s.needs_redraw = true;
             }
             UserEvent::GitOpDone => {
-                s.git_diff = None;
+                // Close all GitDiff tabs across all panes (they're stale after a git op)
+                let mut removed_buf_ids: Vec<usize> = Vec::new();
+                for pane in s.panes.values_mut() {
+                    for t in pane.tabs.iter().filter(|t| t.kind == TabKind::GitDiff) {
+                        removed_buf_ids.push(t.buf_id);
+                    }
+                    pane.tabs.retain(|t| t.kind != TabKind::GitDiff);
+                    pane.active = pane.active.min(pane.tabs.len().saturating_sub(1));
+                    if pane.tabs.is_empty() {
+                        let new_id = s.next_buf_id; s.next_buf_id += 1;
+                        pane.tabs.push(Tab::untitled(new_id));
+                    }
+                }
+                for id in removed_buf_ids { s.git_diff_tabs.remove(&id); }
                 let root = s.explorer.as_ref().map(|e| e.root.clone())
                     .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
                 s.git_panel.loading = true;
@@ -6399,6 +6500,14 @@ fn draw_str(buf: &mut [u32], w: u32, h: u32, g: &Glyphs, text: &str, mut x: i32,
     }
 }
 
+fn fit_str(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars { s.to_owned() }
+    else {
+        let t: String = s.chars().take(max_chars.saturating_sub(1)).collect();
+        format!("{}…", t)
+    }
+}
+
 fn draw_squiggle(buf: &mut [u32], w: u32, h: u32, x: i32, y: i32, width: i32, color: u32) {
     for dx in 0..width {
         let yoff: i32 = if (dx % 4) < 2 { 0 } else { 2 };
@@ -6418,6 +6527,8 @@ struct PaneSnap {
     rect:           Rect,
     is_active:      bool,
     is_settings_tab: bool,
+    is_git_diff_tab: bool,
+    git_diff_snap:  Option<(Vec<DiffLine>, usize, bool)>, // (lines, scroll, loading)
     scroll:         usize,
     hscroll:        usize,
     find_h:         i32,
@@ -6602,7 +6713,7 @@ fn render(s: &mut State) {
         if pane.kind != PaneKind::Editor { continue; }
         let active = pane.active;
         let Some(tab) = pane.tabs.get_mut(active) else { continue };
-        if tab.kind == TabKind::Settings { continue; }
+        if tab.kind == TabKind::Settings || tab.kind == TabKind::GitDiff { continue; }
         let lang = tab.path.as_deref().map(Lang::from_path).unwrap_or(Lang::None);
         let fh  = if pane.find.open { lh + 4 + if pane.find.replace_open { lh + 4 } else { 0 } } else { 0 };
         let vis = ((rect.h - tab_h - fh).max(0) / lh).max(1) as usize;
@@ -6645,14 +6756,54 @@ fn render(s: &mut State) {
         let pane = s.panes.get(&pid)?;
         if pane.kind != PaneKind::Editor { return None; }
 
+        // Helper: build tab_info with ∆ suffix for GitDiff tabs
+        let make_tab_info = |tabs: &[Tab]| -> Vec<(String, bool)> {
+            tabs.iter().map(|t| {
+                if t.kind == TabKind::GitDiff {
+                    let name = t.path.as_deref()
+                        .and_then(|p| p.file_name()).and_then(|n| n.to_str())
+                        .unwrap_or("Diff");
+                    (format!("{} \u{0394}", name), false)
+                } else {
+                    (t.display_name().to_owned(), t.dirty)
+                }
+            }).collect()
+        };
+
+        // GitDiff tab: build a minimal snap
+        if pane.tabs.get(pane.active).map_or(false, |t| t.kind == TabKind::GitDiff) {
+            let tab = &pane.tabs[pane.active];
+            let buf_id = tab.buf_id;
+            let tab_scroll = tab.scroll;
+            let gd = s.git_diff_tabs.get(&buf_id);
+            let git_diff_snap = gd.map(|d| (d.lines.clone(), tab_scroll, d.loading));
+            let tab_info = make_tab_info(&pane.tabs);
+            return Some(PaneSnap {
+                id: pid, rect, is_active: pid == active_pane_id,
+                is_settings_tab: false, is_git_diff_tab: true,
+                git_diff_snap,
+                tab_info, active_tab: pane.active,
+                scroll: tab_scroll, hscroll: 0, find_h: 0, editor_h: 0,
+                cursors_snap: vec![], match_ranges: vec![],
+                find_open: false, find_repl_open: false,
+                find_focus: FindFocus::Query, case_sensitive: false, whole_word: false,
+                find_query: String::new(), find_repl: String::new(),
+                find_cursor_q: 0, find_cursor_r: 0,
+                find_sel_q: None, find_sel_r: None,
+                lines: vec![], total: 0, max_line_len: 0,
+                gutter_w: 0, ln_digits: 0,
+                path_name: String::new(), dirty: false,
+                cur_line: 0, cur_col: 0, diagnostics: vec![],
+            });
+        }
+
         // Settings tab: build a minimal snap (no lines/cursors needed)
         if pane.tabs.get(pane.active).map_or(false, |t| t.kind == TabKind::Settings) {
-            let tab_info: Vec<(String, bool)> = pane.tabs.iter()
-                .map(|t| (t.display_name().to_owned(), t.dirty)).collect();
+            let tab_info = make_tab_info(&pane.tabs);
             let settings_scroll = pane.tabs.get(pane.active).map_or(0, |t| t.scroll);
             return Some(PaneSnap {
                 id: pid, rect, is_active: pid == active_pane_id,
-                is_settings_tab: true,
+                is_settings_tab: true, is_git_diff_tab: false, git_diff_snap: None,
                 tab_info, active_tab: pane.active,
                 scroll: settings_scroll, hscroll: 0, find_h: 0, editor_h: 0,
                 cursors_snap: vec![], match_ranges: vec![],
@@ -6718,14 +6869,13 @@ fn render(s: &mut State) {
         let max_line_len = tab.max_line_len.unwrap_or(0);
         let ln_digits = State::line_num_digits(total);
         let gutter_w  = State::gutter_w(total, cw);
-        let tab_info: Vec<(String, bool)> = pane.tabs.iter()
-            .map(|t| (t.display_name().to_owned(), t.dirty)).collect();
+        let tab_info = make_tab_info(&pane.tabs);
 
         Some(PaneSnap {
             id: pid,
             rect,
             is_active: pid == active_pane_id,
-            is_settings_tab: false,
+            is_settings_tab: false, is_git_diff_tab: false, git_diff_snap: None,
             scroll, hscroll, find_h: fh, editor_h: eh,
             cursors_snap, match_ranges,
             find_open: pane.find.open, find_repl_open: pane.find.replace_open,
@@ -6909,6 +7059,7 @@ fn render(s: &mut State) {
         is_git_repo:    bool,
         sel:            GitSel,
         loading:        bool,
+        scroll:         usize,
     }
     let git_snap: Option<GitSnap> = if s.explorer.is_some() && left_view == LeftView::Git && left_panel_visible {
         let gp = &s.git_panel;
@@ -6921,6 +7072,7 @@ fn render(s: &mut State) {
             is_git_repo:    gp.is_git_repo,
             sel:            gp.sel.clone(),
             loading:        gp.loading,
+            scroll:         gp.scroll,
         })
     } else { None };
 
@@ -6928,11 +7080,6 @@ fn render(s: &mut State) {
     let err_count: usize = s.diagnostics.values()
         .map(|v| v.iter().filter(|d| d.severity == DiagSeverity::Error).count())
         .sum();
-
-    // Diff overlay snapshot
-    let diff_snap: Option<(String, Vec<DiffLine>, usize, bool)> = s.git_diff.as_ref().map(|d| {
-        (d.path.clone(), d.lines.clone(), d.scroll, d.loading)
-    });
 
     // Context menu snapshot
     let ctx_menu_snap: Option<(i32, i32, Vec<ContextMenuItem>, usize)> =
@@ -7242,47 +7389,58 @@ fn render(s: &mut State) {
                 } else if gs.loading {
                     draw_str(buf, w, h, g, " Loading...", px + 2, asc + 4, FG_DIM, px + pw - 1);
                 } else {
-                    let mut ry = 4i32;
+                    let scroll_px = gs.scroll as i32 * lh;
+                    let mut ry = 4i32 - scroll_px;
+                    let commit_area_top = panel_h - lh * 3 - 8;
                     // STAGED header
-                    draw_str(buf, w, h, g, " STAGED", px + 2, ry + asc, FG_DIM, px + pw - 1);
-                    fill(buf, w, h, px, ry + lh - 1, pw - 1, 1, BORDER);
+                    if ry + lh > 0 && ry < commit_area_top {
+                        draw_str(buf, w, h, g, " STAGED", px + 2, ry + asc, FG_DIM, px + pw - 1);
+                        fill(buf, w, h, px, ry + lh - 1, pw - 1, 1, BORDER);
+                    }
                     ry += lh;
-                    let staged_start_y = ry;
                     if gs.staged.is_empty() {
-                        draw_str(buf, w, h, g, "  (none)", px + 2, ry + asc, FG_DIM, px + pw - 1);
+                        if ry + lh > 0 && ry < commit_area_top {
+                            draw_str(buf, w, h, g, "  (none)", px + 2, ry + asc, FG_DIM, px + pw - 1);
+                        }
                         ry += lh;
                     } else {
                         for (i, entry) in gs.staged.iter().enumerate() {
-                            if ry + lh > panel_h { break; }
-                            let is_sel = gs.sel == GitSel::Staged(i);
-                            if is_sel { fill(buf, w, h, px, ry, pw - 1, lh, SEL_BG); }
-                            let avail = ((pw - 6) / cw).max(0) as usize;
-                            let label = format!("  {} {}", entry.xy.0, entry.path);
-                            let disp: String = label.chars().take(avail).collect();
-                            draw_str(buf, w, h, g, &disp, px + 2, ry + asc, FG, px + pw - 1);
+                            if ry + lh > commit_area_top { break; }
+                            if ry + lh > 0 {
+                                let is_sel = gs.sel == GitSel::Staged(i);
+                                if is_sel { fill(buf, w, h, px, ry, pw - 1, lh, SEL_BG); }
+                                let avail = ((pw - 6) / cw).max(0) as usize;
+                                let label = format!("  {} {}", entry.xy.0, entry.path);
+                                let disp: String = label.chars().take(avail).collect();
+                                draw_str(buf, w, h, g, &disp, px + 2, ry + asc, FG, px + pw - 1);
+                            }
                             ry += lh;
                         }
                     }
-                    let _ = staged_start_y;
 
                     // CHANGES header
                     ry += 2;
-                    draw_str(buf, w, h, g, " CHANGES", px + 2, ry + asc, FG_DIM, px + pw - 1);
-                    fill(buf, w, h, px, ry + lh - 1, pw - 1, 1, BORDER);
+                    if ry + lh > 0 && ry < commit_area_top {
+                        draw_str(buf, w, h, g, " CHANGES", px + 2, ry + asc, FG_DIM, px + pw - 1);
+                        fill(buf, w, h, px, ry + lh - 1, pw - 1, 1, BORDER);
+                    }
                     ry += lh;
-                    let commit_area_top = panel_h - lh * 3 - 8;
                     if gs.unstaged.is_empty() {
-                        draw_str(buf, w, h, g, "  (none)", px + 2, ry + asc, FG_DIM, px + pw - 1);
+                        if ry + lh > 0 && ry < commit_area_top {
+                            draw_str(buf, w, h, g, "  (none)", px + 2, ry + asc, FG_DIM, px + pw - 1);
+                        }
                     } else {
                         for (i, entry) in gs.unstaged.iter().enumerate() {
                             if ry + lh > commit_area_top { break; }
-                            let is_sel = gs.sel == GitSel::Unstaged(i);
-                            if is_sel { fill(buf, w, h, px, ry, pw - 1, lh, SEL_BG); }
-                            let avail = ((pw - 6) / cw).max(0) as usize;
-                            let xy_char = if entry.xy.0 == '?' { '?' } else { entry.xy.1 };
-                            let label = format!("  {} {}", xy_char, entry.path);
-                            let disp: String = label.chars().take(avail).collect();
-                            draw_str(buf, w, h, g, &disp, px + 2, ry + asc, FG, px + pw - 1);
+                            if ry + lh > 0 {
+                                let is_sel = gs.sel == GitSel::Unstaged(i);
+                                if is_sel { fill(buf, w, h, px, ry, pw - 1, lh, SEL_BG); }
+                                let avail = ((pw - 6) / cw).max(0) as usize;
+                                let xy_char = if entry.xy.0 == '?' { '?' } else { entry.xy.1 };
+                                let label = format!("  {} {}", xy_char, entry.path);
+                                let disp: String = label.chars().take(avail).collect();
+                                draw_str(buf, w, h, g, &disp, px + 2, ry + asc, FG, px + pw - 1);
+                            }
                             ry += lh;
                         }
                     }
@@ -7570,6 +7728,70 @@ fn render(s: &mut State) {
                 continue;
             }
 
+            // GitDiff tab content
+            if snap.is_git_diff_tab {
+                let content_y = r.y + tab_h;
+                let content_h = r.y + r.h - content_y;
+                fill(buf, w, h, r.x, content_y, r.w, content_h, BG);
+
+                if let Some((ref lines, gd_scroll, gd_loading)) = snap.git_diff_snap {
+                    const DIGITS: i32 = 4;
+                    let gutter_w = (DIGITS * 2 + 3) * cw;
+                    let ed_gx = r.x + gutter_w;
+                    let clip_r_gd = r.x + r.w;
+
+                    // Vertical separator lines in gutter
+                    let sep1_x = r.x + (DIGITS + 1) * cw;
+                    let sep2_x = r.x + (DIGITS * 2 + 2) * cw;
+                    fill(buf, w, h, sep1_x, content_y, 1, content_h, BORDER);
+                    fill(buf, w, h, sep2_x, content_y, 1, content_h, BORDER);
+
+                    if gd_loading {
+                        draw_str(buf, w, h, g, "  Loading...", ed_gx, content_y + asc, FG_DIM, clip_r_gd);
+                    } else if lines.is_empty() {
+                        draw_str(buf, w, h, g, "  (no changes)", ed_gx, content_y + asc, FG_DIM, clip_r_gd);
+                    } else {
+                        let (mut old_line, mut new_line) = compute_line_nums_at(lines, gd_scroll);
+                        let mut ry = content_y;
+                        for line in lines.iter().skip(gd_scroll) {
+                            if ry + lh > r.y + r.h { break; }
+                            match line {
+                                DiffLine::Hunk(s) => {
+                                    fill(buf, w, h, r.x, ry, r.w, lh, BG);
+                                    draw_str(buf, w, h, g, s, ed_gx, ry + asc, DIFF_HUNK, clip_r_gd);
+                                    if let Some((o, n)) = parse_hunk_header(s) { old_line = o; new_line = n; }
+                                }
+                                DiffLine::Added(s) => {
+                                    fill(buf, w, h, r.x, ry, r.w, lh, DIFF_ADD_BG);
+                                    let ln_str = format!("{:>w$}", new_line, w = DIGITS as usize);
+                                    draw_str(buf, w, h, g, &ln_str, r.x + (DIGITS + 2) * cw, ry + asc, DIFF_ADD_FG, sep2_x);
+                                    draw_str(buf, w, h, g, s, ed_gx, ry + asc, DIFF_ADD_FG, clip_r_gd);
+                                    new_line += 1;
+                                }
+                                DiffLine::Removed(s) => {
+                                    fill(buf, w, h, r.x, ry, r.w, lh, DIFF_DEL_BG);
+                                    let ln_str = format!("{:>w$}", old_line, w = DIGITS as usize);
+                                    draw_str(buf, w, h, g, &ln_str, r.x + cw, ry + asc, DIFF_DEL_FG, sep1_x);
+                                    draw_str(buf, w, h, g, s, ed_gx, ry + asc, DIFF_DEL_FG, clip_r_gd);
+                                    old_line += 1;
+                                }
+                                DiffLine::Context(s) => {
+                                    let old_str = format!("{:>w$}", old_line, w = DIGITS as usize);
+                                    let new_str = format!("{:>w$}", new_line, w = DIGITS as usize);
+                                    draw_str(buf, w, h, g, &old_str, r.x + cw, ry + asc, FG_DIM, sep1_x);
+                                    draw_str(buf, w, h, g, &new_str, r.x + (DIGITS + 2) * cw, ry + asc, FG_DIM, sep2_x);
+                                    draw_str(buf, w, h, g, s, ed_gx, ry + asc, FG_DIM, clip_r_gd);
+                                    old_line += 1;
+                                    new_line += 1;
+                                }
+                            }
+                            ry += lh;
+                        }
+                    }
+                }
+                continue;
+            }
+
             // Editor lines
             for (vi, (text, line_start, colors)) in snap.lines.iter().enumerate() {
                 let li       = scroll + vi;
@@ -7628,7 +7850,7 @@ fn render(s: &mut State) {
                 // Text
                 let mut x = ed_x - hscroll as i32 * cw;
                 for (ci, ch) in text.chars().enumerate() {
-                    if x + cw > 0 && x < clip_r {
+                    if x + cw > ed_x && x < clip_r {
                         let color = colors.get(ci).copied().unwrap_or(FG);
                         if let Some((m, bmap)) = g.get(ch) {
                             blit(buf, w, h, bmap, m, x, baseline, color);
@@ -7943,58 +8165,6 @@ fn render(s: &mut State) {
             draw_str(buf, w, h, g, &format!("  {}", snap.title), 0, sbase, FG_DIM, w as i32);
         }
 
-        // ── Diff overlay ──────────────────────────────────────────────────
-        if let Some((ref ds_path, ref ds_lines, ds_scroll, ds_loading)) = diff_snap {
-            let area_x  = area.x;
-            let area_w  = area.w;
-            let full_h  = h as i32 - status_h;
-            let header_h = lh + 6;
-
-            fill(buf, w, h, area_x, 0, area_w, full_h, BG2);
-            fill(buf, w, h, area_x, 0, 1, full_h, BORDER);
-            fill(buf, w, h, area_x, 0, area_w, header_h, SEL_BG);
-            fill(buf, w, h, area_x, header_h, area_w, 1, BORDER);
-
-            let label_clip = area_x + area_w - cw * 13;
-            draw_str(buf, w, h, g, &format!("  {ds_path}"), area_x, asc + 3, ACCENT, label_clip);
-
-            let stage_x = area_x + area_w - cw * 12;
-            draw_str(buf, w, h, g, "[Stage]", stage_x, asc + 3, FG, stage_x + cw * 7);
-
-            let close_x = area_x + area_w - cw * 3;
-            draw_str(buf, w, h, g, "[x]", close_x, asc + 3, FG_DIM, area_x + area_w - 1);
-
-            let content_y = header_h + 1;
-            if ds_loading {
-                draw_str(buf, w, h, g, "  Loading...", area_x, content_y + asc, FG_DIM, area_x + area_w - 1);
-            } else if ds_lines.is_empty() {
-                draw_str(buf, w, h, g, "  (no changes)", area_x, content_y + asc, FG_DIM, area_x + area_w - 1);
-            } else {
-                let mut ry = content_y;
-                for line in ds_lines.iter().skip(ds_scroll) {
-                    if ry + lh > full_h { break; }
-                    match line {
-                        DiffLine::Added(s) => {
-                            fill(buf, w, h, area_x, ry, area_w, lh, DIFF_ADD_BG);
-                            draw_str(buf, w, h, g, &format!(" +{s}"), area_x + 2, ry + asc, DIFF_ADD_FG, area_x + area_w - 1);
-                        }
-                        DiffLine::Removed(s) => {
-                            fill(buf, w, h, area_x, ry, area_w, lh, DIFF_DEL_BG);
-                            draw_str(buf, w, h, g, &format!(" -{s}"), area_x + 2, ry + asc, DIFF_DEL_FG, area_x + area_w - 1);
-                        }
-                        DiffLine::Context(s) => {
-                            draw_str(buf, w, h, g, &format!("  {s}"), area_x + 2, ry + asc, FG_DIM, area_x + area_w - 1);
-                        }
-                        DiffLine::Hunk(s) => {
-                            fill(buf, w, h, area_x, ry, area_w, lh, BG);
-                            draw_str(buf, w, h, g, &format!("  {s}"), area_x + 2, ry + asc, DIFF_HUNK, area_x + area_w - 1);
-                        }
-                    }
-                    ry += lh;
-                }
-            }
-        }
-
         // ── Context menu ──────────────────────────────────────────────────
         if let Some((cmx, cmy, items, hovered)) = &ctx_menu_snap {
             let item_h  = lh + 2;
@@ -8090,11 +8260,17 @@ fn render(s: &mut State) {
                     }
                 }
             } else {
+                let avail_chars = ((ow - 10) / cw).max(4) as usize;
                 for (i, (name, dir)) in qf_items.iter().enumerate() {
                     let ry = oy + 4 + lh + 4 + i as i32 * lh;
                     if i == qf_sel_in_view { fill(buf, w, h, ox + 1, ry, ow - 2, lh, SEL_BG); }
-                    draw_str(buf, w, h, g, name, ox + 6, ry + asc, FG, ox + ow - 4 - dir.chars().count() as i32 * cw - cw);
-                    draw_str(buf, w, h, g, dir, ox + ow - 4 - dir.chars().count() as i32 * cw, ry + asc, FG_DIM, ox + ow - 2);
+                    let dir_max = (avail_chars / 3).max(1);
+                    let dir_disp = fit_str(dir, dir_max);
+                    let name_max = avail_chars.saturating_sub(dir_disp.chars().count() + 2);
+                    let name_disp = fit_str(name, name_max);
+                    let dir_w = dir_disp.chars().count() as i32 * cw;
+                    draw_str(buf, w, h, g, &name_disp, ox + 6, ry + asc, FG, ox + ow - 4 - dir_w - cw);
+                    draw_str(buf, w, h, g, &dir_disp, ox + ow - 4 - dir_w, ry + asc, FG_DIM, ox + ow - 2);
                 }
             }
         }
