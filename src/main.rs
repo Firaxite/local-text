@@ -3629,12 +3629,16 @@ fn global_replace(results: &[GlobalFindResult], query: &str, replace: &str, case
 }
 
 fn darken_buffer(buf: &mut [u32], w: u32, h: u32) {
+    // Multiply each channel by 100/256 ≈ 39% brightness (vs 100/255 — indistinguishable).
+    // Packing R+B into one lane avoids channel extraction and all integer divisions:
+    //   max(channel * 100) = 25500 = 0x63CC < 2^15, so the B contribution (bits 0-14)
+    //   never bleeds into the R contribution (bits 16+) — no overflow between channels.
+    // The compiler auto-vectorizes this loop with NEON on Apple Silicon.
     let len = (w as usize).saturating_mul(h as usize).min(buf.len());
     for p in buf[..len].iter_mut() {
-        let r = (*p >> 16 & 0xFF) * 100 / 255;
-        let g = (*p >>  8 & 0xFF) * 100 / 255;
-        let b = (*p       & 0xFF) * 100 / 255;
-        *p = (r << 16) | (g << 8) | b;
+        let rb = ((*p & 0x00FF00FF) * 100 >> 8) & 0x00FF00FF;
+        let g  = ((*p & 0x0000FF00) * 100 >> 8) & 0x0000FF00;
+        *p = rb | g;
     }
 }
 
