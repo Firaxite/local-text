@@ -406,6 +406,8 @@ struct GlobalFind {
     case_sensitive: bool,
     live_search:    bool,
     search_fire_at: Option<Instant>,
+    searching:      bool,   // true while a background search thread is running
+    search_token:   u64,    // incremented per search; stale SearchDone events are dropped
     cursor_query:   usize,
     cursor_replace: usize,
     cursor_include: usize,
@@ -1016,6 +1018,7 @@ pub enum UserEvent {
     GitStatusResult { staged: Vec<GitEntry>, unstaged: Vec<GitEntry>, is_git_repo: bool },
     GitDiffResult   { buf_id: usize, path: String, lines: Vec<DiffLine> },
     GitOpDone,
+    SearchDone { token: u64, results: Vec<GlobalFindResult> },
     Redraw,
 }
 
@@ -3542,6 +3545,24 @@ fn open_diff_tab(s: &mut State, path: String, staged: bool) {
     refresh_git_diff(s.proxy.clone(), root, path, staged, buf_id);
 }
 
+fn spawn_search(gf: &mut GlobalFind, root: std::path::PathBuf, proxy: EventLoopProxy<UserEvent>) {
+    let query   = gf.query.clone();
+    let include = gf.include_glob.clone();
+    let exclude = gf.exclude_glob.clone();
+    let cs      = gf.case_sensitive;
+    gf.search_token += 1;
+    let token = gf.search_token;
+    gf.searching = true;
+    gf.results.clear();
+    gf.selected = 0;
+    gf.scroll   = 0;
+    std::thread::spawn(move || {
+        let results = if query.is_empty() { Vec::new() }
+                      else { global_search(&root, &query, &include, &exclude, cs) };
+        let _ = proxy.send_event(UserEvent::SearchDone { token, results });
+    });
+}
+
 fn global_search(root: &std::path::Path, query: &str, include: &str, exclude: &str, case_sensitive: bool) -> Vec<GlobalFindResult> {
     let mut all_files = Vec::new();
     walk_files(root, &mut all_files, 0);
@@ -3669,17 +3690,7 @@ impl ApplicationHandler<UserEvent> for App {
                         s.global_find.search_fire_at = None;
                         let root = s.explorer.as_ref().map(|e| e.root.clone())
                             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-                        let query   = s.global_find.query.clone();
-                        let include = s.global_find.include_glob.clone();
-                        let exclude = s.global_find.exclude_glob.clone();
-                        let cs      = s.global_find.case_sensitive;
-                        if !query.is_empty() {
-                            s.global_find.results  = global_search(&root, &query, &include, &exclude, cs);
-                        } else {
-                            s.global_find.results.clear();
-                        }
-                        s.global_find.selected = 0;
-                        s.global_find.scroll   = 0;
+                        spawn_search(&mut s.global_find, root, s.proxy.clone());
                         self.dirty.store(true, Ordering::Release);
                         s.needs_redraw = true;
                     }
@@ -3785,6 +3796,7 @@ impl ApplicationHandler<UserEvent> for App {
                 results: vec![], scroll: 0, selected: 0,
                 focus: GlobalFindFocus::Query, case_sensitive: false,
                 live_search: false, search_fire_at: None,
+                searching: false, search_token: 0,
                 cursor_query: 0, cursor_replace: 0, cursor_include: 0, cursor_exclude: 0,
                 sel_anchor_q: None, sel_anchor_r: None, sel_anchor_inc: None, sel_anchor_exc: None,
             },
@@ -4686,16 +4698,9 @@ impl ApplicationHandler<UserEvent> for App {
                             // Search button
                             let root = s.explorer.as_ref().map(|e| e.root.clone())
                                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-                            let query   = s.global_find.query.clone();
-                            let include = s.global_find.include_glob.clone();
-                            let exclude = s.global_find.exclude_glob.clone();
-                            let cs      = s.global_find.case_sensitive;
-                            if !query.is_empty() {
-                                let results = global_search(&root, &query, &include, &exclude, cs);
-                                s.global_find.results  = results;
-                                s.global_find.selected = 0;
-                                s.global_find.scroll   = 0;
-                                s.global_find.focus    = GlobalFindFocus::Results;
+                            if !s.global_find.query.is_empty() {
+                                spawn_search(&mut s.global_find, root, s.proxy.clone());
+                                s.global_find.focus = GlobalFindFocus::Results;
                             }
                             // Also check Replace All button
                             let search_label_w = "[Search]".chars().count() as i32 * s.glyphs.cw;
@@ -5661,16 +5666,9 @@ impl ApplicationHandler<UserEvent> for App {
                         Key::Named(NamedKey::Enter) if focus == GlobalFindFocus::Query => {
                             let root = s.explorer.as_ref().map(|e| e.root.clone())
                                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-                            let query   = s.global_find.query.clone();
-                            let include = s.global_find.include_glob.clone();
-                            let exclude = s.global_find.exclude_glob.clone();
-                            let cs      = s.global_find.case_sensitive;
-                            if !query.is_empty() {
-                                let results = global_search(&root, &query, &include, &exclude, cs);
-                                s.global_find.results  = results;
-                                s.global_find.selected = 0;
-                                s.global_find.scroll   = 0;
-                                s.global_find.focus    = GlobalFindFocus::Results;
+                            if !s.global_find.query.is_empty() {
+                                spawn_search(&mut s.global_find, root, s.proxy.clone());
+                                s.global_find.focus = GlobalFindFocus::Results;
                             }
                         }
                         key => {
@@ -6523,6 +6521,14 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 s.needs_redraw = true;
             }
+            UserEvent::SearchDone { token, results } => {
+                if token == s.global_find.search_token {
+                    s.global_find.results  = results;
+                    s.global_find.searching = false;
+                    s.needs_redraw = true;
+                    self.dirty.store(true, Ordering::Release);
+                }
+            }
             UserEvent::GitOpDone => {
                 // Close all GitDiff tabs across all panes (they're stale after a git op)
                 let mut removed_buf_ids: Vec<usize> = Vec::new();
@@ -7140,6 +7146,7 @@ fn render(s: &mut State) {
         focus:    GlobalFindFocus,
         case_sensitive: bool,
         live_search: bool,
+        searching: bool,
         results:  Vec<(String, usize, String, usize, usize)>,
         selected: usize, scroll: usize,
         cursor_query:   usize, cursor_replace: usize,
@@ -7157,6 +7164,7 @@ fn render(s: &mut State) {
             focus:   gf.focus,
             case_sensitive: gf.case_sensitive,
             live_search: gf.live_search,
+            searching: gf.searching,
             results: gf.results.iter().map(|r| {
                 let name = r.path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_owned();
                 (name, r.line_num, r.line_text.clone(), r.match_col, r.match_len)
@@ -7481,7 +7489,11 @@ fn render(s: &mut State) {
                 let vis_count = (res_h / lh).max(0) as usize;
                 let start = gf.scroll.min(gf.results.len());
                 let end   = (start + vis_count).min(gf.results.len());
-                let count_str = format!(" {} match(es)", gf.results.len());
+                let count_str = if gf.searching {
+                    " Searching...".to_owned()
+                } else {
+                    format!(" {} match(es)", gf.results.len())
+                };
                 draw_str(buf, w, h, g, &count_str, px, fy + asc, FG_DIM, px + pw - 1);
                 fy += lh;
                 for (ri, (name, line_num, line_text, _match_col, _match_len)) in gf.results[start..end].iter().enumerate() {
