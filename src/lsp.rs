@@ -16,14 +16,15 @@ use std::thread;
 
 use winit::event_loop::EventLoopProxy;
 
+use crate::vpath::{SshHost, VPath};
 use crate::{Diagnostic, DiagSeverity, Lang, UserEvent};
 
 // ── PendingKind ───────────────────────────────────────────────────────────────
 pub enum PendingKind {
     Definition,
     References,
-    Formatting { path: PathBuf },
-    OrganizeImports { path: PathBuf },
+    Formatting { path: VPath },
+    OrganizeImports { path: VPath },
 }
 
 // ── LspServer ─────────────────────────────────────────────────────────────────
@@ -33,9 +34,11 @@ pub struct LspServer {
     pub stdin:          ChildStdin,
     pub output_pane_id: usize,
     pub request_id:     u64,
-    pub doc_version:    HashMap<PathBuf, u64>,
+    pub doc_version:    HashMap<VPath, u64>,
     pub initialized:    bool,
     pub pending:        HashMap<u64, PendingKind>,
+    /// If Some, this server runs on a remote host via SSH.
+    pub ssh_host:       Option<SshHost>,
 }
 
 // ── LspManager ────────────────────────────────────────────────────────────────
@@ -109,13 +112,20 @@ pub fn send_request(server: &mut LspServer, method: &str, params: serde_json::Va
 
 // ── Diagnostic parsing ────────────────────────────────────────────────────────
 
-/// If the message is a publishDiagnostics notification, return the (path, diagnostics).
-pub fn parse_diagnostics(json: &str) -> Option<(PathBuf, Vec<Diagnostic>)> {
+/// If the message is a publishDiagnostics notification, return the (path,
+/// diagnostics).  `ssh_host` is the remote host the server is running on (if
+/// any); it is used to reconstruct the correct `VPath::Remote` from the
+/// `file://` URI the server emits.
+pub fn parse_diagnostics(json: &str, ssh_host: Option<&SshHost>) -> Option<(VPath, Vec<Diagnostic>)> {
     let v: serde_json::Value = serde_json::from_str(json).ok()?;
     if v["method"].as_str() != Some("textDocument/publishDiagnostics") { return None; }
     let params = &v["params"];
     let uri = params["uri"].as_str()?;
-    let path = PathBuf::from(uri.strip_prefix("file://")?);
+    let raw_path = PathBuf::from(uri.strip_prefix("file://")?);
+    let path = match ssh_host {
+        Some(host) => VPath::Remote { host: host.clone(), path: raw_path },
+        None       => VPath::Local(raw_path),
+    };
     let diags = params["diagnostics"].as_array()?.iter().filter_map(|d| {
         let s = &d["range"]["start"];
         let e = &d["range"]["end"];
@@ -146,10 +156,14 @@ pub fn is_initialize_response(json: &str) -> bool {
 
 /// Spawn a language server for the given language. Returns None if the binary
 /// is not installed or the language has no configured server.
+///
+/// When `ssh_host` is `Some`, the server is launched on the remote host via
+/// `ssh [user@]host -- <cmd> <args>`, reusing the ControlMaster socket.
 pub fn start_server(
     lang: Lang,
     output_pane_id: usize,
     proxy: EventLoopProxy<UserEvent>,
+    ssh_host: Option<SshHost>,
 ) -> Option<LspServer> {
     let (cmd, args): (&str, &[&str]) = match lang {
         Lang::Rust       => ("rust-analyzer", &["--stdio"]),
@@ -158,13 +172,29 @@ pub fn start_server(
         Lang::None | Lang::Json | Lang::Jsonc | Lang::Markdown => return None,
     };
 
-    let mut child = Command::new(cmd)
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .ok()?; // silently returns None if binary not found
+    let mut child = if let Some(ref host) = ssh_host {
+        // Run LSP server on remote via SSH, reusing the ControlMaster socket.
+        let control_path = host.control_path();
+        let mut ssh_cmd = Command::new("ssh");
+        ssh_cmd
+            .arg("-o").arg(format!("ControlPath={}", control_path.display()))
+            .arg(host.host_arg())
+            .arg("--")
+            .arg(cmd)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        ssh_cmd.spawn().ok()?
+    } else {
+        Command::new(cmd)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .ok()?
+    };
 
     let stdin  = child.stdin.take().unwrap();
     let stdout = child.stdout.take().unwrap();
@@ -173,6 +203,7 @@ pub fn start_server(
     // stdout reader: JSON-RPC messages → LspOutput + LspDiagnostics/LspResponse events
     let proxy_out = proxy.clone();
     let opi = output_pane_id;
+    let host_for_thread = ssh_host.clone();
     thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
         while let Some(msg) = read_message(&mut reader) {
@@ -187,7 +218,7 @@ pub fn start_server(
                     let id = v["id"].as_u64().unwrap();
                     let result = v["result"].clone();
                     let _ = proxy_out.send_event(UserEvent::LspResponse { server_id: opi, id, result });
-                } else if let Some((path, diags)) = parse_diagnostics(&msg) {
+                } else if let Some((path, diags)) = parse_diagnostics(&msg, host_for_thread.as_ref()) {
                     let _ = proxy_out.send_event(UserEvent::LspDiagnostics { path, diagnostics: diags });
                 }
             }
@@ -215,16 +246,17 @@ pub fn start_server(
         doc_version: HashMap::new(),
         initialized: false,
         pending: HashMap::new(),
+        ssh_host,
     })
 }
 
 // ── LSP notification helpers ──────────────────────────────────────────────────
 
 /// Build textDocument/didOpen params.
-pub fn did_open_params(path: &PathBuf, text: &str, lang_id: &str) -> serde_json::Value {
+pub fn did_open_params(path: &VPath, text: &str, lang_id: &str) -> serde_json::Value {
     serde_json::json!({
         "textDocument": {
-            "uri":        uri_from_path(path),
+            "uri":        path.to_lsp_uri(),
             "languageId": lang_id,
             "version":    1,
             "text":       text,
@@ -233,10 +265,10 @@ pub fn did_open_params(path: &PathBuf, text: &str, lang_id: &str) -> serde_json:
 }
 
 /// Build textDocument/didChange params (full document sync).
-pub fn did_change_params(path: &PathBuf, text: &str, version: u64) -> serde_json::Value {
+pub fn did_change_params(path: &VPath, text: &str, version: u64) -> serde_json::Value {
     serde_json::json!({
         "textDocument": {
-            "uri":     uri_from_path(path),
+            "uri":     path.to_lsp_uri(),
             "version": version,
         },
         "contentChanges": [{ "text": text }]
@@ -244,8 +276,8 @@ pub fn did_change_params(path: &PathBuf, text: &str, version: u64) -> serde_json
 }
 
 /// Send LSP initialize + initialized handshake.
-pub fn send_initialize(server: &mut LspServer, root_path: Option<&PathBuf>) {
-    let root_uri = root_path.map(uri_from_path);
+pub fn send_initialize(server: &mut LspServer, root_path: Option<&VPath>) {
+    let root_uri = root_path.map(VPath::to_lsp_uri);
     let params = serde_json::json!({
         "processId": std::process::id(),
         "rootUri":   root_uri,
@@ -268,7 +300,7 @@ pub fn send_initialize(server: &mut LspServer, root_path: Option<&PathBuf>) {
 }
 
 /// Send textDocument/didOpen.
-pub fn notify_did_open(server: &mut LspServer, path: &PathBuf, text: &str) {
+pub fn notify_did_open(server: &mut LspServer, path: &VPath, text: &str) {
     let lang_id = match server.lang {
         Lang::Rust       => "rust",
         Lang::TypeScript => "typescript",
@@ -284,7 +316,7 @@ pub fn notify_did_open(server: &mut LspServer, path: &PathBuf, text: &str) {
 }
 
 /// Send textDocument/didChange.
-pub fn notify_did_change(server: &mut LspServer, path: &PathBuf, text: &str) {
+pub fn notify_did_change(server: &mut LspServer, path: &VPath, text: &str) {
     let ver = server.doc_version.entry(path.clone()).or_insert(0);
     *ver += 1;
     let version = *ver;
@@ -299,26 +331,26 @@ pub fn send_initialized(server: &mut LspServer) {
 }
 
 /// Send textDocument/didClose and remove the tracked document version.
-pub fn notify_did_close(server: &mut LspServer, path: &PathBuf) {
+pub fn notify_did_close(server: &mut LspServer, path: &VPath) {
     let params = serde_json::json!({
-        "textDocument": { "uri": uri_from_path(path) }
+        "textDocument": { "uri": path.to_lsp_uri() }
     });
     send_notification(server, "textDocument/didClose", params);
     server.doc_version.remove(path);
 }
 
-pub fn request_definition(srv: &mut LspServer, path: &PathBuf, line: usize, col: usize) -> u64 {
+pub fn request_definition(srv: &mut LspServer, path: &VPath, line: usize, col: usize) -> u64 {
     let id = send_request(srv, "textDocument/definition", serde_json::json!({
-        "textDocument": { "uri": uri_from_path(path) },
+        "textDocument": { "uri": path.to_lsp_uri() },
         "position": { "line": line, "character": col }
     }));
     srv.pending.insert(id, PendingKind::Definition);
     id
 }
 
-pub fn request_references(srv: &mut LspServer, path: &PathBuf, line: usize, col: usize) -> u64 {
+pub fn request_references(srv: &mut LspServer, path: &VPath, line: usize, col: usize) -> u64 {
     let id = send_request(srv, "textDocument/references", serde_json::json!({
-        "textDocument": { "uri": uri_from_path(path) },
+        "textDocument": { "uri": path.to_lsp_uri() },
         "position": { "line": line, "character": col },
         "context": { "includeDeclaration": false }
     }));
@@ -326,18 +358,18 @@ pub fn request_references(srv: &mut LspServer, path: &PathBuf, line: usize, col:
     id
 }
 
-pub fn request_formatting(srv: &mut LspServer, path: &PathBuf) -> u64 {
+pub fn request_formatting(srv: &mut LspServer, path: &VPath) -> u64 {
     let id = send_request(srv, "textDocument/formatting", serde_json::json!({
-        "textDocument": { "uri": uri_from_path(path) },
+        "textDocument": { "uri": path.to_lsp_uri() },
         "options": { "tabSize": 4, "insertSpaces": true }
     }));
     srv.pending.insert(id, PendingKind::Formatting { path: path.clone() });
     id
 }
 
-pub fn request_organize_imports(srv: &mut LspServer, path: &PathBuf) -> u64 {
+pub fn request_organize_imports(srv: &mut LspServer, path: &VPath) -> u64 {
     let id = send_request(srv, "textDocument/codeAction", serde_json::json!({
-        "textDocument": { "uri": uri_from_path(path) },
+        "textDocument": { "uri": path.to_lsp_uri() },
         "range": {
             "start": { "line": 0, "character": 0 },
             "end":   { "line": 0, "character": 0 }
@@ -346,8 +378,4 @@ pub fn request_organize_imports(srv: &mut LspServer, path: &PathBuf) -> u64 {
     }));
     srv.pending.insert(id, PendingKind::OrganizeImports { path: path.clone() });
     id
-}
-
-fn uri_from_path(path: &PathBuf) -> String {
-    format!("file://{}", path.display())
 }

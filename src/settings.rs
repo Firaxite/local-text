@@ -88,10 +88,17 @@ pub struct Settings {
     pub cpu_double_buffer: bool,   // true = 2 IOSurfaces (tear-free); false = legacy single-buffer
     #[serde(default = "Settings::default_gpu_drawable_count")]
     pub gpu_drawable_count: u8,    // Metal drawable pool size: 2 or 3 (Apple minimum is 2)
+    /// Recently opened remote SSH URIs (most recent first), stored as "ssh://[user@]host[:port]/path".
+    #[serde(default)]
+    pub recent_remote_hosts: Vec<String>,
+    /// Per-host extra PATH directories for finding LSP binaries on remote.
+    /// Key = host string (e.g. "user@host" or "host"), value = list of directories.
+    #[serde(default)]
+    pub remote_lsp_search_paths: std::collections::HashMap<String, Vec<String>>,
 }
 
 impl Default for Settings {
-    fn default() -> Self { Settings { renderer: RendererBackend::Cpu, vsync: true, font_size: Self::default_font_size(), rainbow_brackets: false, undo_limit: Self::default_undo_limit(), term_copy_paste: false, term_cmd_bs: false, term_alt_bs: false, term_word_select: TermWordSelect::Whitespace, format_on_save: String::new(), organize_imports_on_save: String::new(), format_command: String::new(), glyph_cache_limit: GlyphCacheLimit::Unlimited, cpu_double_buffer: Self::default_cpu_double_buffer(), gpu_drawable_count: Self::default_gpu_drawable_count() } }
+    fn default() -> Self { Settings { renderer: RendererBackend::Cpu, vsync: true, font_size: Self::default_font_size(), rainbow_brackets: false, undo_limit: Self::default_undo_limit(), term_copy_paste: false, term_cmd_bs: false, term_alt_bs: false, term_word_select: TermWordSelect::Whitespace, format_on_save: String::new(), organize_imports_on_save: String::new(), format_command: String::new(), glyph_cache_limit: GlyphCacheLimit::Unlimited, cpu_double_buffer: Self::default_cpu_double_buffer(), gpu_drawable_count: Self::default_gpu_drawable_count(), recent_remote_hosts: Vec::new(), remote_lsp_search_paths: std::collections::HashMap::new() } }
 }
 
 impl Settings {
