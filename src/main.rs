@@ -4,6 +4,7 @@ mod terminal;
 mod lsp;
 mod vpath;
 mod ssh;
+mod collab;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -365,6 +366,8 @@ enum CommandAction {
     FormatDocument, OrganizeImports,
     OpenMarkdownPreview,
     OpenRemoteDirectory,
+    StartCollab,
+    JoinCollab,
 }
 
 struct CommandEntry { name: &'static str, shortcut: &'static str, action: CommandAction }
@@ -392,6 +395,8 @@ const COMMANDS: &[CommandEntry] = &[
     CommandEntry { name: "Organize Imports",      shortcut: "Opt+Shift+O",   action: CommandAction::OrganizeImports },
     CommandEntry { name: "Open Markdown Preview", shortcut: "Cmd+Shift+M",   action: CommandAction::OpenMarkdownPreview },
     CommandEntry { name: "Open Remote Directory…", shortcut: "",              action: CommandAction::OpenRemoteDirectory },
+    CommandEntry { name: "Start Collab Session",   shortcut: "",              action: CommandAction::StartCollab },
+    CommandEntry { name: "Join Collab Session…",   shortcut: "",              action: CommandAction::JoinCollab },
 ];
 
 // ── Global find/replace ───────────────────────────────────────────────────────
@@ -1084,6 +1089,13 @@ pub enum UserEvent {
     RemoteFileContent   { token: u64, path: VPath, content: String },
     RemoteWriteDone     { path: VPath },
     RemoteDirListing    { path: VPath, entries: Vec<(String, bool)> },
+    // Collab events
+    CollabMessage     { from_site_id: u64, msg: collab::CollabMsg },
+    CollabConnected   { session: Box<collab::CollabSession>, doc_text: String, peers: Vec<collab::PeerInfo> },
+    CollabDisconnected,
+    CollabError       { msg: String },
+    CollabGuestJoined { site_id: u64, peer: collab::PeerInfo },
+    CollabGuestLeft   { site_id: u64 },
 }
 
 // ── Application state ─────────────────────────────────────────────────────────
@@ -1161,6 +1173,11 @@ struct State {
 
     /// Connection state for each SSH host (Connecting | Connected | Failed).
     ssh_connections: HashMap<vpath::SshHost, SshConnectionState>,
+
+    /// Active collab session (None = not in a session, zero RAM overhead).
+    collab: Option<collab::CollabSession>,
+    /// Before-snapshot captured in push_undo when collab is active, consumed by notify_collab_change.
+    collab_before: Option<ropey::Rope>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -1349,6 +1366,21 @@ impl State {
     // Call before every edit. coalesce=true merges with the previous entry when
     // that entry was also coalesced (used for consecutive single-char typing).
     fn push_undo(&mut self, coalesce: bool) {
+        // In collab mode: capture the before-snapshot (once per event batch) for op extraction,
+        // then do hl/gen invalidation but skip the undo stack — full-snapshot undo is unsafe
+        // in a shared document (it would revert peer edits).
+        if self.collab.is_some() {
+            if self.collab_before.is_none() {
+                self.collab_before = Some(self.tab().text.clone());
+            }
+            let tab = self.tab_mut();
+            tab.max_line_len = None;
+            tab.hl_dirty_from = 0;
+            tab.hl_color_cache.clear();
+            tab.edit_generation += 1;
+            tab.last_typing = coalesce;
+            return;
+        }
         let limit = self.settings.undo_limit;
         let tab = self.tab_mut();
         tab.max_line_len = None;
@@ -2150,6 +2182,49 @@ fn notify_lsp_change(s: &mut State) {
     if let Some(srv) = s.lsp.server_for_lang_mut(lang) {
         lsp::notify_did_change(srv, &path, &text);
     }
+}
+
+/// Extract ops from before/after Rope diff and send to collab peers.
+/// Called after every keyboard event that might have edited the document.
+fn notify_collab_change(s: &mut State) {
+    let before = match s.collab_before.take() { Some(b) => b, None => return };
+    // Get current text from active editor pane
+    let ap = s.active_pane;
+    let after = match s.panes.get(&ap).and_then(|p| p.tabs.get(p.active)) {
+        Some(tab) if s.panes[&ap].kind == PaneKind::Editor => tab.text.clone(),
+        _ => return,
+    };
+    let site_id = match s.collab.as_ref() { Some(sess) => sess.site_id, None => return };
+    let ops = collab::extract_ops(&before, &after, site_id);
+    if !ops.is_empty() {
+        if let Some(session) = s.collab.as_mut() {
+            session.send_local_op(ops);
+        }
+    }
+}
+
+/// Send a debounced CursorUpdate to collab peers if enough time has elapsed.
+fn send_collab_cursor_if_needed(s: &mut State) {
+    let should_send = s.collab.as_ref()
+        .map_or(false, |sess| sess.cursor_debounce_elapsed());
+    if !should_send { return; }
+    let ap = s.active_pane;
+    let cursors: Vec<collab::RemoteCursorPos> = s.panes.get(&ap)
+        .filter(|p| p.kind == PaneKind::Editor)
+        .map(|p| p.tab().cursors.iter()
+            .map(|c| collab::RemoteCursorPos { head: c.head, tail: c.tail })
+            .collect())
+        .unwrap_or_default();
+    if let Some(session) = s.collab.as_mut() {
+        session.send_cursor_update(cursors);
+    }
+}
+
+/// Get the username from the environment for the collab peer name.
+fn whoami_or_default() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "Guest".to_owned())
 }
 
 // ── Syntax highlighter ────────────────────────────────────────────────────────
@@ -3221,6 +3296,97 @@ fn refilter_tree_search(ex: &mut FileExplorer) {
     ex.tree_search_sel = 0;
 }
 
+// ── Collab message dispatcher ─────────────────────────────────────────────────
+
+fn handle_collab_msg(s: &mut State, from_site_id: u64, msg: collab::CollabMsg) {
+    use collab::{CollabMsg, CollabRole};
+    match msg {
+        CollabMsg::Op { site_id, clock, mut ops, path: _ } => {
+            // Extract what we need before splitting borrows
+            let (is_host, local_site_id) = {
+                let Some(session) = s.collab.as_mut() else { return };
+                let is_host = matches!(session.role, CollabRole::Host { .. });
+                if !is_host {
+                    // Guest: rebase remote ops against our inflight queue
+                    collab::integrate_remote_against_inflight(&mut ops, &mut session.inflight);
+                }
+                (is_host, session.site_id)
+            };
+
+            // Apply ops to the active editor tab
+            let ap = s.active_pane;
+            if let Some(pane) = s.panes.get_mut(&ap) {
+                if pane.kind == PaneKind::Editor {
+                    if let Some(tab) = pane.tabs.get_mut(pane.active) {
+                        collab::apply_ops_to_rope(&mut tab.text, &ops);
+                        tab.dirty = true;
+                        tab.hl_dirty_from = 0;
+                        tab.hl_color_cache.clear();
+                        tab.edit_generation += 1;
+                        tab.max_line_len = None;
+                        // Adjust local cursors so they stay in the right place
+                        for cursor in &mut tab.cursors {
+                            let (nh, nt) = collab::adjust_cursor(
+                                cursor.head, cursor.tail, &ops, local_site_id,
+                            );
+                            cursor.head = nh;
+                            cursor.tail = nt;
+                        }
+                    }
+                }
+            }
+
+            // Adjust remote cursor positions for the op sender
+            if let Some(session) = s.collab.as_mut() {
+                if let Some(remote) = session.remote_cursors.get_mut(&site_id) {
+                    for rc in remote.iter_mut() {
+                        let (nh, nt) = collab::adjust_cursor(rc.head, rc.tail, &ops, 0);
+                        rc.head = nh;
+                        rc.tail = nt;
+                    }
+                }
+            }
+
+            // Host: sequence the op, broadcast to other guests, send Ack back
+            if is_host {
+                let Some(session) = s.collab.as_mut() else { return };
+                session.server_clock += 1;
+                let ack_clock = clock;  // ack the client's own clock
+                let broadcast_msg = CollabMsg::Op { site_id, clock, ops, path: String::new() };
+                session.broadcast_except_msg(Some(site_id), &broadcast_msg);
+                session.send_to_site(site_id, &CollabMsg::Ack { clock: ack_clock });
+            }
+        }
+        CollabMsg::Ack { clock } => {
+            if let Some(session) = s.collab.as_mut() {
+                session.inflight.retain(|op| op.clock > clock);
+            }
+        }
+        CollabMsg::CursorUpdate { site_id, cursors } => {
+            if let Some(session) = s.collab.as_mut() {
+                session.remote_cursors.insert(site_id, cursors);
+            }
+        }
+        CollabMsg::PeerJoined { peer } => {
+            let name = peer.name.clone();
+            if let Some(session) = s.collab.as_mut() {
+                if !session.peers.iter().any(|p| p.site_id == peer.site_id) {
+                    session.peers.push(peer);
+                }
+            }
+            s.status_msg = Some(format!("{name} joined the session"));
+        }
+        CollabMsg::PeerLeft { site_id } => {
+            if let Some(session) = s.collab.as_mut() {
+                session.peers.retain(|p| p.site_id != site_id);
+                session.remote_cursors.remove(&site_id);
+            }
+        }
+        _ => {}
+    }
+    let _ = from_site_id; // used for logging in future
+}
+
 fn execute_command(s: &mut State, action: CommandAction) {
     match action {
         CommandAction::Save           => {
@@ -3490,6 +3656,49 @@ fn execute_command(s: &mut State, action: CommandAction) {
                     .map(|u| VPath::parse(u))
                     .collect();
                 s.quick_finder.filtered = (0..s.quick_finder.entries.len()).collect();
+                s.quick_finder.selected = 0;
+                s.quick_finder.loading = false;
+            }
+        }
+        CommandAction::StartCollab => {
+            let port = s.settings.collab_port;
+            let ap = s.active_pane;
+            let doc_path = s.panes.get(&ap)
+                .and_then(|p| p.tabs.get(p.active))
+                .and_then(|t| t.path.as_ref())
+                .map(|p| p.to_string())
+                .unwrap_or_default();
+            match collab::start_host(port, doc_path, s.proxy.clone()) {
+                Ok(session) => {
+                    let invite = session.invite_str().to_owned();
+                    s.collab = Some(session);
+                    s.status_msg = Some(format!("Collab: {invite}"));
+                }
+                Err(e) => {
+                    s.status_msg = Some(format!("Collab error: {e}"));
+                }
+            }
+        }
+        CommandAction::JoinCollab => {
+            let query = s.quick_finder.query.trim().to_owned();
+            if query.starts_with("lt-collab://") {
+                let peer_name = whoami_or_default();
+                match collab::connect_guest(&query, peer_name, s.proxy.clone()) {
+                    Ok(()) => {
+                        s.status_msg = Some("Connecting to collab session…".to_owned());
+                    }
+                    Err(e) => {
+                        s.status_msg = Some(format!("Collab error: {e}"));
+                    }
+                }
+                s.quick_finder.open = false;
+            } else {
+                // Pre-fill quick-finder so user can paste or type the invite string
+                s.quick_finder.query = "lt-collab://".to_owned();
+                s.quick_finder.cursor = s.quick_finder.query.len();
+                s.quick_finder.open = true;
+                s.quick_finder.entries = vec![];
+                s.quick_finder.filtered = vec![];
                 s.quick_finder.selected = 0;
                 s.quick_finder.loading = false;
             }
@@ -3973,6 +4182,9 @@ impl ApplicationHandler<UserEvent> for App {
             last_sync_gen:  u64::MAX,
 
             ssh_connections: HashMap::new(),
+
+            collab:        None,
+            collab_before: None,
         };
 
         s.win.request_redraw();
@@ -4503,8 +4715,8 @@ impl ApplicationHandler<UserEvent> for App {
                                 CtxAction::FormatDocument  => execute_command(s, CommandAction::FormatDocument),
                                 CtxAction::OrganizeImports => execute_command(s, CommandAction::OrganizeImports),
                                 CtxAction::Copy  => { execute_command(s, CommandAction::Copy); }
-                                CtxAction::Cut   => { execute_command(s, CommandAction::Cut); }
-                                CtxAction::Paste => { execute_command(s, CommandAction::Paste); }
+                                CtxAction::Cut   => { execute_command(s, CommandAction::Cut); notify_collab_change(s); }
+                                CtxAction::Paste => { execute_command(s, CommandAction::Paste); notify_collab_change(s); }
                                 CtxAction::TabCopyRelPath => {
                                     if let Some((pid, ti)) = tab_source {
                                         let path = s.panes.get(&pid)
@@ -6602,6 +6814,8 @@ impl ApplicationHandler<UserEvent> for App {
                         };
 
                     notify_lsp_change(s);
+                    notify_collab_change(s);
+                    send_collab_cursor_if_needed(s);
                     { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                     let _ = handled;
                 }
@@ -6848,6 +7062,104 @@ impl ApplicationHandler<UserEvent> for App {
                 s.needs_redraw = true;
                 self.dirty.store(true, Ordering::Release);
             }
+
+            // ── Collab events ─────────────────────────────────────────────────
+            UserEvent::CollabMessage { from_site_id, msg } => {
+                handle_collab_msg(s, from_site_id, msg);
+                s.needs_redraw = true;
+                self.dirty.store(true, Ordering::Release);
+            }
+            UserEvent::CollabConnected { session, doc_text, peers: _ } => {
+                // Guest: replace active tab's content with the host's current snapshot
+                let ap = s.active_pane;
+                if let Some(pane) = s.panes.get_mut(&ap) {
+                    if pane.kind == PaneKind::Editor {
+                        if let Some(tab) = pane.tabs.get_mut(pane.active) {
+                            tab.text = ropey::Rope::from_str(&doc_text);
+                            tab.dirty = false;
+                            tab.hl_dirty_from = 0;
+                            tab.hl_color_cache.clear();
+                            tab.edit_generation += 1;
+                            tab.max_line_len = None;
+                            // Store the current tab path in the session
+                            let path_str = tab.path.as_ref()
+                                .map(|p| p.to_string())
+                                .unwrap_or_default();
+                            let mut sess = *session;
+                            sess.doc_path = path_str;
+                            s.collab = Some(sess);
+                        }
+                    }
+                }
+                let n = s.collab.as_ref().map_or(0, |sess| sess.peers.len());
+                s.status_msg = Some(format!("🔒 collab: connected ({n} peer{})", if n == 1 { "" } else { "s" }));
+                s.needs_redraw = true;
+                self.dirty.store(true, Ordering::Release);
+            }
+            UserEvent::CollabDisconnected => {
+                s.collab = None;
+                s.collab_before = None;
+                s.status_msg = Some("Collab session ended".to_owned());
+                s.needs_redraw = true;
+                self.dirty.store(true, Ordering::Release);
+            }
+            UserEvent::CollabError { msg } => {
+                s.status_msg = Some(format!("Collab error: {msg}"));
+                s.needs_redraw = true;
+                self.dirty.store(true, Ordering::Release);
+            }
+            UserEvent::CollabGuestJoined { site_id, peer } => {
+                // Host: send Welcome with current doc text, broadcast PeerJoined
+                let (server_clock, _session_key, all_peers) = {
+                    let Some(session) = s.collab.as_ref() else { return };
+                    (session.server_clock, session.session_key, session.peers.clone())
+                };
+                let name = peer.name.clone();
+                let color = peer.color;
+
+                // Get current doc text from active tab
+                let ap = s.active_pane;
+                let doc_text = s.panes.get(&ap)
+                    .filter(|p| p.kind == PaneKind::Editor)
+                    .and_then(|p| p.tabs.get(p.active))
+                    .map(|t| t.text.to_string())
+                    .unwrap_or_default();
+
+                let welcome = collab::CollabMsg::Welcome {
+                    your_site_id: site_id,
+                    doc_text,
+                    server_clock,
+                    peers: all_peers,
+                };
+                let new_peer = collab::PeerInfo { site_id, name: name.clone(), color };
+                let peer_joined = collab::CollabMsg::PeerJoined { peer: new_peer.clone() };
+
+                if let Some(session) = s.collab.as_ref() {
+                    session.send_to_site(site_id, &welcome);
+                    session.broadcast_except_msg(Some(site_id), &peer_joined);
+                }
+                if let Some(session) = s.collab.as_mut() {
+                    session.peers.push(new_peer);
+                }
+                s.status_msg = Some(format!("{name} joined the session"));
+                s.needs_redraw = true;
+                self.dirty.store(true, Ordering::Release);
+            }
+            UserEvent::CollabGuestLeft { site_id } => {
+                let name = s.collab.as_ref()
+                    .and_then(|sess| sess.peers.iter().find(|p| p.site_id == site_id))
+                    .map(|p| p.name.clone())
+                    .unwrap_or_else(|| format!("Guest {site_id}"));
+                if let Some(session) = s.collab.as_mut() {
+                    session.peers.retain(|p| p.site_id != site_id);
+                    session.remote_cursors.remove(&site_id);
+                    // Broadcast PeerLeft to remaining guests
+                    session.broadcast_except_msg(None, &collab::CollabMsg::PeerLeft { site_id });
+                }
+                s.status_msg = Some(format!("{name} left the session"));
+                s.needs_redraw = true;
+                self.dirty.store(true, Ordering::Release);
+            }
         }
         s.win.request_redraw();
     }
@@ -6965,6 +7277,8 @@ struct PaneSnap {
     cur_col:        usize,
     // Diagnostics: (line, col_start, col_end, severity, message)
     diagnostics:    Vec<(usize, usize, usize, DiagSeverity, String)>,
+    // Remote collab cursors: (line, col, color) — empty when collab is inactive
+    remote_cursors: Vec<(usize, usize, u32)>,
 }
 
 fn render(s: &mut State) {
@@ -7241,7 +7555,7 @@ fn render(s: &mut State) {
                 lines: vec![], total: 0, max_line_len: 0,
                 gutter_w: 0, ln_digits: 0,
                 path_name: String::new(), dirty: false,
-                cur_line: 0, cur_col: 0, diagnostics: vec![],
+                cur_line: 0, cur_col: 0, diagnostics: vec![], remote_cursors: vec![],
             });
         }
 
@@ -7263,7 +7577,7 @@ fn render(s: &mut State) {
                 lines: vec![], total: 0, max_line_len: 0,
                 gutter_w: 0, ln_digits: 0,
                 path_name: String::from("Settings"), dirty: false,
-                cur_line: 0, cur_col: 0, diagnostics: vec![],
+                cur_line: 0, cur_col: 0, diagnostics: vec![], remote_cursors: vec![],
             });
         }
 
@@ -7326,6 +7640,21 @@ fn render(s: &mut State) {
         let gutter_w  = State::gutter_w(total, cw);
         let tab_info = make_tab_info(&pane.tabs);
 
+        // Remote collab cursors — convert char offsets to (line, col, color)
+        let remote_cursors: Vec<(usize, usize, u32)> = s.collab.as_ref().map_or(vec![], |session| {
+            session.remote_cursors.iter().flat_map(|(&sid, cursors)| {
+                let color = session.peers.iter()
+                    .find(|p| p.site_id == sid)
+                    .map_or(0xFF6B6B, |p| p.color);
+                cursors.iter().map(move |rc| {
+                    let head  = rc.head.min(tab.text.len_chars());
+                    let line  = tab.text.char_to_line(head);
+                    let col   = head - tab.text.line_to_char(line);
+                    (line, col, color)
+                }).collect::<Vec<_>>()
+            }).collect()
+        });
+
         Some(PaneSnap {
             id: pid,
             rect,
@@ -7349,6 +7678,7 @@ fn render(s: &mut State) {
                 .and_then(|p| s.diagnostics.get(p))
                 .map(|diags| diags.iter().map(|d| (d.line, d.col_start, d.col_end, d.severity.clone(), d.message.clone())).collect())
                 .unwrap_or_default(),
+            remote_cursors,
         })
     }).collect();
 
@@ -7396,6 +7726,19 @@ fn render(s: &mut State) {
     let left_panel_visible = s.left_panel_visible;
     let act_w            = s.activity_bar_w();
     let status_msg       = s.status_msg.clone();
+    // Collab status shown in right side of status bar when active and no other status_msg
+    let collab_status: Option<String> = s.collab.as_ref().map(|sess| {
+        let n = sess.peer_count();
+        let ps = if n == 1 { "" } else { "s" };
+        match &sess.role {
+            collab::CollabRole::Host { invite_str, .. } => {
+                format!(" 🔒 hosting ({n} peer{ps}) | {invite_str} ")
+            }
+            collab::CollabRole::Guest => {
+                format!(" 🔒 collab ({n} peer{ps}) ")
+            }
+        }
+    });
 
     // Quick finder / command palette snapshot (unified)
     let qf_open         = s.quick_finder.open;
@@ -8375,6 +8718,14 @@ fn render(s: &mut State) {
                     }
                 }
 
+                // Remote collab cursors (3-pixel bar in peer color)
+                for &(rc_line, rc_col, rc_color) in &snap.remote_cursors {
+                    if rc_line == li {
+                        let cx = ed_x + (rc_col as i32 - hscroll as i32) * cw;
+                        if cx >= ed_x && cx < clip_r { fill(buf, w, h, cx, py, 3, lh, rc_color); }
+                    }
+                }
+
                 // Diagnostic squiggles
                 for &(dline, cs, ce, ref sev, _) in &snap.diagnostics {
                     if dline != li { continue; }
@@ -8660,16 +9011,24 @@ fn render(s: &mut State) {
         fill(buf, w, h, 0, sy, w as i32, 1, BORDER);
 
         let sbase = sy + status_h * 3 / 4;
+        // Show collab indicator on the right of the status bar (if active)
+        if let Some(ref cs) = collab_status {
+            let cs_w = cs.chars().count() as i32 * cw;
+            draw_str(buf, w, h, g, cs, w as i32 - cs_w, sbase, 0x6BCB77, w as i32);
+        }
+        let right_margin = collab_status.as_ref().map_or(0, |cs| cs.chars().count() as i32 * cw);
         if let Some(msg) = &status_msg {
-            draw_str(buf, w, h, g, &format!("  {msg}"), 0, sbase, 0xFFB86C, w as i32);
+            draw_str(buf, w, h, g, &format!("  {msg}"), 0, sbase, 0xFFB86C, w as i32 - right_margin);
         } else if let Some(snap) = pane_snaps.iter().find(|p| p.is_active) {
             let dirty_mark = if snap.dirty { " *" } else { "" };
-            draw_str(buf, w, h, g, &format!("  {}{dirty_mark}", snap.path_name), 0, sbase, FG, w as i32);
-            let lc_str = format!("Ln {}, Col {}  ", snap.cur_line + 1, snap.cur_col + 1);
-            let lc_w   = lc_str.chars().count() as i32 * cw;
-            draw_str(buf, w, h, g, &lc_str, w as i32 - lc_w, sbase, FG_DIM, w as i32);
+            draw_str(buf, w, h, g, &format!("  {}{dirty_mark}", snap.path_name), 0, sbase, FG, w as i32 - right_margin);
+            if collab_status.is_none() {
+                let lc_str = format!("Ln {}, Col {}  ", snap.cur_line + 1, snap.cur_col + 1);
+                let lc_w   = lc_str.chars().count() as i32 * cw;
+                draw_str(buf, w, h, g, &lc_str, w as i32 - lc_w, sbase, FG_DIM, w as i32);
+            }
         } else if let Some(snap) = md_snaps.iter().find(|p| p.is_active) {
-            draw_str(buf, w, h, g, &format!("  {}", snap.title), 0, sbase, FG_DIM, w as i32);
+            draw_str(buf, w, h, g, &format!("  {}", snap.title), 0, sbase, FG_DIM, w as i32 - right_margin);
         }
 
         // ── Context menu ──────────────────────────────────────────────────

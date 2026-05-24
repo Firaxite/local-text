@@ -95,10 +95,13 @@ pub struct Settings {
     /// Key = host string (e.g. "user@host" or "host"), value = list of directories.
     #[serde(default)]
     pub remote_lsp_search_paths: std::collections::HashMap<String, Vec<String>>,
+    /// TCP port the host listens on for collab sessions (default 7777).
+    #[serde(default = "Settings::default_collab_port")]
+    pub collab_port: u16,
 }
 
 impl Default for Settings {
-    fn default() -> Self { Settings { renderer: RendererBackend::Cpu, vsync: true, font_size: Self::default_font_size(), rainbow_brackets: false, undo_limit: Self::default_undo_limit(), term_copy_paste: false, term_cmd_bs: false, term_alt_bs: false, term_word_select: TermWordSelect::Whitespace, format_on_save: String::new(), organize_imports_on_save: String::new(), format_command: String::new(), glyph_cache_limit: GlyphCacheLimit::Unlimited, cpu_double_buffer: Self::default_cpu_double_buffer(), gpu_drawable_count: Self::default_gpu_drawable_count(), recent_remote_hosts: Vec::new(), remote_lsp_search_paths: std::collections::HashMap::new() } }
+    fn default() -> Self { Settings { renderer: RendererBackend::Cpu, vsync: true, font_size: Self::default_font_size(), rainbow_brackets: false, undo_limit: Self::default_undo_limit(), term_copy_paste: false, term_cmd_bs: false, term_alt_bs: false, term_word_select: TermWordSelect::Whitespace, format_on_save: String::new(), organize_imports_on_save: String::new(), format_command: String::new(), glyph_cache_limit: GlyphCacheLimit::Unlimited, cpu_double_buffer: Self::default_cpu_double_buffer(), gpu_drawable_count: Self::default_gpu_drawable_count(), recent_remote_hosts: Vec::new(), remote_lsp_search_paths: std::collections::HashMap::new(), collab_port: Self::default_collab_port() } }
 }
 
 impl Settings {
@@ -106,6 +109,7 @@ impl Settings {
     pub fn default_undo_limit() -> Option<usize> { Some(200) }
     pub fn default_cpu_double_buffer() -> bool { true }
     pub fn default_gpu_drawable_count() -> u8 { 2 }
+    pub fn default_collab_port() -> u16 { 7777 }
 
     fn config_path() -> Option<PathBuf> {
         let home = std::env::var("HOME").ok()?;
