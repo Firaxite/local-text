@@ -80,38 +80,40 @@ pub enum VPath {
 impl VPath {
     // ── Construction ─────────────────────────────────────────────────────────
 
-    /// Parse `"ssh://[user@]host[:port]/abs/path"` → `VPath::Remote`,
+    /// Parse `"ssh://[user@]host[:port]:path"` → `VPath::Remote`.
+    /// If `:path` is omitted, the path defaults to `~` on the remote.
     /// or any other string → `VPath::Local`.
     pub fn parse(s: &str) -> Self {
         if let Some(rest) = s.strip_prefix("ssh://") {
-            // rest = "[user@]host[:port]/abs/path"
-            if let Some(slash) = rest.find('/') {
-                let host_part = &rest[..slash];
-                let path_part = &rest[slash..]; // includes the leading '/'
+            let Some((host_part, path_part)) = split_ssh_host_and_path(rest) else {
+                return VPath::Local(PathBuf::from(s));
+            };
+            if host_part.is_empty() || host_part.contains('/') {
+                return VPath::Local(PathBuf::from(s));
+            }
 
-                let (user, host_port) = if let Some(at) = host_part.rfind('@') {
-                    (Some(host_part[..at].to_owned()), &host_part[at + 1..])
-                } else {
-                    (None, host_part)
-                };
+            let (user, host_port) = if let Some(at) = host_part.rfind('@') {
+                (Some(host_part[..at].to_owned()), &host_part[at + 1..])
+            } else {
+                (None, host_part)
+            };
 
-                let (host, port) = if let Some(colon) = host_port.rfind(':') {
-                    let maybe_port = &host_port[colon + 1..];
-                    if let Ok(p) = maybe_port.parse::<u16>() {
-                        (host_port[..colon].to_owned(), Some(p))
-                    } else {
-                        (host_port.to_owned(), None)
-                    }
+            let (host, port) = if let Some(colon) = host_port.rfind(':') {
+                let maybe_port = &host_port[colon + 1..];
+                if let Ok(p) = maybe_port.parse::<u16>() {
+                    (host_port[..colon].to_owned(), Some(p))
                 } else {
                     (host_port.to_owned(), None)
-                };
-
-                if !host.is_empty() {
-                    return VPath::Remote {
-                        host: SshHost { user, host, port },
-                        path: PathBuf::from(path_part),
-                    };
                 }
+            } else {
+                (host_port.to_owned(), None)
+            };
+
+            if !host.is_empty() {
+                return VPath::Remote {
+                    host: SshHost { user, host, port },
+                    path: PathBuf::from(path_part),
+                };
             }
         }
         VPath::Local(PathBuf::from(s))
@@ -240,6 +242,49 @@ impl VPath {
     }
 }
 
+fn split_ssh_host_and_path(rest: &str) -> Option<(&str, &str)> {
+    if rest.is_empty() { return None; }
+
+    let authority_start = rest.rfind('@').map(|idx| idx + 1).unwrap_or(0);
+    let first_slash = rest[authority_start..].find('/').map(|idx| authority_start + idx);
+    let first_colon = rest[authority_start..].find(':').map(|idx| authority_start + idx);
+
+    if let Some(slash) = first_slash {
+        if first_colon.map_or(true, |colon| slash < colon) {
+            return Some((&rest[..slash], &rest[slash..]));
+        }
+    }
+
+    if let Some(colon) = first_colon {
+        if let Some(slash) = first_slash {
+            if slash > colon + 1 {
+                let maybe_port = &rest[colon + 1..slash];
+                if maybe_port.parse::<u16>().is_ok() {
+                    return Some((&rest[..slash], &rest[slash..]));
+                }
+            }
+        }
+
+        let after_colon = &rest[colon + 1..];
+        if after_colon.is_empty() {
+            return Some((&rest[..colon], "~"));
+        }
+        if after_colon.parse::<u16>().is_ok() {
+            return Some((rest, "~"));
+        }
+        if let Some(second_colon) = after_colon.find(':') {
+            let maybe_port = &after_colon[..second_colon];
+            if maybe_port.parse::<u16>().is_ok() {
+                let path = &after_colon[second_colon + 1..];
+                return Some((&rest[..colon + 1 + second_colon], if path.is_empty() { "~" } else { path }));
+            }
+        }
+        return Some((&rest[..colon], after_colon));
+    }
+
+    Some((rest, "~"))
+}
+
 // ── Trait impls ───────────────────────────────────────────────────────────────
 
 impl fmt::Display for VPath {
@@ -271,5 +316,43 @@ impl Ord for VPath {
             (VPath::Local(_),  VPath::Remote { .. }) => Ordering::Less,
             (VPath::Remote { .. }, VPath::Local(_))  => Ordering::Greater,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_remote(input: &str, user: Option<&str>, host: &str, port: Option<u16>, path: &str) {
+        match VPath::parse(input) {
+            VPath::Remote { host: parsed_host, path: parsed_path } => {
+                assert_eq!(parsed_host.user.as_deref(), user);
+                assert_eq!(parsed_host.host.as_str(), host);
+                assert_eq!(parsed_host.port, port);
+                assert_eq!(parsed_path, PathBuf::from(path));
+            }
+            other => panic!("expected remote path for {input:?}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_remote_uri_forms() {
+        assert_remote("ssh://example.com", None, "example.com", None, "~");
+        assert_remote("ssh://example.com:/srv/app", None, "example.com", None, "/srv/app");
+        assert_remote("ssh://example.com:2222", None, "example.com", Some(2222), "~");
+        assert_remote("ssh://example.com:2222:/srv/app", None, "example.com", Some(2222), "/srv/app");
+        assert_remote("ssh://me@example.com:~/src/app", Some("me"), "example.com", None, "~/src/app");
+    }
+
+    #[test]
+    fn preserves_colons_in_remote_path() {
+        assert_remote("ssh://example.com:/srv/app:a/b:c", None, "example.com", None, "/srv/app:a/b:c");
+        assert_remote("ssh://example.com:2222:~/src/app:a", None, "example.com", Some(2222), "~/src/app:a");
+    }
+
+    #[test]
+    fn keeps_legacy_slash_path_form() {
+        assert_remote("ssh://example.com/srv/app", None, "example.com", None, "/srv/app");
+        assert_remote("ssh://example.com:2222/srv/app", None, "example.com", Some(2222), "/srv/app");
     }
 }

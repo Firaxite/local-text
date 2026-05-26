@@ -255,7 +255,7 @@ impl FindBar {
 
 // ── Left panel / activity bar ─────────────────────────────────────────────────
 #[derive(Clone, Copy, PartialEq)]
-enum LeftView { FileTree, GlobalSearch, Diagnostics, Git }
+enum LeftView { FileTree, GlobalSearch, Diagnostics, Git, Collab }
 
 #[derive(Clone)]
 pub struct GitEntry {
@@ -317,11 +317,12 @@ enum CtxAction {
     TabOpenPreview,
     TabClose,
     TabSplitRight, TabSplitLeft, TabSplitDown, TabSplitUp,
+    ExplorerOpenAsRoot,
     GitOpenFile, GitViewDiff, GitStage, GitUnstage,
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum SettingsFieldId { FormatOnSave, OrganizeImportsOnSave, FormatCommand }
+enum SettingsFieldId { FormatOnSave, OrganizeImportsOnSave, FormatCommand, CollabPort, CollabIncludeGlobs, CollabExcludeGlobs }
 
 #[derive(Clone)]
 struct ContextMenuItem {
@@ -338,6 +339,7 @@ struct ContextMenu {
     hovered:    usize,
     tab_source: Option<(usize, usize)>,  // (pane_id, tab_idx) for tab bar menus
     git_entry:  Option<(bool, String)>,  // (staged, path)
+    explorer_entry: Option<VPath>,
 }
 
 // ── Quick file finder ─────────────────────────────────────────────────────────
@@ -353,6 +355,7 @@ struct QuickFinder {
     restore_tree_focus: bool,
     walk_token:         u64,   // incremented on each open; stale QuickFinderFiles events are dropped
     loading:            bool,  // true while background walk_files is in progress
+    remote_directory_mode: bool,
 }
 
 // ── Command palette ───────────────────────────────────────────────────────────
@@ -458,6 +461,7 @@ struct Tab {
     hl_color_cache: Vec<Vec<u32>>,      // cached highlight color per char, indexed by line
     max_line_len:   Option<usize>, // cached max line length (chars), None = needs recompute
     edit_generation: u64, // incremented on every text mutation; used to skip redundant syncs
+    remote_load_token: Option<u64>,
 }
 
 impl Tab {
@@ -466,7 +470,7 @@ impl Tab {
               cursors: vec![Cursor::new(0)], scroll: 0, hscroll: 0,
               undo_stack: Vec::new(), redo_stack: Vec::new(), last_typing: false,
               hl_cache: Vec::new(), hl_dirty_from: 0, hl_color_cache: Vec::new(),
-              max_line_len: Some(0), edit_generation: 0 }
+              max_line_len: Some(0), edit_generation: 0, remote_load_token: None }
     }
 
     fn settings() -> Self {
@@ -475,7 +479,7 @@ impl Tab {
               scroll: 0, hscroll: 0,
               undo_stack: Vec::new(), redo_stack: Vec::new(), last_typing: false,
               hl_cache: Vec::new(), hl_dirty_from: 0, hl_color_cache: Vec::new(),
-              max_line_len: Some(0), edit_generation: 0 }
+              max_line_len: Some(0), edit_generation: 0, remote_load_token: None }
     }
 
     fn display_name(&self) -> &str {
@@ -515,6 +519,18 @@ impl Tab {
         // Remote files are loaded asynchronously (Phase 3); for now only local works.
         let Some(local_path) = path.as_local_path() else {
             self.path = Some(path);
+            self.cursors = vec![Cursor::new(0)];
+            self.scroll = 0;
+            self.hscroll = 0;
+            self.dirty = false;
+            self.undo_stack.clear();
+            self.redo_stack.clear();
+            self.last_typing = false;
+            self.hl_cache.clear();
+            self.hl_dirty_from = 0;
+            self.hl_color_cache.clear();
+            self.max_line_len = Some(0);
+            self.remote_load_token = None;
             return false;
         };
         const MAX_FILE_BYTES: u64 = 256 * 1024 * 1024;
@@ -536,6 +552,7 @@ impl Tab {
                 self.hl_dirty_from = 0;
                 self.hl_color_cache.clear();
                 self.max_line_len = None;
+                self.remote_load_token = None;
                 self.edit_generation += 1;
                 true
             }
@@ -613,8 +630,8 @@ impl FileExplorer {
         self.selected = 0;
     }
 
-    fn toggle(&mut self, idx: usize) {
-        if !self.entries[idx].is_dir { return; }
+    fn toggle(&mut self, idx: usize) -> Option<PathBuf> {
+        if !self.entries[idx].is_dir { return None; }
         if self.entries[idx].expanded {
             self.entries[idx].expanded = false;
             let depth = self.entries[idx].depth;
@@ -625,15 +642,18 @@ impl FileExplorer {
             self.entries[idx].expanded = true;
             let path = self.entries[idx].path.clone();
             let depth = self.entries[idx].depth + 1;
-            // Remote directory expansion is async (Phase 3); skip for now.
             if self.root.as_local_path().is_some() {
                 let children = load_dir_entries(&path, depth, self.show_hidden);
                 for (i, child) in children.into_iter().enumerate() {
                     self.entries.insert(idx + 1 + i, child);
                 }
+            } else {
+                self.selected = self.selected.min(self.entries.len().saturating_sub(1));
+                return Some(path);
             }
         }
         self.selected = self.selected.min(self.entries.len().saturating_sub(1));
+        None
     }
 }
 
@@ -653,6 +673,84 @@ fn load_dir_entries(dir: &std::path::Path, depth: usize, show_hidden: bool) -> V
         b.is_dir.cmp(&a.is_dir).then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
     entries
+}
+
+fn remote_uri(vpath: &VPath) -> Option<String> {
+    match vpath {
+        VPath::Remote { host, path } => Some(format!("ssh://{}:{}", host.display(), path.display())),
+        VPath::Local(_) => None,
+    }
+}
+
+fn parse_remote_directory_query(query: &str) -> Result<(VPath, String), String> {
+    let query = query.trim();
+    if !query.starts_with("ssh://") {
+        return Err("Remote directory must start with ssh://".to_owned());
+    }
+    if query == "ssh://" {
+        return Err("Enter a remote URI like ssh://host:~/devel".to_owned());
+    }
+
+    let vpath = VPath::parse(query);
+    if matches!(&vpath, VPath::Remote { .. }) {
+        let uri = remote_uri(&vpath).unwrap_or_else(|| query.to_owned());
+        Ok((vpath, uri))
+    } else {
+        Err("Remote URI must look like ssh://host:~/devel".to_owned())
+    }
+}
+
+fn open_remote_directory(s: &mut State, vpath: VPath, uri: String) {
+    let h = match &vpath {
+        VPath::Remote { host, .. } => host.clone(),
+        VPath::Local(_) => return,
+    };
+    s.explorer = Some(FileExplorer::new(vpath));
+    s.left_view = LeftView::FileTree;
+    s.explorer_w = ((200.0 * s.font_size / FONT_PX).round() as i32).clamp(80, 600);
+    eprintln!("open remote directory: {uri}");
+    if !s.settings.recent_remote_hosts.contains(&uri) {
+        s.settings.recent_remote_hosts.insert(0, uri);
+        s.settings.recent_remote_hosts.truncate(20);
+        s.settings.save();
+    }
+    s.status_msg = Some(format!("Connecting to {}…", h.display()));
+    ssh::ensure_control_master(h, s.proxy.clone());
+}
+
+fn remote_listing_to_file_entries(
+    parent: &std::path::Path,
+    entries: Vec<(String, bool)>,
+    depth: usize,
+    show_hidden: bool,
+) -> Vec<FileEntry> {
+    fn remote_child_path(parent: &std::path::Path, name: &str) -> PathBuf {
+        let parent = parent.to_string_lossy();
+        let sep = if parent == "/" || parent.ends_with('/') { "" } else { "/" };
+        PathBuf::from(format!("{parent}{sep}{name}"))
+    }
+
+    let mut out: Vec<FileEntry> = entries.into_iter()
+        .filter(|(name, _)| show_hidden || !name.starts_with('.'))
+        .map(|(name, is_dir)| FileEntry {
+            path: remote_child_path(parent, &name),
+            name,
+            is_dir,
+            expanded: false,
+            depth,
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        b.is_dir.cmp(&a.is_dir).then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    out
+}
+
+fn explorer_entry_vpath(ex: &FileExplorer, path: PathBuf) -> VPath {
+    match &ex.root {
+        VPath::Remote { host, .. } => VPath::Remote { host: host.clone(), path },
+        VPath::Local(_) => VPath::Local(path),
+    }
 }
 
 // ── Pane layout types ─────────────────────────────────────────────────────────
@@ -962,7 +1060,32 @@ fn resize_terminal_panes(s: &mut State) {
 /// Return the SSH host for the active workspace, if any.
 /// Used to decide whether new terminals should connect to the remote.
 fn active_workspace_ssh_host(s: &State) -> Option<vpath::SshHost> {
-    s.explorer.as_ref().and_then(|e| e.root.ssh_host().cloned())
+    if let Some(host) = s.explorer.as_ref().and_then(|e| e.root.ssh_host().cloned()) {
+        return Some(host);
+    }
+
+    if let Some(pane) = s.panes.get(&s.active_pane) {
+        if pane.kind == PaneKind::Editor {
+            if let Some(host) = pane.tabs.get(pane.active)
+                .and_then(|tab| tab.path.as_ref())
+                .and_then(|path| path.ssh_host().cloned())
+            {
+                return Some(host);
+            }
+            if let Some(host) = pane.tabs.iter()
+                .filter_map(|tab| tab.path.as_ref())
+                .find_map(|path| path.ssh_host().cloned())
+            {
+                return Some(host);
+            }
+        }
+    }
+
+    s.panes.values()
+        .filter(|pane| pane.kind == PaneKind::Editor)
+        .flat_map(|pane| pane.tabs.iter())
+        .filter_map(|tab| tab.path.as_ref())
+        .find_map(|path| path.ssh_host().cloned())
 }
 
 fn open_terminal_pane(s: &mut State) {
@@ -1021,11 +1144,96 @@ fn open_markdown_preview(s: &mut State) {
     s.active_pane = pane_id;
 }
 
+fn lsp_binary(lang: Lang) -> Option<&'static str> {
+    match lang {
+        Lang::TypeScript => Some("typescript-language-server"),
+        Lang::Rust       => Some("rust-analyzer"),
+        Lang::Python     => Some("pylsp"),
+        Lang::None | Lang::Json | Lang::Jsonc | Lang::Markdown => None,
+    }
+}
+
+fn lsp_required_binaries(lang: Lang) -> &'static [&'static str] {
+    match lang {
+        Lang::TypeScript => &["typescript-language-server", "tsserver"],
+        Lang::Rust       => &["rust-analyzer"],
+        Lang::Python     => &["pylsp"],
+        Lang::None | Lang::Json | Lang::Jsonc | Lang::Markdown => &[],
+    }
+}
+
+fn lsp_install_command(lang: Lang) -> Option<&'static str> {
+    match lang {
+        Lang::TypeScript => Some("npm install -g typescript-language-server typescript\n"),
+        Lang::Rust       => Some("rustup component add rust-analyzer\n"),
+        Lang::Python     => Some("pip install python-lsp-server\n"),
+        Lang::None | Lang::Json | Lang::Jsonc | Lang::Markdown => None,
+    }
+}
+
+fn remote_lsp_path_dirs(settings: &settings::Settings, host: &vpath::SshHost) -> Vec<String> {
+    fn push_unique(dirs: &mut Vec<String>, dir: &str) {
+        if !dir.is_empty() && !dirs.iter().any(|existing| existing == dir) {
+            dirs.push(dir.to_owned());
+        }
+    }
+
+    let mut dirs = Vec::new();
+    for dir in ["~/.cargo/bin", "~/.local/bin", "~/.npm-global/bin", "/usr/local/bin", "/opt/homebrew/bin"] {
+        push_unique(&mut dirs, dir);
+    }
+
+    for key in [host.display(), host.host_arg(), host.host.clone()] {
+        if let Some(extra) = settings.remote_lsp_search_paths.get(&key) {
+            for dir in extra {
+                push_unique(&mut dirs, dir.as_str());
+            }
+        }
+    }
+    dirs
+}
+
+fn lsp_scope_host(s: &State) -> Option<vpath::SshHost> {
+    active_workspace_ssh_host(s).or_else(|| {
+        let pane = s.panes.get(&s.active_pane)?;
+        if pane.kind != PaneKind::Editor { return None; }
+        pane.tabs.get(pane.active)?.path.as_ref()?.ssh_host().cloned()
+    })
+}
+
+fn lsp_installed_for(s: &State, lang: Lang, host: Option<&vpath::SshHost>) -> Option<bool> {
+    match host {
+        Some(h) => s.remote_lsp_installed.get(&(h.clone(), lang)).copied(),
+        None    => Some(s.lsp_installed.get(&lang).copied().unwrap_or(false)),
+    }
+}
+
 fn check_lsp_binaries(s: &mut State) {
-    for (lang, bin) in &[(Lang::TypeScript, "typescript-language-server"), (Lang::Rust, "rust-analyzer"), (Lang::Python, "pylsp")] {
-        let installed = std::process::Command::new("which").arg(bin).output()
-            .map(|o| o.status.success()).unwrap_or(false);
-        s.lsp_installed.insert(*lang, installed);
+    let langs = [Lang::TypeScript, Lang::Rust, Lang::Python];
+    if let Some(host) = lsp_scope_host(s) {
+        if !matches!(s.ssh_connections.get(&host), Some(SshConnectionState::Connected)) {
+            s.remote_lsp_check_errors.remove(&host);
+            for lang in langs {
+                s.remote_lsp_installed.remove(&(host.clone(), lang));
+            }
+            ssh::ensure_control_master(host, s.proxy.clone());
+            return;
+        }
+        let bins: Vec<(Lang, Vec<String>)> = langs.iter()
+            .map(|&lang| (lang, lsp_required_binaries(lang).iter().map(|bin| (*bin).to_owned()).collect()))
+            .collect();
+        let path_dirs = remote_lsp_path_dirs(&s.settings, &host);
+        ssh::ssh_check_lsp_binaries(host, bins, path_dirs, s.proxy.clone());
+        return;
+    }
+
+    for lang in langs {
+        let bins = lsp_required_binaries(lang);
+        let installed = !bins.is_empty() && bins.iter().all(|bin| {
+            std::process::Command::new("which").arg(bin).output()
+                .map(|o| o.status.success()).unwrap_or(false)
+        });
+        s.lsp_installed.insert(lang, installed);
     }
 }
 
@@ -1075,6 +1283,8 @@ pub enum UserEvent {
     LspOutput      { pane_id: usize, data: Vec<u8> },
     LspDiagnostics { path: VPath, diagnostics: Vec<Diagnostic> },
     LspResponse    { server_id: usize, id: u64, result: serde_json::Value },
+    LspServerStopped { server_id: usize },
+    LspBinaryCheckResult { host: Option<vpath::SshHost>, statuses: Vec<(Lang, Option<bool>)>, error: Option<String> },
     FormatterDone  { path: VPath },
     GitStatusResult { staged: Vec<GitEntry>, unstaged: Vec<GitEntry>, is_git_repo: bool },
     GitDiffResult   { buf_id: usize, path: String, lines: Vec<DiffLine> },
@@ -1087,11 +1297,12 @@ pub enum UserEvent {
     SshConnected        { host: vpath::SshHost },
     SshError            { host: vpath::SshHost, msg: String },
     RemoteFileContent   { token: u64, path: VPath, content: String },
+    RemoteFileError     { token: u64, path: VPath, msg: String },
     RemoteWriteDone     { path: VPath },
     RemoteDirListing    { path: VPath, entries: Vec<(String, bool)> },
     // Collab events
     CollabMessage     { from_site_id: u64, msg: collab::CollabMsg },
-    CollabConnected   { session: Box<collab::CollabSession>, doc_text: String, peers: Vec<collab::PeerInfo> },
+    CollabConnected   { session: Box<collab::CollabSession>, doc_text: String, peers: Vec<collab::PeerInfo>, file_list: Vec<String> },
     CollabDisconnected,
     CollabError       { msg: String },
     CollabGuestJoined { site_id: u64, peer: collab::PeerInfo },
@@ -1109,6 +1320,7 @@ struct State {
     active_pane:  usize,
     next_pane_id: usize,
     next_buf_id:  usize,
+    next_remote_read_token: u64,
     drag:         Option<DragState>,
     drag_pending: Option<(usize, usize, f32, f32)>,
     resize_drag:  Option<ResizeDrag>,
@@ -1119,6 +1331,9 @@ struct State {
     lsp:            lsp::LspManager,
     diagnostics:    HashMap<VPath, Vec<Diagnostic>>,
     lsp_installed:  HashMap<Lang, bool>,
+    remote_lsp_installed: HashMap<(vpath::SshHost, Lang), bool>,
+    remote_lsp_check_errors: HashMap<vpath::SshHost, String>,
+    lsp_start_errors: HashMap<(Option<vpath::SshHost>, Lang), String>,
     proxy:          EventLoopProxy<UserEvent>,
 
     cursor_visible: bool,
@@ -1178,6 +1393,8 @@ struct State {
     collab: Option<collab::CollabSession>,
     /// Before-snapshot captured in push_undo when collab is active, consumed by notify_collab_change.
     collab_before: Option<ropey::Rope>,
+    /// File list sent by the host (guest-side only); empty when hosting or not in a session.
+    collab_file_list: Vec<String>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -1909,6 +2126,27 @@ impl State {
 }
 
 // ── Helper: open file in a tab ────────────────────────────────────────────────
+fn begin_remote_tab_read(s: &mut State, pane_id: usize, tab_idx: usize, path: VPath) {
+    let VPath::Remote { host, path: remote_path } = path.clone() else { return; };
+
+    if !matches!(s.ssh_connections.get(&host), Some(SshConnectionState::Connected)) {
+        s.status_msg = Some(format!("Connecting to {}…", host.display()));
+        ssh::ensure_control_master(host, s.proxy.clone());
+        return;
+    }
+
+    let token = s.next_remote_read_token;
+    s.next_remote_read_token += 1;
+    let Some(tab) = s.panes.get_mut(&pane_id).and_then(|p| p.tabs.get_mut(tab_idx)) else {
+        return;
+    };
+    if tab.path.as_ref() != Some(&path) {
+        return;
+    }
+    tab.remote_load_token = Some(token);
+    ssh::ssh_read_file(host, remote_path, token, s.proxy.clone());
+}
+
 fn open_or_reuse_tab(s: &mut State, path: VPath) {
     // Find the nearest editor pane to open the file in (active if it's an editor,
     // otherwise find the first editor pane in the layout).
@@ -1923,30 +2161,31 @@ fn open_or_reuse_tab(s: &mut State, path: VPath) {
         s.active_pane = id;
         id
     };
-    let pane = s.panes.get_mut(&ap).unwrap();
-    for i in 0..pane.tabs.len() {
-        if pane.tabs[i].kind == TabKind::GitDiff { continue; }
-        if pane.tabs[i].path.as_ref() == Some(&path) {
-            pane.active = i;
-            return;
+    let (loaded, target_tab_idx) = {
+        let pane = s.panes.get_mut(&ap).unwrap();
+        for i in 0..pane.tabs.len() {
+            if pane.tabs[i].kind == TabKind::GitDiff { continue; }
+            if pane.tabs[i].path.as_ref() == Some(&path) {
+                pane.active = i;
+                return;
+            }
         }
-    }
-    let loaded = if pane.tab().kind != TabKind::GitDiff && pane.tab().is_empty_untitled() {
-        pane.tab_mut().load_file(path.clone())
-    } else {
-        let mut tab = Tab::untitled(s.next_buf_id);
-        s.next_buf_id += 1;
-        let ok = tab.load_file(path.clone());
-        pane.tabs.push(tab);
-        pane.active = pane.tabs.len() - 1;
-        ok
+        if pane.tab().kind != TabKind::GitDiff && pane.tab().is_empty_untitled() {
+            let loaded = pane.tab_mut().load_file(path.clone());
+            (loaded, pane.active)
+        } else {
+            let mut tab = Tab::untitled(s.next_buf_id);
+            s.next_buf_id += 1;
+            let loaded = tab.load_file(path.clone());
+            pane.tabs.push(tab);
+            pane.active = pane.tabs.len() - 1;
+            (loaded, pane.active)
+        }
     };
     if !loaded {
         match &path {
-            VPath::Remote { host, path: remote_path } => {
-                // Async load: dispatch SSH read and leave the tab showing empty text.
-                let token = s.next_buf_id as u64;  // cheap unique-ish token
-                ssh::ssh_read_file(host.clone(), remote_path.clone(), token, s.proxy.clone());
+            VPath::Remote { .. } => {
+                begin_remote_tab_read(s, ap, target_tab_idx, path.clone());
             }
             VPath::Local(_) => {
                 // Local file that failed to load (too large).
@@ -1959,27 +2198,35 @@ fn open_or_reuse_tab(s: &mut State, path: VPath) {
     notify_lsp_open(s, &path);
 }
 
-fn apply_goto_definition(s: &mut State, result: &serde_json::Value) {
+fn lsp_uri_to_vpath(uri: &str, ssh_host: Option<&vpath::SshHost>) -> Option<VPath> {
+    let raw_path = PathBuf::from(uri.strip_prefix("file://")?);
+    Some(match ssh_host {
+        Some(host) => VPath::Remote { host: host.clone(), path: raw_path },
+        None       => VPath::Local(raw_path),
+    })
+}
+
+fn apply_goto_definition(s: &mut State, result: &serde_json::Value, ssh_host: Option<vpath::SshHost>) {
     let loc = if result.is_array() { result.get(0) } else { Some(result) };
     let Some(loc) = loc else { return };
     let uri  = loc["uri"].as_str().unwrap_or("");
     let line = loc["range"]["start"]["line"].as_u64().unwrap_or(0) as usize;
     let col  = loc["range"]["start"]["character"].as_u64().unwrap_or(0) as usize;
-    // For now LSP servers are always local; reconstruct as VPath::Local.
-    let path = VPath::Local(PathBuf::from(uri.strip_prefix("file://").unwrap_or(uri)));
+    let Some(path) = lsp_uri_to_vpath(uri, ssh_host.as_ref()) else { return };
     push_cursor_history(s);
     open_or_reuse_tab(s, path);
-    let pos = s.tab().text.line_to_char(line) + col;
+    let target_line = line.min(s.tab().text.len_lines().saturating_sub(1));
+    let target_col = col.min(State::line_len(&s.tab().text, target_line));
+    let pos = s.tab().text.line_to_char(target_line) + target_col;
     s.tab_mut().cursors = vec![Cursor::new(pos)];
     s.ensure_visible();
 }
 
-fn apply_references(s: &mut State, result: &serde_json::Value) {
+fn apply_references(s: &mut State, result: &serde_json::Value, ssh_host: Option<vpath::SshHost>) {
     let locs = result.as_array().map(|a| a.as_slice()).unwrap_or(&[]);
     s.global_find.results = locs.iter().filter_map(|loc| {
         let uri  = loc["uri"].as_str()?;
-        // For now LSP servers are always local; reconstruct as VPath::Local.
-        let path = VPath::Local(PathBuf::from(uri.strip_prefix("file://")?));
+        let path = lsp_uri_to_vpath(uri, ssh_host.as_ref())?;
         let line = loc["range"]["start"]["line"].as_u64()? as usize;
         let col  = loc["range"]["start"]["character"].as_u64()? as usize;
         let text = path.as_local_path()
@@ -2136,23 +2383,38 @@ fn open_token(s: &mut State, token: &str) {
 fn notify_lsp_open(s: &mut State, path: &VPath) {
     let lang = Lang::from_path(path.as_path());
     if lang == Lang::None { return; }
+    let ssh_host = path.ssh_host().cloned();
     // Start server if not running
-    if !s.lsp.has_server_for(lang) {
+    if !s.lsp.has_server_for_lang_host(lang, ssh_host.as_ref()) {
         let op_id = s.next_pane_id;
         s.next_pane_id += 1;
         let proxy = s.proxy.clone();
-        let ssh_host = path.ssh_host().cloned();
-        if let Some(mut srv) = lsp::start_server(lang, op_id, proxy, ssh_host) {
+        let remote_path_dirs = ssh_host.as_ref()
+            .map(|host| remote_lsp_path_dirs(&s.settings, host))
+            .unwrap_or_default();
+        if let Some(mut srv) = lsp::start_server(lang, op_id, proxy, ssh_host.clone(), remote_path_dirs) {
             // Send initialize request
             let root = path.parent();
             lsp::send_initialize(&mut srv, root.as_ref());
             // Register LSP output pane (not shown in tree until user opens it)
-            let title = format!("{:?} LSP Output", lang);
+            let title = match &ssh_host {
+                Some(host) => format!("{:?} LSP Output ({})", lang, host.display()),
+                None       => format!("{:?} LSP Output (local)", lang),
+            };
             let op = OutputPane { id: op_id, lines: vec![], scroll: 0, title };
             s.lsp_panes.insert(op_id, op);
             let shell_pane = Pane { id: op_id, kind: PaneKind::LspOutput, tabs: vec![], term_ids: vec![], active: 0, find: FindBar::new() };
             s.panes.insert(op_id, shell_pane);
             s.lsp.servers.insert(op_id, srv);
+            s.lsp_start_errors.remove(&(ssh_host.clone(), lang));
+        } else {
+            let scope = ssh_host.as_ref()
+                .map(|h| format!("remote {}", h.display()))
+                .unwrap_or_else(|| "local machine".to_owned());
+            let bin = lsp_binary(lang).unwrap_or("language server");
+            let msg = format!("Failed to start {bin} on {scope}");
+            s.status_msg = Some(msg.clone());
+            s.lsp_start_errors.insert((ssh_host, lang), msg);
         }
     }
     // Send didOpen to the server for this language
@@ -2161,7 +2423,7 @@ fn notify_lsp_open(s: &mut State, path: &VPath) {
         s.panes.get(&ap).and_then(|p| p.tabs.get(p.active)).map(|t| t.text.to_string())
     };
     if let Some(text) = text {
-        if let Some(srv) = s.lsp.server_for_lang_mut(lang) {
+        if let Some(srv) = s.lsp.server_for_lang_host_mut(lang, path.ssh_host()) {
             lsp::notify_did_open(srv, path, &text);
         }
     }
@@ -2179,7 +2441,7 @@ fn notify_lsp_change(s: &mut State) {
         if lang == Lang::None { return; }
         (path, tab.text.to_string(), lang)
     };
-    if let Some(srv) = s.lsp.server_for_lang_mut(lang) {
+    if let Some(srv) = s.lsp.server_for_lang_host_mut(lang, path.ssh_host()) {
         lsp::notify_did_change(srv, &path, &text);
     }
 }
@@ -2188,17 +2450,20 @@ fn notify_lsp_change(s: &mut State) {
 /// Called after every keyboard event that might have edited the document.
 fn notify_collab_change(s: &mut State) {
     let before = match s.collab_before.take() { Some(b) => b, None => return };
-    // Get current text from active editor pane
+    // Get current text and path from active editor pane
     let ap = s.active_pane;
-    let after = match s.panes.get(&ap).and_then(|p| p.tabs.get(p.active)) {
-        Some(tab) if s.panes[&ap].kind == PaneKind::Editor => tab.text.clone(),
+    let (after, path) = match s.panes.get(&ap).and_then(|p| p.tabs.get(p.active)) {
+        Some(tab) if s.panes[&ap].kind == PaneKind::Editor => {
+            let path = tab.path.as_ref().map(|p| p.to_string()).unwrap_or_default();
+            (tab.text.clone(), path)
+        }
         _ => return,
     };
     let site_id = match s.collab.as_ref() { Some(sess) => sess.site_id, None => return };
     let ops = collab::extract_ops(&before, &after, site_id);
     if !ops.is_empty() {
         if let Some(session) = s.collab.as_mut() {
-            session.send_local_op(ops);
+            session.send_local_op(path, ops);
         }
     }
 }
@@ -2209,14 +2474,19 @@ fn send_collab_cursor_if_needed(s: &mut State) {
         .map_or(false, |sess| sess.cursor_debounce_elapsed());
     if !should_send { return; }
     let ap = s.active_pane;
-    let cursors: Vec<collab::RemoteCursorPos> = s.panes.get(&ap)
-        .filter(|p| p.kind == PaneKind::Editor)
-        .map(|p| p.tab().cursors.iter()
-            .map(|c| collab::RemoteCursorPos { head: c.head, tail: c.tail })
-            .collect())
-        .unwrap_or_default();
+    let (cursors, path) = {
+        let pane = s.panes.get(&ap).filter(|p| p.kind == PaneKind::Editor);
+        let tab  = pane.and_then(|p| p.tabs.get(p.active));
+        let path = tab.and_then(|t| t.path.as_ref()).map(|p| p.to_string()).unwrap_or_default();
+        let cursors: Vec<collab::RemoteCursorPos> = pane
+            .map(|p| p.tab().cursors.iter()
+                .map(|c| collab::RemoteCursorPos { head: c.head, tail: c.tail })
+                .collect())
+            .unwrap_or_default();
+        (cursors, path)
+    };
     if let Some(session) = s.collab.as_mut() {
-        session.send_cursor_update(cursors);
+        session.send_cursor_update(path, cursors);
     }
 }
 
@@ -3211,10 +3481,20 @@ fn walk_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>, depth: u
 
 fn open_quick_finder(s: &mut State, proxy: EventLoopProxy<UserEvent>) {
     let had_tree_focus = s.explorer.as_ref().map(|e| e.tree_search_focused).unwrap_or(false);
-    // For remote roots, file walking is async via SSH (Phase 3); use empty for now.
-    let root = s.explorer.as_ref()
-        .and_then(|e| e.root.as_local_path().map(|p| p.to_path_buf()))
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let remote_root = s.explorer.as_ref().and_then(|e| {
+        if let VPath::Remote { host, path } = &e.root {
+            Some((host.clone(), path.clone()))
+        } else {
+            None
+        }
+    });
+    let local_root = if remote_root.is_none() {
+        Some(s.explorer.as_ref()
+            .and_then(|e| e.root.as_local_path().map(|p| p.to_path_buf()))
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default()))
+    } else {
+        None
+    };
 
     s.quick_finder.walk_token += 1;
     let token = s.quick_finder.walk_token;
@@ -3227,17 +3507,22 @@ fn open_quick_finder(s: &mut State, proxy: EventLoopProxy<UserEvent>) {
     s.quick_finder.selected            = 0;
     s.quick_finder.restore_tree_focus  = had_tree_focus;
     s.quick_finder.loading             = true;
+    s.quick_finder.remote_directory_mode = false;
     s.quick_finder.open                = true;
     // Unfocus tree search and global find so they don't swallow subsequent keystrokes
     if let Some(ex) = s.explorer.as_mut() { ex.tree_search_focused = false; }
     s.global_find.focus = GlobalFindFocus::Results;
 
-    std::thread::spawn(move || {
-        let mut local_entries = Vec::new();
-        walk_files(&root, &mut local_entries, 0);
-        let entries: Vec<VPath> = local_entries.into_iter().map(VPath::Local).collect();
-        let _ = proxy.send_event(UserEvent::QuickFinderFiles { token, entries });
-    });
+    if let Some((host, root)) = remote_root {
+        ssh::ssh_walk_files(host, root, token, proxy);
+    } else if let Some(root) = local_root {
+        std::thread::spawn(move || {
+            let mut local_entries = Vec::new();
+            walk_files(&root, &mut local_entries, 0);
+            let entries: Vec<VPath> = local_entries.into_iter().map(VPath::Local).collect();
+            let _ = proxy.send_event(UserEvent::QuickFinderFiles { token, entries });
+        });
+    }
 }
 
 fn refilter_quick_finder(s: &mut State) {
@@ -3258,9 +3543,14 @@ fn refilter_quick_finder(s: &mut State) {
         s.quick_finder.filtered = (0..s.quick_finder.entries.len()).collect();
         s.quick_finder.filtered_commands = vec![];
     } else {
+        let remote_directory_mode = s.quick_finder.remote_directory_mode;
         let mut scored: Vec<(usize, i32)> = s.quick_finder.entries.iter().enumerate()
             .filter_map(|(i, p)| {
-                let path_str = p.as_path().to_string_lossy();
+                let path_str = if remote_directory_mode {
+                    remote_uri(p).unwrap_or_else(|| p.as_path().to_string_lossy().into_owned())
+                } else {
+                    p.as_path().to_string_lossy().into_owned()
+                };
                 fuzzy_score_path(&q, &path_str).map(|sc| (i, sc))
             })
             .collect();
@@ -3301,36 +3591,39 @@ fn refilter_tree_search(ex: &mut FileExplorer) {
 fn handle_collab_msg(s: &mut State, from_site_id: u64, msg: collab::CollabMsg) {
     use collab::{CollabMsg, CollabRole};
     match msg {
-        CollabMsg::Op { site_id, clock, mut ops, path: _ } => {
+        CollabMsg::Op { site_id, clock, mut ops, path } => {
             // Extract what we need before splitting borrows
             let (is_host, local_site_id) = {
                 let Some(session) = s.collab.as_mut() else { return };
                 let is_host = matches!(session.role, CollabRole::Host { .. });
                 if !is_host {
-                    // Guest: rebase remote ops against our inflight queue
-                    collab::integrate_remote_against_inflight(&mut ops, &mut session.inflight);
+                    // Guest: rebase remote ops against per-path inflight queue
+                    let inflight = session.inflight.entry(path.clone()).or_default();
+                    collab::integrate_remote_against_inflight(&mut ops, inflight);
                 }
                 (is_host, session.site_id)
             };
 
-            // Apply ops to the active editor tab
-            let ap = s.active_pane;
-            if let Some(pane) = s.panes.get_mut(&ap) {
-                if pane.kind == PaneKind::Editor {
-                    if let Some(tab) = pane.tabs.get_mut(pane.active) {
+            // Apply ops to the tab that owns this path (not just the active tab)
+            let target = find_editor_tab_by_path(s, &path);
+            if let Some((pane_id, tab_idx)) = target {
+                if let Some(pane) = s.panes.get_mut(&pane_id) {
+                    if let Some(tab) = pane.tabs.get_mut(tab_idx) {
                         collab::apply_ops_to_rope(&mut tab.text, &ops);
                         tab.dirty = true;
                         tab.hl_dirty_from = 0;
                         tab.hl_color_cache.clear();
                         tab.edit_generation += 1;
                         tab.max_line_len = None;
-                        // Adjust local cursors so they stay in the right place
-                        for cursor in &mut tab.cursors {
-                            let (nh, nt) = collab::adjust_cursor(
-                                cursor.head, cursor.tail, &ops, local_site_id,
-                            );
-                            cursor.head = nh;
-                            cursor.tail = nt;
+                        // Adjust local cursors only if this is the active tab
+                        if pane_id == s.active_pane && tab_idx == pane.active {
+                            for cursor in &mut tab.cursors {
+                                let (nh, nt) = collab::adjust_cursor(
+                                    cursor.head, cursor.tail, &ops, local_site_id,
+                                );
+                                cursor.head = nh;
+                                cursor.tail = nt;
+                            }
                         }
                     }
                 }
@@ -3338,7 +3631,7 @@ fn handle_collab_msg(s: &mut State, from_site_id: u64, msg: collab::CollabMsg) {
 
             // Adjust remote cursor positions for the op sender
             if let Some(session) = s.collab.as_mut() {
-                if let Some(remote) = session.remote_cursors.get_mut(&site_id) {
+                if let Some((_, remote)) = session.remote_cursors.get_mut(&site_id) {
                     for rc in remote.iter_mut() {
                         let (nh, nt) = collab::adjust_cursor(rc.head, rc.tail, &ops, 0);
                         rc.head = nh;
@@ -3347,24 +3640,38 @@ fn handle_collab_msg(s: &mut State, from_site_id: u64, msg: collab::CollabMsg) {
                 }
             }
 
-            // Host: sequence the op, broadcast to other guests, send Ack back
+            // Host: check write permission, sequence op, broadcast, send Ack
             if is_host {
                 let Some(session) = s.collab.as_mut() else { return };
+                // Verify the sender has write permission for this path
+                let sender_perms = session.peer_perms(site_id);
+                let is_hidden = path.split('/').any(|c| c.starts_with('.'));
+                let can_write = if is_hidden {
+                    sender_perms & collab::perms::WRITE_HIDDEN != 0
+                } else {
+                    sender_perms & collab::perms::WRITE_FILES != 0
+                };
+                if !can_write {
+                    // Silently drop unauthorized writes
+                    return;
+                }
                 session.server_clock += 1;
-                let ack_clock = clock;  // ack the client's own clock
-                let broadcast_msg = CollabMsg::Op { site_id, clock, ops, path: String::new() };
+                let ack_clock = clock;
+                let broadcast_msg = CollabMsg::Op { site_id, clock, ops, path: path.clone() };
                 session.broadcast_except_msg(Some(site_id), &broadcast_msg);
-                session.send_to_site(site_id, &CollabMsg::Ack { clock: ack_clock });
+                session.send_to_site(site_id, &CollabMsg::Ack { clock: ack_clock, path });
             }
         }
-        CollabMsg::Ack { clock } => {
+        CollabMsg::Ack { clock, path } => {
             if let Some(session) = s.collab.as_mut() {
-                session.inflight.retain(|op| op.clock > clock);
+                if let Some(inflight) = session.inflight.get_mut(&path) {
+                    inflight.retain(|op| op.clock > clock);
+                }
             }
         }
-        CollabMsg::CursorUpdate { site_id, cursors } => {
+        CollabMsg::CursorUpdate { site_id, cursors, path } => {
             if let Some(session) = s.collab.as_mut() {
-                session.remote_cursors.insert(site_id, cursors);
+                session.remote_cursors.insert(site_id, (path, cursors));
             }
         }
         CollabMsg::PeerJoined { peer } => {
@@ -3382,9 +3689,159 @@ fn handle_collab_msg(s: &mut State, from_site_id: u64, msg: collab::CollabMsg) {
                 session.remote_cursors.remove(&site_id);
             }
         }
+        CollabMsg::PeerRoleChanged { site_id, role } => {
+            if let Some(session) = s.collab.as_mut() {
+                if let Some(peer) = session.peers.iter_mut().find(|p| p.site_id == site_id) {
+                    peer.role = role;
+                }
+                // If our own role was changed, update my_role
+                if site_id == session.site_id {
+                    session.my_role = Some(role);
+                }
+            }
+        }
+        CollabMsg::RoleConfig { perms } => {
+            if let Some(session) = s.collab.as_mut() {
+                session.role_perms = perms;
+            }
+        }
+        CollabMsg::FileList { paths } => {
+            // Host sent us an updated list of accessible files
+            s.collab_file_list = paths;
+        }
+        CollabMsg::FileResponse { path, content, .. } => {
+            // Host approved a file request — load content into any pending tab
+            let mut content_loaded = false;
+            for pane in s.panes.values_mut() {
+                for tab in pane.tabs.iter_mut() {
+                    if tab.path.as_ref().map(|p| p.to_string()).as_deref() == Some(path.as_str())
+                        && tab.remote_load_token.is_none()
+                        && tab.text.len_chars() == 0
+                    {
+                        tab.text = ropey::Rope::from_str(&content);
+                        tab.dirty = false;
+                        tab.hl_dirty_from = 0;
+                        tab.hl_color_cache.clear();
+                        tab.max_line_len = None;
+                        tab.edit_generation += 1;
+                        content_loaded = true;
+                    }
+                }
+            }
+            if content_loaded { s.needs_redraw = true; }
+        }
+        CollabMsg::FileDenied { path } => {
+            s.status_msg = Some(format!("Access denied: {path}"));
+        }
+        CollabMsg::RoleChangeRequest { target_site_id, new_role } => {
+            // Only the host processes this; guests receive PeerRoleChanged broadcasts
+            let is_host = s.collab.as_ref()
+                .map_or(false, |sess| matches!(sess.role, CollabRole::Host { .. }));
+            if !is_host { return; }
+            // Verify the requester (from_site_id) is a Moderator and isn't trying to
+            // grant a role higher than Contributor
+            let requester_perms = s.collab.as_ref().map_or(0, |sess| sess.peer_perms(from_site_id));
+            let can_manage = requester_perms & collab::perms::MANAGE_ROLES != 0;
+            let target_too_high = matches!(new_role, collab::PeerRole::SystemAccess | collab::PeerRole::Moderator);
+            if !can_manage || target_too_high { return; }
+            if let Some(session) = s.collab.as_mut() {
+                if let Some(peer) = session.peers.iter_mut().find(|p| p.site_id == target_site_id) {
+                    peer.role = new_role;
+                }
+                let msg = CollabMsg::PeerRoleChanged { site_id: target_site_id, role: new_role };
+                session.broadcast_except_msg(None, &msg);
+            }
+        }
+        CollabMsg::FileRequest { path } => {
+            // Host: serve a file to the requesting guest, if they have access
+            let is_host = s.collab.as_ref()
+                .map_or(false, |sess| matches!(sess.role, CollabRole::Host { .. }));
+            if !is_host { return; }
+
+            // Resolve path relative to the workspace root
+            let root = s.explorer.as_ref()
+                .and_then(|e| e.root.as_local_path().map(|p| p.to_path_buf()));
+
+            let (sender_role, role_perms, include, exclude) = if let Some(sess) = s.collab.as_ref() {
+                let sender_role = sess.peers.iter()
+                    .find(|p| p.site_id == from_site_id)
+                    .map(|p| p.role)
+                    .unwrap_or(collab::PeerRole::Viewer);
+                (sender_role, sess.role_perms.clone(), sess.include_globs.clone(), sess.exclude_globs.clone())
+            } else { return; };
+
+            let can_view = collab::guest_can_view(&path, sender_role, &role_perms, &include, &exclude);
+            if !can_view {
+                if let Some(session) = s.collab.as_ref() {
+                    session.send_to_site(from_site_id, &CollabMsg::FileDenied { path });
+                }
+                return;
+            }
+
+            // First check if we have the file open in a tab (use in-memory content)
+            let in_memory = s.panes.values()
+                .filter(|p| p.kind == PaneKind::Editor)
+                .flat_map(|p| p.tabs.iter())
+                .find(|t| t.path.as_ref().map(|p| p.to_string()).as_deref() == Some(path.as_str()))
+                .map(|t| t.text.to_string());
+
+            let content = in_memory.or_else(|| {
+                root.as_ref().and_then(|root| {
+                    let full_path = root.join(&path);
+                    std::fs::read_to_string(&full_path).ok()
+                })
+            });
+
+            if let Some(session) = s.collab.as_ref() {
+                match content {
+                    Some(text) => {
+                        session.send_to_site(from_site_id, &CollabMsg::FileResponse {
+                            path,
+                            content: text,
+                            server_clock: session.server_clock,
+                        });
+                    }
+                    None => {
+                        session.send_to_site(from_site_id, &CollabMsg::FileDenied { path });
+                    }
+                }
+            }
+        }
+        CollabMsg::FileSaved { path, content } => {
+            // Host saved a file — update guest's in-memory copy if open
+            let target = find_editor_tab_by_path(s, &path);
+            if let Some((pane_id, tab_idx)) = target {
+                if let Some(pane) = s.panes.get_mut(&pane_id) {
+                    if let Some(tab) = pane.tabs.get_mut(tab_idx) {
+                        // Only replace if the tab is clean (no local edits) to avoid conflicts
+                        if !tab.dirty {
+                            tab.text = ropey::Rope::from_str(&content);
+                            tab.hl_dirty_from = 0;
+                            tab.hl_color_cache.clear();
+                            tab.max_line_len = None;
+                            tab.edit_generation += 1;
+                            s.needs_redraw = true;
+                        }
+                    }
+                }
+            }
+        }
         _ => {}
     }
-    let _ = from_site_id; // used for logging in future
+    let _ = from_site_id;
+}
+
+/// Find the (pane_id, tab_index) for an editor tab whose path string matches `path`.
+fn find_editor_tab_by_path(s: &State, path: &str) -> Option<(usize, usize)> {
+    for (&pid, pane) in &s.panes {
+        if pane.kind != PaneKind::Editor { continue; }
+        for (ti, tab) in pane.tabs.iter().enumerate() {
+            if tab.path.as_ref().map(|p| p.to_string()).as_deref() == Some(path) {
+                return Some((pid, ti));
+            }
+        }
+    }
+    None
 }
 
 fn execute_command(s: &mut State, action: CommandAction) {
@@ -3394,6 +3851,20 @@ fn execute_command(s: &mut State, action: CommandAction) {
             if s.panes.get(&id).map_or(false, |p| p.kind == PaneKind::Editor) {
                 let proxy = s.proxy.clone();
                 s.tab_mut().save_with_proxy(Some(&proxy));
+                // If hosting a collab session, broadcast FileSaved to all guests
+                // so they can update their in-memory copies of this file.
+                let is_collab_host = s.collab.as_ref()
+                    .map_or(false, |sess| matches!(sess.role, collab::CollabRole::Host { .. }));
+                if is_collab_host {
+                    let tab_path = s.tab().path.as_ref().map(|p| p.to_string());
+                    if let Some(path) = tab_path {
+                        let content: String = s.tab().text.chunks().collect();
+                        if let Some(session) = s.collab.as_ref() {
+                            let msg = collab::CollabMsg::FileSaved { path, content };
+                            session.broadcast_except_msg(None, &msg);
+                        }
+                    }
+                }
                 let lang = s.tab().path.as_ref().map(|p| Lang::from_path(p.as_path())).unwrap_or(Lang::None);
                 let path = s.tab().path.clone();
                 // Format-on-save only runs for local files.
@@ -3409,8 +3880,10 @@ fn execute_command(s: &mut State, action: CommandAction) {
                         match lang {
                             Lang::Json | Lang::Jsonc => format_json_document(s),
                             _ => {
-                                if let (Some(srv), Some(ref p)) = (s.lsp.server_for_lang_mut(lang), path.as_ref()) {
-                                    if srv.initialized { lsp::request_formatting(srv, p); }
+                                if let Some(ref p) = path {
+                                    if let Some(srv) = s.lsp.server_for_lang_host_mut(lang, p.ssh_host()) {
+                                        if srv.initialized { lsp::request_formatting(srv, p); }
+                                    }
                                 }
                             }
                         }
@@ -3421,8 +3894,10 @@ fn execute_command(s: &mut State, action: CommandAction) {
                 if !org_globs.is_empty() && lang != Lang::None {
                     let matches = org_globs.split(',').map(|g| g.trim()).any(|g| glob_match(g, &path_str));
                     if matches {
-                        if let (Some(srv), Some(ref p)) = (s.lsp.server_for_lang_mut(lang), path.as_ref()) {
-                            if srv.initialized { lsp::request_organize_imports(srv, p); }
+                        if let Some(ref p) = path {
+                            if let Some(srv) = s.lsp.server_for_lang_host_mut(lang, p.ssh_host()) {
+                                if srv.initialized { lsp::request_organize_imports(srv, p); }
+                            }
                         }
                     }
                 }
@@ -3543,8 +4018,10 @@ fn execute_command(s: &mut State, action: CommandAction) {
             let line  = text.char_to_line(pos.min(text.len_chars().saturating_sub(1)));
             let col   = pos.saturating_sub(text.line_to_char(line));
             if lang != Lang::None {
-                if let (Some(srv), Some(ref p)) = (s.lsp.server_for_lang_mut(lang), path.as_ref()) {
-                    if srv.initialized { lsp::request_definition(srv, p, line, col); }
+                if let Some(ref p) = path {
+                    if let Some(srv) = s.lsp.server_for_lang_host_mut(lang, p.ssh_host()) {
+                        if srv.initialized { lsp::request_definition(srv, p, line, col); }
+                    }
                 }
             }
         }
@@ -3556,8 +4033,10 @@ fn execute_command(s: &mut State, action: CommandAction) {
             let line  = text.char_to_line(pos.min(text.len_chars().saturating_sub(1)));
             let col   = pos.saturating_sub(text.line_to_char(line));
             if lang != Lang::None {
-                if let (Some(srv), Some(ref p)) = (s.lsp.server_for_lang_mut(lang), path.as_ref()) {
-                    if srv.initialized { lsp::request_references(srv, p, line, col); }
+                if let Some(ref p) = path {
+                    if let Some(srv) = s.lsp.server_for_lang_host_mut(lang, p.ssh_host()) {
+                        if srv.initialized { lsp::request_references(srv, p, line, col); }
+                    }
                 }
             }
         }
@@ -3608,8 +4087,10 @@ fn execute_command(s: &mut State, action: CommandAction) {
                 Lang::None => {}
                 _ => {
                     let path = s.tab().path.clone();
-                    if let (Some(srv), Some(ref p)) = (s.lsp.server_for_lang_mut(lang), path.as_ref()) {
-                        if srv.initialized { lsp::request_formatting(srv, p); }
+                    if let Some(ref p) = path {
+                        if let Some(srv) = s.lsp.server_for_lang_host_mut(lang, p.ssh_host()) {
+                            if srv.initialized { lsp::request_formatting(srv, p); }
+                        }
                     }
                 }
             }
@@ -3618,44 +4099,35 @@ fn execute_command(s: &mut State, action: CommandAction) {
             let lang = s.tab().path.as_ref().map(|p| Lang::from_path(p.as_path())).unwrap_or(Lang::None);
             let path = s.tab().path.clone();
             if lang != Lang::None {
-                if let (Some(srv), Some(ref p)) = (s.lsp.server_for_lang_mut(lang), path.as_ref()) {
-                    if srv.initialized { lsp::request_organize_imports(srv, p); }
+                if let Some(ref p) = path {
+                    if let Some(srv) = s.lsp.server_for_lang_host_mut(lang, p.ssh_host()) {
+                        if srv.initialized { lsp::request_organize_imports(srv, p); }
+                    }
                 }
             }
         }
         CommandAction::OpenMarkdownPreview => open_markdown_preview(s),
         CommandAction::OpenRemoteDirectory => {
-            // The command palette shows this entry; the user then types
-            // an ssh:// URI in the quick-finder input.  Here we pre-fill
-            // the quick-finder with an ssh:// prompt so the user can type
-            // the URI directly.  If a URI is already in the quick-finder
-            // input, open it immediately.
             let query = s.quick_finder.query.trim().to_owned();
             if query.starts_with("ssh://") {
-                let vpath = VPath::parse(&query);
-                if let VPath::Remote { ref host, .. } = vpath {
-                    let h = host.clone();
-                    s.explorer = Some(FileExplorer::new(vpath.clone()));
-                    s.explorer_w = ((200.0 * s.font_size / FONT_PX).round() as i32).clamp(80, 600);
-                    // Save to recent hosts
-                    let uri = query.clone();
-                    if !s.settings.recent_remote_hosts.contains(&uri) {
-                        s.settings.recent_remote_hosts.insert(0, uri);
-                        s.settings.recent_remote_hosts.truncate(20);
-                        s.settings.save();
-                    }
-                    ssh::ensure_control_master(h, s.proxy.clone());
+                match parse_remote_directory_query(&query) {
+                    Ok((vpath, uri)) => open_remote_directory(s, vpath, uri),
+                    Err(msg) => s.status_msg = Some(msg),
                 }
                 s.quick_finder.open = false;
             } else {
-                // Open quick-finder pre-filled with ssh:// so user can type a URI
-                s.quick_finder.query = "ssh://".to_owned();
-                s.quick_finder.cursor = s.quick_finder.query.len();
+                s.quick_finder.query.clear();
+                s.quick_finder.cursor = 0;
+                s.quick_finder.sel_anchor = None;
+                s.quick_finder.walk_token += 1;
                 s.quick_finder.open = true;
+                s.quick_finder.remote_directory_mode = true;
                 s.quick_finder.entries = s.settings.recent_remote_hosts.iter()
                     .map(|u| VPath::parse(u))
+                    .filter(|p| matches!(p, VPath::Remote { .. }))
                     .collect();
                 s.quick_finder.filtered = (0..s.quick_finder.entries.len()).collect();
+                s.quick_finder.filtered_commands.clear();
                 s.quick_finder.selected = 0;
                 s.quick_finder.loading = false;
             }
@@ -3668,7 +4140,12 @@ fn execute_command(s: &mut State, action: CommandAction) {
                 .and_then(|t| t.path.as_ref())
                 .map(|p| p.to_string())
                 .unwrap_or_default();
-            match collab::start_host(port, doc_path, s.proxy.clone()) {
+            match collab::start_host(
+                port, doc_path, s.proxy.clone(),
+                s.settings.collab_role_perms.clone(),
+                s.settings.collab_include_globs.clone(),
+                s.settings.collab_exclude_globs.clone(),
+            ) {
                 Ok(session) => {
                     let invite = session.invite_str().to_owned();
                     s.collab = Some(session);
@@ -3696,7 +4173,9 @@ fn execute_command(s: &mut State, action: CommandAction) {
                 // Pre-fill quick-finder so user can paste or type the invite string
                 s.quick_finder.query = "lt-collab://".to_owned();
                 s.quick_finder.cursor = s.quick_finder.query.len();
+                s.quick_finder.walk_token += 1;
                 s.quick_finder.open = true;
+                s.quick_finder.remote_directory_mode = false;
                 s.quick_finder.entries = vec![];
                 s.quick_finder.filtered = vec![];
                 s.quick_finder.selected = 0;
@@ -4111,6 +4590,7 @@ impl ApplicationHandler<UserEvent> for App {
             active_pane:  0,
             next_pane_id: 1,
             next_buf_id:  1,
+            next_remote_read_token: 1,
             drag:         None,
             drag_pending: None,
             resize_drag:  None,
@@ -4120,6 +4600,9 @@ impl ApplicationHandler<UserEvent> for App {
             lsp:           lsp::LspManager::new(),
             diagnostics:   HashMap::new(),
             lsp_installed: HashMap::new(),
+            remote_lsp_installed: HashMap::new(),
+            remote_lsp_check_errors: HashMap::new(),
+            lsp_start_errors: HashMap::new(),
             proxy:         self.proxy.clone(),
             cursor_visible: true,
             cursor_blink:   Instant::now() + Duration::from_millis(500),
@@ -4161,6 +4644,7 @@ impl ApplicationHandler<UserEvent> for App {
                 open: false, query: String::new(), cursor: 0, sel_anchor: None,
                 entries: vec![], filtered: vec![], filtered_commands: vec![], selected: 0,
                 restore_tree_focus: false, walk_token: 0, loading: false,
+                remote_directory_mode: false,
             },
             global_find: GlobalFind {
                 query: String::new(), replace: String::new(),
@@ -4183,8 +4667,9 @@ impl ApplicationHandler<UserEvent> for App {
 
             ssh_connections: HashMap::new(),
 
-            collab:        None,
-            collab_before: None,
+            collab:           None,
+            collab_before:    None,
+            collab_file_list: Vec::new(),
         };
 
         s.win.request_redraw();
@@ -4488,6 +4973,36 @@ impl ApplicationHandler<UserEvent> for App {
 
                 // Git panel entry right-click
                 let act_w_r = s.activity_bar_w();
+                if s.explorer.is_some() && s.left_view == LeftView::FileTree && s.left_panel_visible
+                    && mx >= act_w_r && mx < act_w_r + s.explorer_w()
+                {
+                    let row = my / lh;
+                    if row >= 2 {
+                        let idx = (row - 2) as usize;
+                        let entry = s.explorer.as_ref().and_then(|ex| {
+                            if !ex.tree_search.is_empty() || idx >= ex.entries.len() || !ex.entries[idx].is_dir {
+                                None
+                            } else {
+                                Some(explorer_entry_vpath(ex, ex.entries[idx].path.clone()))
+                            }
+                        });
+                        if let Some(entry) = entry {
+                            s.context_menu = Some(ContextMenu {
+                                x: mx, y: my, hovered: 0,
+                                tab_source: None, git_entry: None, explorer_entry: Some(entry),
+                                items: vec![ContextMenuItem {
+                                    label: "Open Folder Here",
+                                    shortcut: "",
+                                    action: CtxAction::ExplorerOpenAsRoot,
+                                    enabled: true,
+                                }],
+                            });
+                            { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                            return;
+                        }
+                    }
+                }
+
                 if s.explorer.is_some() && s.left_view == LeftView::Git && s.left_panel_visible
                     && mx >= act_w_r && mx < act_w_r + s.explorer_w()
                 {
@@ -4517,6 +5032,7 @@ impl ApplicationHandler<UserEvent> for App {
                         s.context_menu = Some(ContextMenu {
                             x: mx, y: my, hovered: 0, tab_source: None,
                             git_entry: Some((is_staged, entry_path)),
+                            explorer_entry: None,
                             items: vec![
                                 ContextMenuItem { label: "Open File", shortcut: "", action: CtxAction::GitOpenFile, enabled: true },
                                 ContextMenuItem { label: "View Diff", shortcut: "", action: CtxAction::GitViewDiff, enabled: true },
@@ -4574,7 +5090,7 @@ impl ApplicationHandler<UserEvent> for App {
                     items.push(ContextMenuItem { label: "",            shortcut: "", action: CtxAction::Separator,     enabled: true });
                     items.push(ContextMenuItem { label: "Close",       shortcut: "Cmd+W", action: CtxAction::TabClose, enabled: true });
                     s.context_menu = Some(ContextMenu {
-                        x: mx, y: my, hovered: 0, tab_source: Some((hit.pid, hit.ti)), git_entry: None, items,
+                        x: mx, y: my, hovered: 0, tab_source: Some((hit.pid, hit.ti)), git_entry: None, explorer_entry: None, items,
                     });
                 } else {
                     // Editor text-area context menu
@@ -4582,13 +5098,16 @@ impl ApplicationHandler<UserEvent> for App {
                         if s.panes.get(&pid).map_or(false, |p| p.kind == PaneKind::Editor) {
                             s.active_pane = pid;
                             let lang = s.tab().path.as_ref().map(|p| Lang::from_path(p.as_path())).unwrap_or(Lang::None);
-                            let lsp_avail = lang != Lang::None && s.lsp.has_server_for(lang)
-                                && s.lsp.server_for_lang_mut(lang).map_or(false, |srv| srv.initialized);
+                            let active_path = s.tab().path.clone();
+                            let lsp_avail = lang != Lang::None
+                                && active_path.as_ref().and_then(|p| {
+                                    s.lsp.server_for_lang_host(lang, p.ssh_host()).map(|srv| srv.initialized)
+                                }).unwrap_or(false);
                             let has_sel = s.tab().cursors.iter().any(|c| c.has_sel());
                             s.context_menu = Some(ContextMenu {
                                 x: mx, y: my,
                                 hovered: 0,
-                                tab_source: None, git_entry: None,
+                                tab_source: None, git_entry: None, explorer_entry: None,
                                 items: vec![
                                     ContextMenuItem { label: "Go to Definition",   shortcut: "Cmd+Click / F12",   action: CtxAction::GotoDefinition,  enabled: lsp_avail },
                                     ContextMenuItem { label: "Find All References", shortcut: "Cmd+Shift+F12",    action: CtxAction::FindReferences,   enabled: lsp_avail },
@@ -4672,6 +5191,7 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         let tab_source = cm.tab_source;
                         let git_entry  = cm.git_entry.clone();
+                        let explorer_entry = cm.explorer_entry.clone();
                         s.context_menu = None;
                         if let Some(action) = action_taken {
                             let root_ga = s.explorer.as_ref()
@@ -4717,6 +5237,16 @@ impl ApplicationHandler<UserEvent> for App {
                                 CtxAction::Copy  => { execute_command(s, CommandAction::Copy); }
                                 CtxAction::Cut   => { execute_command(s, CommandAction::Cut); notify_collab_change(s); }
                                 CtxAction::Paste => { execute_command(s, CommandAction::Paste); notify_collab_change(s); }
+                                CtxAction::ExplorerOpenAsRoot => {
+                                    if let Some(path) = explorer_entry {
+                                        if let Some(uri) = remote_uri(&path) {
+                                            open_remote_directory(s, path, uri);
+                                        } else {
+                                            s.explorer = Some(FileExplorer::new(path));
+                                            s.left_view = LeftView::FileTree;
+                                        }
+                                    }
+                                }
                                 CtxAction::TabCopyRelPath => {
                                     if let Some((pid, ti)) = tab_source {
                                         let path = s.panes.get(&pid)
@@ -4769,7 +5299,7 @@ impl ApplicationHandler<UserEvent> for App {
                                             let closed = pane.tabs.remove(ti);
                                             if let Some(ref p) = closed.path {
                                                 let lang = Lang::from_path(p.as_path());
-                                                if let Some(srv) = s.lsp.server_for_lang_mut(lang) {
+                                                if let Some(srv) = s.lsp.server_for_lang_host_mut(lang, p.ssh_host()) {
                                                     lsp::notify_did_close(srv, p);
                                                 }
                                             }
@@ -4801,11 +5331,12 @@ impl ApplicationHandler<UserEvent> for App {
                 let act_w = s.activity_bar_w();
                 if s.explorer.is_some() && mx < act_w && my < s.h as i32 - s.status_h() {
                     let lh = s.glyphs.lh;
-                    let file_icon_y = 8;
-                    let srch_icon_y = file_icon_y + lh + 4;
-                    let diag_icon_y = srch_icon_y + lh + 4;
-                    let git_icon_y  = diag_icon_y + lh + 4;
-                    let gear_y      = s.h as i32 - s.status_h() - lh - 8;
+                    let file_icon_y   = 8;
+                    let srch_icon_y   = file_icon_y + lh + 4;
+                    let diag_icon_y   = srch_icon_y + lh + 4;
+                    let git_icon_y    = diag_icon_y + lh + 4;
+                    let collab_icon_y = git_icon_y  + lh + 4;
+                    let gear_y        = s.h as i32 - s.status_h() - lh - 8;
                     let clicked_view = if my >= file_icon_y && my < file_icon_y + lh {
                         Some(LeftView::FileTree)
                     } else if my >= srch_icon_y && my < srch_icon_y + lh {
@@ -4814,6 +5345,8 @@ impl ApplicationHandler<UserEvent> for App {
                         Some(LeftView::Diagnostics)
                     } else if my >= git_icon_y && my < git_icon_y + lh {
                         Some(LeftView::Git)
+                    } else if s.collab.is_some() && my >= collab_icon_y && my < collab_icon_y + lh {
+                        Some(LeftView::Collab)
                     } else {
                         None
                     };
@@ -4844,7 +5377,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 x: act_w, y: gear_y,
                                 items: vec![ContextMenuItem { label: "Open Settings", shortcut: "", action: CtxAction::OpenSettings, enabled: true }],
                                 hovered: 0,
-                                tab_source: None, git_entry: None,
+                                tab_source: None, git_entry: None, explorer_entry: None,
                             });
                         }
                     }
@@ -4915,14 +5448,26 @@ impl ApplicationHandler<UserEvent> for App {
                             } else {
                                 // Unfocus tree search if clicking entries
                                 if let Some(ex) = s.explorer.as_mut() { ex.tree_search_focused = false; }
+                                let mut remote_dir_to_list: Option<(vpath::SshHost, PathBuf)> = None;
                                 let action = s.explorer.as_mut().and_then(|ex| {
                                     if idx < ex.entries.len() {
                                         ex.selected = idx;
-                                        if ex.entries[idx].is_dir { ex.toggle(idx); None }
-                                        else { Some(ex.entries[idx].path.clone()) }
+                                        if ex.entries[idx].is_dir {
+                                            if let Some(path) = ex.toggle(idx) {
+                                                if let VPath::Remote { host, .. } = &ex.root {
+                                                    remote_dir_to_list = Some((host.clone(), path));
+                                                }
+                                            }
+                                            None
+                                        } else {
+                                            Some(explorer_entry_vpath(ex, ex.entries[idx].path.clone()))
+                                        }
                                     } else { None }
                                 });
-                                if let Some(path) = action { open_or_reuse_tab(s, VPath::Local(path)); }
+                                if let Some((host, path)) = remote_dir_to_list {
+                                    ssh::ssh_list_dir(host, path, s.proxy.clone());
+                                }
+                                if let Some(path) = action { open_or_reuse_tab(s, path); }
                             }
                         }
                     } else if s.left_view == LeftView::Diagnostics {
@@ -5435,16 +5980,15 @@ impl ApplicationHandler<UserEvent> for App {
                         } else {
                             // Language Servers section — install button clicks
                             let lsp_sec_y = tws_y + lh + 8;
-                            let lsp_rows: [(&str, &str); 3] = [
-                                ("TypeScript", "npm install -g typescript-language-server typescript\n"),
-                                ("Rust      ", "rustup component add rust-analyzer\n"),
-                                ("Python    ", "pip install python-lsp-server\n"),
-                            ];
-                            let inst_btn_x = btn_x + 11 * cw;
+                            let lsp_rows: [Lang; 3] = [Lang::TypeScript, Lang::Rust, Lang::Python];
+                            let scope_host = lsp_scope_host(s);
+                            let inst_btn_x = btn_x + 14 * cw;
                             let inst_btn_w = 9 * cw;
-                            for (i, (_, cmd)) in lsp_rows.iter().enumerate() {
+                            for (i, &lang) in lsp_rows.iter().enumerate() {
                                 let ly = lsp_sec_y + lh + 4 + i as i32 * (lh + 4);
-                                if my >= ly && my < ly + lh && mx >= inst_btn_x && mx < inst_btn_x + inst_btn_w {
+                                let show_install = lsp_installed_for(s, lang, scope_host.as_ref()) == Some(false);
+                                if show_install && my >= ly && my < ly + lh && mx >= inst_btn_x && mx < inst_btn_x + inst_btn_w {
+                                    let Some(cmd) = lsp_install_command(lang) else { continue };
                                     open_terminal_pane(s);
                                     let pane_id = s.active_pane;
                                     if let Some(&tid) = s.panes.get(&pane_id).and_then(|p| p.term_ids.get(p.active)) {
@@ -5469,6 +6013,7 @@ impl ApplicationHandler<UserEvent> for App {
                                         SettingsFieldId::FormatOnSave          => s.settings.format_on_save.clone(),
                                         SettingsFieldId::OrganizeImportsOnSave => s.settings.organize_imports_on_save.clone(),
                                         SettingsFieldId::FormatCommand         => s.settings.format_command.clone(),
+                                        _ => unreachable!(),
                                     };
                                     let cursor = current.chars().count();
                                     s.settings_edit_field  = Some(*fid);
@@ -5478,6 +6023,104 @@ impl ApplicationHandler<UserEvent> for App {
                                     break;
                                 }
                             }
+
+                            // Collaboration section — text fields + toggles
+                            let collab_sec_y = save_sec_y + lh + 4 + 3 * (lh + 4) + 8;
+                            let perm_col_w = 4 * cw;
+                            if !clicked_field {
+                                // Port field
+                                let cp_y = collab_sec_y + lh + 4;
+                                if my >= cp_y && my < cp_y + lh && mx >= save_btn_x && mx < save_btn_x + 6 * cw {
+                                    let current = s.settings.collab_port.to_string();
+                                    let cursor = current.chars().count();
+                                    s.settings_edit_field  = Some(SettingsFieldId::CollabPort);
+                                    s.settings_edit_text   = current;
+                                    s.settings_edit_cursor = cursor;
+                                    clicked_field = true;
+                                }
+                                // Default role buttons
+                                let dr_y = collab_sec_y + 2 * (lh + 4);
+                                if !clicked_field && my >= dr_y && my < dr_y + lh {
+                                    let role_btns: &[(collab::PeerRole, &str)] = &[
+                                        (collab::PeerRole::Viewer,       " Viewer "),
+                                        (collab::PeerRole::Contributor,  " Contributor "),
+                                        (collab::PeerRole::SystemAccess, " Sys.Access "),
+                                        (collab::PeerRole::Moderator,    " Moderator "),
+                                    ];
+                                    let mut rx2 = save_btn_x;
+                                    for (role, label) in role_btns.iter() {
+                                        let rw2 = label.chars().count() as i32 * cw;
+                                        if mx >= rx2 && mx < rx2 + rw2 {
+                                            s.settings.collab_role_perms.default_role = *role;
+                                            s.settings.save();
+                                            clicked_field = true;
+                                            break;
+                                        }
+                                        rx2 += rw2 + cw;
+                                    }
+                                }
+                                // Include globs field
+                                let cig_y = collab_sec_y + 3 * (lh + 4);
+                                if !clicked_field && my >= cig_y && my < cig_y + lh && mx >= save_btn_x && mx < save_btn_x + field_w {
+                                    let current = s.settings.collab_include_globs.join(",");
+                                    let cursor = current.chars().count();
+                                    s.settings_edit_field  = Some(SettingsFieldId::CollabIncludeGlobs);
+                                    s.settings_edit_text   = current;
+                                    s.settings_edit_cursor = cursor;
+                                    clicked_field = true;
+                                }
+                                // Exclude globs field
+                                let ceg_y = collab_sec_y + 4 * (lh + 4);
+                                if !clicked_field && my >= ceg_y && my < ceg_y + lh && mx >= save_btn_x && mx < save_btn_x + field_w {
+                                    let current = s.settings.collab_exclude_globs.join(",");
+                                    let cursor = current.chars().count();
+                                    s.settings_edit_field  = Some(SettingsFieldId::CollabExcludeGlobs);
+                                    s.settings_edit_text   = current;
+                                    s.settings_edit_cursor = cursor;
+                                    clicked_field = true;
+                                }
+                                // Permission matrix toggles
+                                let perm_hdr_y = collab_sec_y + 5 * (lh + 4) + 4;
+                                let perm_bits = [
+                                    collab::perms::VIEW_FILES, collab::perms::WRITE_FILES,
+                                    collab::perms::VIEW_HIDDEN, collab::perms::WRITE_HIDDEN,
+                                    collab::perms::VIEW_TERMINALS, collab::perms::OPEN_TERMINALS,
+                                    collab::perms::MANAGE_ROLES,
+                                ];
+                                for (ri, _role) in [
+                                    collab::PeerRole::Viewer,
+                                    collab::PeerRole::Contributor,
+                                    collab::PeerRole::SystemAccess,
+                                    collab::PeerRole::Moderator,
+                                ].iter().enumerate() {
+                                    if clicked_field { break; }
+                                    let pm_y = perm_hdr_y + lh + 4 + ri as i32 * (lh + 2);
+                                    if my < pm_y || my >= pm_y + lh { continue; }
+                                    for (ci, &bit) in perm_bits.iter().enumerate() {
+                                        let px2 = save_btn_x + ci as i32 * perm_col_w;
+                                        if mx >= px2 && mx < px2 + 3 * cw {
+                                            let field = match ri {
+                                                0 => &mut s.settings.collab_role_perms.viewer,
+                                                1 => &mut s.settings.collab_role_perms.contributor,
+                                                2 => &mut s.settings.collab_role_perms.system_access,
+                                                _ => &mut s.settings.collab_role_perms.moderator,
+                                            };
+                                            *field ^= bit;
+                                            s.settings.save();
+                                            // If a session is active, broadcast RoleConfig
+                                            if let Some(session) = s.collab.as_ref() {
+                                                let msg = collab::CollabMsg::RoleConfig {
+                                                    perms: s.settings.collab_role_perms.clone(),
+                                                };
+                                                session.broadcast_except_msg(None, &msg);
+                                            }
+                                            clicked_field = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+
                             if !clicked_field {
                                 // Click outside fields — commit and close any open field
                                 if let Some(fid) = s.settings_edit_field {
@@ -5486,6 +6129,21 @@ impl ApplicationHandler<UserEvent> for App {
                                         SettingsFieldId::FormatOnSave          => s.settings.format_on_save = text,
                                         SettingsFieldId::OrganizeImportsOnSave => s.settings.organize_imports_on_save = text,
                                         SettingsFieldId::FormatCommand         => s.settings.format_command = text,
+                                        SettingsFieldId::CollabPort            => {
+                                            if let Ok(p) = text.trim().parse::<u16>() {
+                                                s.settings.collab_port = p;
+                                            }
+                                        }
+                                        SettingsFieldId::CollabIncludeGlobs    => {
+                                            s.settings.collab_include_globs =
+                                                text.split(',').map(|g| g.trim().to_owned())
+                                                    .filter(|g| !g.is_empty()).collect();
+                                        }
+                                        SettingsFieldId::CollabExcludeGlobs    => {
+                                            s.settings.collab_exclude_globs =
+                                                text.split(',').map(|g| g.trim().to_owned())
+                                                    .filter(|g| !g.is_empty()).collect();
+                                        }
                                     }
                                     s.settings.save();
                                     s.settings_edit_field = None;
@@ -5566,10 +6224,12 @@ impl ApplicationHandler<UserEvent> for App {
                     let tab_path   = s.tab().path.clone();
                     let mut lsp_sent = false;
                     if tab_lang != Lang::None {
-                        if let (Some(srv), Some(ref path)) = (s.lsp.server_for_lang_mut(tab_lang), tab_path.as_ref()) {
-                            if srv.initialized {
-                                lsp::request_definition(srv, path, click_line, click_col);
-                                lsp_sent = true;
+                        if let Some(ref path) = tab_path {
+                            if let Some(srv) = s.lsp.server_for_lang_host_mut(tab_lang, path.ssh_host()) {
+                                if srv.initialized {
+                                    lsp::request_definition(srv, path, click_line, click_col);
+                                    lsp_sent = true;
+                                }
                             }
                         }
                     }
@@ -5757,7 +6417,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 let lh = s.glyphs.lh as usize;
                                 let pane_rect = s.active_pane_rect();
                                 let visible_h = (pane_rect.h - s.tab_h()).max(0) as usize;
-                                let content_h = if s.settings.undo_limit.is_some() { 24 * lh + 104 } else { 23 * lh + 100 };
+                                let content_h = if s.settings.undo_limit.is_some() { 34 * lh + 148 } else { 33 * lh + 144 };
                                 let max_scroll = content_h.saturating_sub(visible_h) / lh + 1;
                                 let t = s.tab_mut();
                                 if dy < 0 {
@@ -5904,6 +6564,7 @@ impl ApplicationHandler<UserEvent> for App {
                     match &event.logical_key {
                         Key::Named(NamedKey::Escape) => {
                             s.quick_finder.open = false;
+                            s.quick_finder.remote_directory_mode = false;
                             if s.quick_finder.restore_tree_focus {
                                 s.quick_finder.restore_tree_focus = false;
                                 if let Some(ex) = s.explorer.as_mut() { ex.tree_search_focused = true; }
@@ -5932,34 +6593,62 @@ impl ApplicationHandler<UserEvent> for App {
                                     }
                                     execute_command(s, action);
                                 }
-                            } else if let Some(&fi) = s.quick_finder.filtered.get(idx) {
-                                let path = s.quick_finder.entries[fi].clone();
-                                s.quick_finder.open = false;
-                                if s.quick_finder.restore_tree_focus {
-                                    s.quick_finder.restore_tree_focus = false;
-                                    if let Some(ex) = s.explorer.as_mut() { ex.tree_search_focused = true; }
-                                }
-                                // If the selected entry is a remote path shown from "Open Remote Directory",
-                                // open it as a workspace root rather than a file tab.
+                            } else {
                                 let query = s.quick_finder.query.trim().to_owned();
-                                let is_remote_dir_mode = query.starts_with("ssh://")
-                                    && matches!(path, VPath::Remote { .. });
-                                if is_remote_dir_mode {
-                                    if let VPath::Remote { ref host, .. } = path {
-                                        let h = host.clone();
-                                        s.explorer = Some(FileExplorer::new(path.clone()));
-                                        s.explorer_w = ((200.0 * s.font_size / FONT_PX).round() as i32).clamp(80, 600);
-                                        let uri = path.display_short();
-                                        if !s.settings.recent_remote_hosts.contains(&uri) {
-                                            s.settings.recent_remote_hosts.insert(0, uri);
-                                            s.settings.recent_remote_hosts.truncate(20);
-                                            s.settings.save();
-                                        }
-                                        ssh::ensure_control_master(h, s.proxy.clone());
-                                    }
+                                let typed_remote = if query.starts_with("ssh://") {
+                                    Some(parse_remote_directory_query(&query))
                                 } else {
-                                    push_cursor_history(s);
-                                    open_or_reuse_tab(s, path);
+                                    None
+                                };
+                                if s.quick_finder.remote_directory_mode {
+                                    s.quick_finder.open = false;
+                                    s.quick_finder.remote_directory_mode = false;
+                                    if s.quick_finder.restore_tree_focus {
+                                        s.quick_finder.restore_tree_focus = false;
+                                        if let Some(ex) = s.explorer.as_mut() { ex.tree_search_focused = true; }
+                                    }
+                                    if let Some(result) = typed_remote {
+                                        match result {
+                                            Ok((vpath, uri)) => open_remote_directory(s, vpath, uri),
+                                            Err(msg) => s.status_msg = Some(msg),
+                                        }
+                                    } else if let Some(&fi) = s.quick_finder.filtered.get(idx) {
+                                        let path = s.quick_finder.entries[fi].clone();
+                                        if let Some(uri) = remote_uri(&path) {
+                                            open_remote_directory(s, path, uri);
+                                        }
+                                    } else {
+                                        s.status_msg = Some("Enter a remote URI like ssh://host:~/devel".to_owned());
+                                    }
+                                } else if let Some(result) = typed_remote {
+                                    s.quick_finder.open = false;
+                                    if s.quick_finder.restore_tree_focus {
+                                        s.quick_finder.restore_tree_focus = false;
+                                        if let Some(ex) = s.explorer.as_mut() { ex.tree_search_focused = true; }
+                                    }
+                                    match result {
+                                        Ok((vpath, uri)) => open_remote_directory(s, vpath, uri),
+                                        Err(msg) => s.status_msg = Some(msg),
+                                    }
+                                } else if let Some(&fi) = s.quick_finder.filtered.get(idx) {
+                                    let path = s.quick_finder.entries[fi].clone();
+                                    s.quick_finder.open = false;
+                                    if s.quick_finder.restore_tree_focus {
+                                        s.quick_finder.restore_tree_focus = false;
+                                        if let Some(ex) = s.explorer.as_mut() { ex.tree_search_focused = true; }
+                                    }
+                                    // If the selected entry is a remote path shown from "Open Remote Directory",
+                                    // open it as a workspace root rather than a file tab.
+                                    let is_remote_dir_mode = query.starts_with("ssh://")
+                                        && matches!(&path, VPath::Remote { .. });
+                                    if is_remote_dir_mode {
+                                        if let Some(uri) = remote_uri(&path) {
+                                            open_remote_directory(s, path, uri);
+                                        }
+                                    } else {
+                                        push_cursor_history(s);
+                                        open_or_reuse_tab(s, path);
+                                    }
                                 }
                             }
                         }
@@ -6176,6 +6865,21 @@ impl ApplicationHandler<UserEvent> for App {
                                     SettingsFieldId::FormatOnSave          => s.settings.format_on_save = text,
                                     SettingsFieldId::OrganizeImportsOnSave => s.settings.organize_imports_on_save = text,
                                     SettingsFieldId::FormatCommand         => s.settings.format_command = text,
+                                    SettingsFieldId::CollabPort            => {
+                                        if let Ok(p) = text.trim().parse::<u16>() {
+                                            s.settings.collab_port = p;
+                                        }
+                                    }
+                                    SettingsFieldId::CollabIncludeGlobs    => {
+                                        s.settings.collab_include_globs =
+                                            text.split(',').map(|g| g.trim().to_owned())
+                                                .filter(|g| !g.is_empty()).collect();
+                                    }
+                                    SettingsFieldId::CollabExcludeGlobs    => {
+                                        s.settings.collab_exclude_globs =
+                                            text.split(',').map(|g| g.trim().to_owned())
+                                                .filter(|g| !g.is_empty()).collect();
+                                    }
                                 }
                                 s.settings.save();
                             }
@@ -6573,7 +7277,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 let closed = pane.tabs.remove(pane.active);
                                 if let Some(ref p) = closed.path {
                                     let lang = Lang::from_path(p.as_path());
-                                    if let Some(srv) = s.lsp.server_for_lang_mut(lang) {
+                                    if let Some(srv) = s.lsp.server_for_lang_host_mut(lang, p.ssh_host()) {
                                         lsp::notify_did_close(srv, p);
                                     }
                                 }
@@ -6742,7 +7446,7 @@ impl ApplicationHandler<UserEvent> for App {
                                     let lh = s.glyphs.lh as usize;
                                     let pane_rect = s.active_pane_rect();
                                     let visible_h = (pane_rect.h - s.tab_h()).max(0) as usize;
-                                    let content_h = if s.settings.undo_limit.is_some() { 24 * lh + 104 } else { 23 * lh + 100 };
+                                    let content_h = if s.settings.undo_limit.is_some() { 34 * lh + 148 } else { 33 * lh + 144 };
                                     let max_scroll = content_h.saturating_sub(visible_h) / lh + 1;
                                     let step = if matches!(&event.logical_key, Key::Named(NamedKey::PageDown)) { 5 } else { 1 };
                                     s.tab_mut().scroll = (s.tab().scroll + step).min(max_scroll);
@@ -6863,28 +7567,34 @@ impl ApplicationHandler<UserEvent> for App {
                     op.lines.extend(text.lines().map(String::from));
                 }
                 // Send `initialized` notification after receiving initialize response
+                let mut initialized_key: Option<(Option<vpath::SshHost>, Lang)> = None;
                 if let Some(srv) = s.lsp.servers.get_mut(&pane_id) {
                     if !srv.initialized {
                         if let Ok(text) = String::from_utf8(data) {
                             if lsp::is_initialize_response(&text) {
                                 lsp::send_initialized(srv);
+                                initialized_key = Some((srv.ssh_host.clone(), srv.lang));
                             }
                         }
                     }
+                }
+                if let Some(key) = initialized_key {
+                    s.lsp_start_errors.remove(&key);
                 }
             }
             UserEvent::LspDiagnostics { path, diagnostics } => {
                 s.diagnostics.insert(path, diagnostics);
             }
             UserEvent::LspResponse { server_id, id, result } => {
-                let kind = s.lsp.servers.get_mut(&server_id)
-                    .and_then(|srv| srv.pending.remove(&id));
+                let (kind, ssh_host) = s.lsp.servers.get_mut(&server_id)
+                    .map(|srv| (srv.pending.remove(&id), srv.ssh_host.clone()))
+                    .unwrap_or((None, None));
                 match kind {
                     Some(lsp::PendingKind::Definition) => {
-                        apply_goto_definition(s, &result);
+                        apply_goto_definition(s, &result, ssh_host);
                     }
                     Some(lsp::PendingKind::References) => {
-                        apply_references(s, &result);
+                        apply_references(s, &result, ssh_host);
                     }
                     Some(lsp::PendingKind::Formatting { path }) => {
                         apply_text_edits(s, &path, &result);
@@ -6895,6 +7605,52 @@ impl ApplicationHandler<UserEvent> for App {
                     None => {}
                 }
                 s.needs_redraw = true;
+            }
+            UserEvent::LspServerStopped { server_id } => {
+                if let Some(srv) = s.lsp.servers.remove(&server_id) {
+                    let scope = srv.ssh_host.as_ref()
+                        .map(|h| format!("remote {}", h.display()))
+                        .unwrap_or_else(|| "local machine".to_owned());
+                    let bin = lsp_binary(srv.lang).unwrap_or("language server");
+                    let msg = if srv.initialized {
+                        format!("{bin} stopped on {scope}")
+                    } else {
+                        format!("{bin} failed to initialize on {scope}; check LSP output")
+                    };
+                    s.lsp_start_errors.insert((srv.ssh_host, srv.lang), msg.clone());
+                    s.status_msg = Some(msg);
+                }
+                s.needs_redraw = true;
+                self.dirty.store(true, Ordering::Release);
+            }
+            UserEvent::LspBinaryCheckResult { host, statuses, error } => {
+                match host {
+                    Some(h) => {
+                        if let Some(msg) = error {
+                            s.remote_lsp_check_errors.insert(h.clone(), msg.clone());
+                            for lang in [Lang::TypeScript, Lang::Rust, Lang::Python] {
+                                s.remote_lsp_installed.remove(&(h.clone(), lang));
+                            }
+                            s.status_msg = Some(format!("LSP check failed on {}: {}", h.display(), msg));
+                        } else {
+                            s.remote_lsp_check_errors.remove(&h);
+                        }
+                        for (lang, installed) in statuses {
+                            if let Some(installed) = installed {
+                                s.remote_lsp_installed.insert((h.clone(), lang), installed);
+                            }
+                        }
+                    }
+                    None => {
+                        for (lang, installed) in statuses {
+                            if let Some(installed) = installed {
+                                s.lsp_installed.insert(lang, installed);
+                            }
+                        }
+                    }
+                }
+                s.needs_redraw = true;
+                self.dirty.store(true, Ordering::Release);
             }
             UserEvent::FormatterDone { path } => {
                 for pane in s.panes.values_mut() {
@@ -6947,7 +7703,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::QuickFinderFiles { token, entries } => {
-                if token == s.quick_finder.walk_token {
+                if token == s.quick_finder.walk_token && !s.quick_finder.remote_directory_mode {
                     let n = entries.len();
                     s.quick_finder.entries = entries;
                     s.quick_finder.loading = false;
@@ -6996,20 +7752,20 @@ impl ApplicationHandler<UserEvent> for App {
                 s.ssh_connections.insert(host.clone(), SshConnectionState::Connected);
                 s.status_msg = None;
                 // Trigger loading of any remote tabs that are waiting for this host.
-                let pending_remote: Vec<VPath> = s.panes.values()
-                    .flat_map(|p| p.tabs.iter())
-                    .filter_map(|t| {
+                let pending_remote: Vec<(usize, usize, VPath)> = s.panes.iter()
+                    .flat_map(|(&pid, p)| p.tabs.iter().enumerate().map(move |(tidx, t)| (pid, tidx, t)))
+                    .filter_map(|(pid, tidx, t)| {
                         let path = t.path.as_ref()?;
-                        if path.ssh_host() == Some(&host) && t.text.len_chars() == 0 {
-                            Some(path.clone())
+                        if path.ssh_host() == Some(&host)
+                            && t.text.len_chars() == 0
+                            && t.remote_load_token.is_none()
+                        {
+                            Some((pid, tidx, path.clone()))
                         } else { None }
                     })
                     .collect();
-                let token_base = s.next_buf_id as u64;
-                for (i, vpath) in pending_remote.into_iter().enumerate() {
-                    if let VPath::Remote { host: h, path: rpath } = vpath {
-                        ssh::ssh_read_file(h, rpath, token_base + i as u64, s.proxy.clone());
-                    }
+                for (pid, tidx, vpath) in pending_remote {
+                    begin_remote_tab_read(s, pid, tidx, vpath);
                 }
                 // Trigger dir listing for remote explorer root on this host.
                 if let Some(ex) = &s.explorer {
@@ -7018,6 +7774,12 @@ impl ApplicationHandler<UserEvent> for App {
                             ssh::ssh_list_dir(h, rpath, s.proxy.clone());
                         }
                     }
+                }
+                let settings_open = s.panes.values().any(|p| {
+                    p.kind == PaneKind::Editor && p.tabs.iter().any(|t| t.kind == TabKind::Settings)
+                });
+                if settings_open && lsp_scope_host(s).as_ref() == Some(&host) {
+                    check_lsp_binaries(s);
                 }
                 s.needs_redraw = true;
                 self.dirty.store(true, Ordering::Release);
@@ -7028,19 +7790,49 @@ impl ApplicationHandler<UserEvent> for App {
                 s.needs_redraw = true;
                 self.dirty.store(true, Ordering::Release);
             }
-            UserEvent::RemoteFileContent { token: _, path, content } => {
-                // Deliver content to the tab that was opened for this path.
+            UserEvent::RemoteFileContent { token, path, content } => {
+                // Deliver content only to the tab load request that owns this token.
+                // Always clear the token so it doesn't linger; only insert content
+                // if the tab is still clean (user hasn't typed anything yet).
+                let mut content_dropped = false;
                 for pane in s.panes.values_mut() {
                     for tab in pane.tabs.iter_mut() {
-                        if tab.path.as_ref() == Some(&path) && tab.text.len_chars() == 0 {
-                            tab.text = ropey::Rope::from_str(&content);
-                            tab.dirty = false;
-                            tab.hl_dirty_from = 0;
-                            tab.hl_color_cache.clear();
-                            tab.max_line_len = None;
-                            tab.edit_generation += 1;
+                        if tab.path.as_ref() == Some(&path) && tab.remote_load_token == Some(token) {
+                            tab.remote_load_token = None;
+                            if !tab.dirty && tab.text.len_chars() == 0 {
+                                tab.text = ropey::Rope::from_str(&content);
+                                tab.dirty = false;
+                                tab.hl_dirty_from = 0;
+                                tab.hl_color_cache.clear();
+                                tab.max_line_len = None;
+                                tab.edit_generation += 1;
+                            } else {
+                                content_dropped = true;
+                            }
                         }
                     }
+                }
+                if content_dropped {
+                    s.status_msg = Some(format!(
+                        "Remote load: tab was edited before {} arrived — content discarded",
+                        path.display_short()
+                    ));
+                }
+                s.needs_redraw = true;
+                self.dirty.store(true, Ordering::Release);
+            }
+            UserEvent::RemoteFileError { token, path, msg } => {
+                let mut matched = false;
+                for pane in s.panes.values_mut() {
+                    for tab in pane.tabs.iter_mut() {
+                        if tab.path.as_ref() == Some(&path) && tab.remote_load_token == Some(token) {
+                            tab.remote_load_token = None;
+                            matched = true;
+                        }
+                    }
+                }
+                if matched {
+                    s.status_msg = Some(format!("Remote open error ({}): {}", path.display_short(), msg));
                 }
                 s.needs_redraw = true;
                 self.dirty.store(true, Ordering::Release);
@@ -7057,8 +7849,34 @@ impl ApplicationHandler<UserEvent> for App {
                 s.needs_redraw = true;
                 self.dirty.store(true, Ordering::Release);
             }
-            UserEvent::RemoteDirListing { path: _, entries: _ } => {
-                // Phase 3: populate remote explorer entries when async listing arrives.
+            UserEvent::RemoteDirListing { path, entries } => {
+                if let Some(ex) = s.explorer.as_mut() {
+                    if ex.root == path {
+                        let root_path = path.as_path().to_path_buf();
+                        ex.entries = remote_listing_to_file_entries(&root_path, entries, 0, ex.show_hidden);
+                        ex.selected = ex.selected.min(ex.entries.len().saturating_sub(1));
+                    } else if path.ssh_host() == ex.root.ssh_host() {
+                        let listing_path = path.as_path().to_path_buf();
+                        if let Some(idx) = ex.entries.iter().position(|e| e.path == listing_path) {
+                            let depth = ex.entries[idx].depth;
+                            let mut end = idx + 1;
+                            while end < ex.entries.len() && ex.entries[end].depth > depth { end += 1; }
+                            ex.entries.drain(idx + 1..end);
+                            if ex.entries[idx].expanded {
+                                let children = remote_listing_to_file_entries(
+                                    &listing_path,
+                                    entries,
+                                    depth + 1,
+                                    ex.show_hidden,
+                                );
+                                for (i, child) in children.into_iter().enumerate() {
+                                    ex.entries.insert(idx + 1 + i, child);
+                                }
+                            }
+                            ex.selected = ex.selected.min(ex.entries.len().saturating_sub(1));
+                        }
+                    }
+                }
                 s.needs_redraw = true;
                 self.dirty.store(true, Ordering::Release);
             }
@@ -7069,7 +7887,7 @@ impl ApplicationHandler<UserEvent> for App {
                 s.needs_redraw = true;
                 self.dirty.store(true, Ordering::Release);
             }
-            UserEvent::CollabConnected { session, doc_text, peers: _ } => {
+            UserEvent::CollabConnected { session, doc_text, peers: _, file_list } => {
                 // Guest: replace active tab's content with the host's current snapshot
                 let ap = s.active_pane;
                 if let Some(pane) = s.panes.get_mut(&ap) {
@@ -7091,6 +7909,8 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     }
                 }
+                // Populate the guest's quick-finder with the host-filtered file list
+                s.collab_file_list = file_list;
                 let n = s.collab.as_ref().map_or(0, |sess| sess.peers.len());
                 s.status_msg = Some(format!("🔒 collab: connected ({n} peer{})", if n == 1 { "" } else { "s" }));
                 s.needs_redraw = true;
@@ -7117,11 +7937,55 @@ impl ApplicationHandler<UserEvent> for App {
                 let name = peer.name.clone();
                 let color = peer.color;
 
-                // Get current doc text from active tab
-                let ap = s.active_pane;
-                let doc_text = s.panes.get(&ap)
+                // Determine the guest's assigned role and permission set
+                let (assigned_role, role_perms_snap, include_globs_snap, exclude_globs_snap) =
+                    s.collab.as_ref().map(|sess| (
+                        sess.role_perms.default_role,
+                        sess.role_perms.clone(),
+                        sess.include_globs.clone(),
+                        sess.exclude_globs.clone(),
+                    )).unwrap_or_else(|| (
+                        collab::PeerRole::Viewer,
+                        collab::RolePermissions::default(),
+                        vec![],
+                        vec![],
+                    ));
+
+                // Build a role-filtered file list from the local workspace
+                let workspace_root = s.explorer.as_ref()
+                    .and_then(|e| e.root.as_local_path().map(|p| p.to_path_buf()));
+                let file_list: Vec<String> = if let Some(root) = workspace_root {
+                    let mut raw_paths = Vec::new();
+                    walk_files(&root, &mut raw_paths, 0);
+                    raw_paths.into_iter()
+                        .filter_map(|p| {
+                            p.strip_prefix(&root).ok()
+                                .and_then(|rel| rel.to_str())
+                                .map(|s| s.to_owned())
+                        })
+                        .filter(|rel| collab::guest_can_view(
+                            rel, assigned_role, &role_perms_snap,
+                            &include_globs_snap, &exclude_globs_snap,
+                        ))
+                        .collect()
+                } else {
+                    vec![]
+                };
+
+                // Get doc text from the tab that owns the collab session, not
+                // the currently active tab (the host may have switched files).
+                let session_doc_path = s.collab.as_ref()
+                    .map(|sess| sess.doc_path.clone())
+                    .unwrap_or_default();
+                let doc_text = s.panes.values()
                     .filter(|p| p.kind == PaneKind::Editor)
-                    .and_then(|p| p.tabs.get(p.active))
+                    .flat_map(|p| p.tabs.iter())
+                    .find(|t| {
+                        t.path.as_ref()
+                            .map(|p| p.to_string())
+                            .as_deref()
+                            == Some(session_doc_path.as_str())
+                    })
                     .map(|t| t.text.to_string())
                     .unwrap_or_default();
 
@@ -7130,8 +7994,17 @@ impl ApplicationHandler<UserEvent> for App {
                     doc_text,
                     server_clock,
                     peers: all_peers,
+                    role:      assigned_role,
+                    role_perms: role_perms_snap,
+                    file_list,
                 };
-                let new_peer = collab::PeerInfo { site_id, name: name.clone(), color };
+                let new_peer = collab::PeerInfo {
+                    site_id,
+                    name: name.clone(),
+                    color,
+                    role:         assigned_role,
+                    current_file: String::new(),
+                };
                 let peer_joined = collab::CollabMsg::PeerJoined { peer: new_peer.clone() };
 
                 if let Some(session) = s.collab.as_ref() {
@@ -7640,13 +8513,19 @@ fn render(s: &mut State) {
         let gutter_w  = State::gutter_w(total, cw);
         let tab_info = make_tab_info(&pane.tabs);
 
-        // Remote collab cursors — convert char offsets to (line, col, color)
+        // Remote collab cursors — convert char offsets to (line, col, color).
+        // Only show cursors for peers whose current_file matches this tab's path.
+        let tab_path_str = tab.path.as_ref().map(|p| p.to_string()).unwrap_or_default();
         let remote_cursors: Vec<(usize, usize, u32)> = s.collab.as_ref().map_or(vec![], |session| {
-            session.remote_cursors.iter().flat_map(|(&sid, cursors)| {
+            session.remote_cursors.iter().flat_map(|(&sid, (rc_path, rc_vec))| {
+                // If the peer has a known path, only show their cursor on the matching tab
+                if !rc_path.is_empty() && rc_path != &tab_path_str {
+                    return vec![];
+                }
                 let color = session.peers.iter()
                     .find(|p| p.site_id == sid)
                     .map_or(0xFF6B6B, |p| p.color);
-                cursors.iter().map(move |rc| {
+                rc_vec.iter().map(move |rc| {
                     let head  = rc.head.min(tab.text.len_chars());
                     let line  = tab.text.char_to_line(head);
                     let col   = head - tab.text.line_to_char(line);
@@ -7705,12 +8584,46 @@ fn render(s: &mut State) {
     let term_cmd_bs      = s.settings.term_cmd_bs;
     let term_alt_bs      = s.settings.term_alt_bs;
     let term_word_select = s.settings.term_word_select;
-    let ts_installed     = s.lsp_installed.get(&Lang::TypeScript).copied().unwrap_or(false);
-    let ts_running       = s.lsp.has_server_for(Lang::TypeScript);
-    let rust_installed   = s.lsp_installed.get(&Lang::Rust).copied().unwrap_or(false);
-    let rust_running     = s.lsp.has_server_for(Lang::Rust);
-    let py_installed     = s.lsp_installed.get(&Lang::Python).copied().unwrap_or(false);
-    let py_running       = s.lsp.has_server_for(Lang::Python);
+    let lsp_scope_host   = lsp_scope_host(s);
+    let lsp_scope_label  = lsp_scope_host.as_ref()
+        .map(|h| format!("SSH {}", h.display()))
+        .unwrap_or_else(|| "local".to_owned());
+    let lsp_rows_snap: Vec<(Lang, &'static str, String, bool, bool)> =
+        [(Lang::TypeScript, "TypeScript"), (Lang::Rust, "Rust      "), (Lang::Python, "Python    ")]
+            .into_iter()
+            .map(|(lang, name)| {
+                let srv = s.lsp.server_for_lang_host(lang, lsp_scope_host.as_ref());
+                let installed = lsp_installed_for(s, lang, lsp_scope_host.as_ref());
+                let failed = s.lsp_start_errors.contains_key(&(lsp_scope_host.clone(), lang));
+                let check_failed = lsp_scope_host.as_ref()
+                    .and_then(|host| s.remote_lsp_check_errors.get(host))
+                    .is_some();
+                let connection_failed = lsp_scope_host.as_ref()
+                    .and_then(|host| s.ssh_connections.get(host))
+                    .map_or(false, |state| matches!(state, SshConnectionState::Failed(_)));
+                let (status, accent, show_install) = if let Some(srv) = srv {
+                    if srv.initialized {
+                        ("running".to_owned(), true, false)
+                    } else {
+                        ("starting".to_owned(), false, false)
+                    }
+                } else if failed {
+                    if installed == Some(false) {
+                        ("not found".to_owned(), false, true)
+                    } else {
+                        ("failed".to_owned(), false, false)
+                    }
+                } else {
+                    match installed {
+                        Some(true)  => ("not started".to_owned(), false, false),
+                        Some(false) => ("not found".to_owned(), false, true),
+                        None if check_failed || connection_failed => ("check failed".to_owned(), false, false),
+                        None        => ("checking".to_owned(), false, false),
+                    }
+                };
+                (lang, name, status, accent, show_install)
+            })
+            .collect();
     let format_on_save          = s.settings.format_on_save.clone();
     let organize_imports_on_save = s.settings.organize_imports_on_save.clone();
     let format_command          = s.settings.format_command.clone();
@@ -7720,6 +8633,24 @@ fn render(s: &mut State) {
     let settings_edit_field     = s.settings_edit_field;
     let settings_edit_text      = s.settings_edit_text.clone();
     let settings_edit_cursor    = s.settings_edit_cursor;
+    let collab_port             = s.settings.collab_port;
+    let collab_role_perms       = s.settings.collab_role_perms.clone();
+    let collab_include_globs    = s.settings.collab_include_globs.join(",");
+    let collab_exclude_globs    = s.settings.collab_exclude_globs.join(",");
+    // For collab panel: snapshot of live session peers
+    let collab_peers_snap: Vec<(u64, String, u32, collab::PeerRole, String)> = s.collab.as_ref()
+        .map(|sess| sess.peers.iter().map(|p| {
+            (p.site_id, p.name.clone(), p.color, p.role, p.current_file.clone())
+        }).collect())
+        .unwrap_or_default();
+    let collab_session_active   = s.collab.is_some();
+    let collab_is_host          = s.collab.as_ref()
+        .map_or(false, |sess| matches!(sess.role, collab::CollabRole::Host { .. }));
+    let collab_invite_str: Option<String> = s.collab.as_ref().and_then(|sess| {
+        if let collab::CollabRole::Host { invite_str, .. } = &sess.role {
+            Some(invite_str.clone())
+        } else { None }
+    });
     let explorer_drag    = s.explorer_drag;
     let ui_scale         = s.font_size / FONT_PX;
     let left_view        = s.left_view;
@@ -7748,6 +8679,7 @@ fn render(s: &mut State) {
     let qf_sel_anchor_chars: Option<usize> = s.quick_finder.sel_anchor.map(|a|
         s.quick_finder.query[..a].chars().count());
     let qf_is_cmd_mode  = qf_query.starts_with('>');
+    let qf_remote_directory_mode = s.quick_finder.remote_directory_mode;
     let qf_selected     = s.quick_finder.selected;
     let qf_items: Vec<(String, String)> = if qf_open && !qf_is_cmd_mode {
         let n = s.quick_finder.filtered.len();
@@ -7755,8 +8687,13 @@ fn render(s: &mut State) {
         let view_end   = (view_start + 10).min(n);
         s.quick_finder.filtered[view_start..view_end].iter().map(|&idx| {
             let p = &s.quick_finder.entries[idx];
-            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_owned();
-            let dir  = p.parent_str();
+            let (name, dir) = if qf_remote_directory_mode {
+                (remote_uri(p).unwrap_or_else(|| p.display_short()), String::new())
+            } else {
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_owned();
+                let dir  = p.parent_str();
+                (name, dir)
+            };
             (name, dir)
         }).collect()
     } else { vec![] };
@@ -7962,7 +8899,8 @@ fn render(s: &mut State) {
             let diag_icon_y = srch_icon_y + icon_size + 4;
             let gear_y      = panel_h - icon_size - 8;
 
-            let git_icon_y  = diag_icon_y + icon_size + 4;
+            let git_icon_y    = diag_icon_y + icon_size + 4;
+            let collab_icon_y = git_icon_y + icon_size + 4;
 
             // File tree icon
             let ft_active = left_view == LeftView::FileTree && left_panel_visible;
@@ -7997,6 +8935,16 @@ fn render(s: &mut State) {
             let gt_bg = if gt_active { SEL_BG } else { BG };
             fill(buf, w, h, 2, git_icon_y, act_w - 3, icon_size, gt_bg);
             draw_str(buf, w, h, g, " [G]", 2, git_icon_y + asc, if gt_active { ACCENT } else { FG_DIM }, act_w - 1);
+
+            // Collab icon — only visible when a session is active
+            if collab_session_active {
+                let co_active = left_view == LeftView::Collab && left_panel_visible;
+                if co_active { fill(buf, w, h, 0, collab_icon_y, 2, icon_size, ACCENT); }
+                let co_bg = if co_active { SEL_BG } else { BG };
+                fill(buf, w, h, 2, collab_icon_y, act_w - 3, icon_size, co_bg);
+                let co_color = if co_active { ACCENT } else { 0x55_AA_FF_u32 };
+                draw_str(buf, w, h, g, " [C]", 2, collab_icon_y + asc, co_color, act_w - 1);
+            }
 
             // Gear icon — centered, full-width
             fill(buf, w, h, 2, gear_y, act_w - 3, icon_size, SEL_BG);
@@ -8286,6 +9234,58 @@ fn render(s: &mut State) {
                     draw_str(buf, w, h, g, "[Stage All]", px + pw / 2, btn_y + asc, stage_all_fg, px + pw - 1);
                 }
             }
+
+            // ── Collab panel ──────────────────────────────────────────────
+            if left_view == LeftView::Collab {
+                let mut cy = 0i32;
+                // Header row
+                let role_label = if collab_is_host { " 👑 Hosting" } else { " 🔒 Connected" };
+                draw_str(buf, w, h, g, role_label, px, cy + asc, ACCENT, px + pw - 1);
+                cy += lh;
+                fill(buf, w, h, px, cy - 1, pw - 1, 1, BORDER);
+
+                // Invite string (host only)
+                if let Some(ref invite) = collab_invite_str {
+                    let avail = ((pw - 4) / cw).max(0) as usize;
+                    let disp: String = invite.chars().take(avail).collect();
+                    draw_str(buf, w, h, g, &disp, px + 2, cy + asc, FG_DIM, px + pw - 1);
+                    cy += lh;
+                }
+
+                // Peer list header
+                fill(buf, w, h, px, cy, pw - 1, lh, BG2);
+                draw_str(buf, w, h, g, " Name / File", px, cy + asc, FG_DIM, px + pw * 2 / 3);
+                draw_str(buf, w, h, g, " Role", px + pw * 2 / 3, cy + asc, FG_DIM, px + pw - 1);
+                cy += lh;
+                fill(buf, w, h, px, cy - 1, pw - 1, 1, BORDER);
+
+                if collab_peers_snap.is_empty() {
+                    draw_str(buf, w, h, g, " (no peers)", px + 2, cy + asc, FG_DIM, px + pw - 1);
+                    cy += lh;
+                }
+                for (_sid, ref name, color, role, ref cur_file) in &collab_peers_snap {
+                    if cy >= panel_h { break; }
+                    // Color swatch
+                    fill(buf, w, h, px, cy, 3, lh, *color | 0xFF_000000);
+                    // Name
+                    let name_avail = ((pw * 2 / 3 - 6) / cw).max(0) as usize;
+                    let name_disp: String = name.chars().take(name_avail).collect();
+                    draw_str(buf, w, h, g, &format!(" {}", name_disp), px + 4, cy + asc, FG, px + pw * 2 / 3);
+                    // Role badge
+                    let role_lbl = role.label();
+                    draw_str(buf, w, h, g, role_lbl, px + pw * 2 / 3, cy + asc, FG_DIM, px + pw - 1);
+                    cy += lh;
+                    // Current file (dimmed, indented)
+                    if !cur_file.is_empty() && cy < panel_h {
+                        let fav = ((pw - 8) / cw).max(0) as usize;
+                        // Take the basename only to save space
+                        let basename = cur_file.rsplit('/').next().unwrap_or(cur_file.as_str());
+                        let fdisp: String = basename.chars().take(fav).collect();
+                        draw_str(buf, w, h, g, &format!("   {}", fdisp), px, cy + asc, FG_DIM, px + pw - 1);
+                        cy += lh;
+                    }
+                }
+            }
             } // end if left_panel_visible
         }
 
@@ -8500,31 +9500,24 @@ fn render(s: &mut State) {
                 // ── Language Servers section ───────────────────────────────────
                 let lsp_sec_y = tws_y + lh + 8;
                 if row_vis(lsp_sec_y) {
-                    draw_str(buf, w, h, g, "  Language Servers", r.x, lsp_sec_y + asc, FG, btn_x - cw);
+                    draw_str(buf, w, h, g, &format!("  Language Servers ({lsp_scope_label})"), r.x, lsp_sec_y + asc, FG, r.x + r.w);
                 }
                 fc(buf, r.x + cw, lsp_sec_y + lh - 1, r.w - 2 * cw, 1, BORDER);
                 let inst_btn_w = 9 * cw;
 
-                let lsp_rows: [(&str, bool, bool, &str); 3] = [
-                    ("TypeScript", ts_installed, ts_running, "npm i -g typescript-language-server typescript"),
-                    ("Rust      ", rust_installed, rust_running, "rustup component add rust-analyzer"),
-                    ("Python    ", py_installed, py_running, "pip install python-lsp-server"),
-                ];
-                for (i, (name, installed, running, _)) in lsp_rows.iter().enumerate() {
+                for (i, (_, name, status, accent, show_install)) in lsp_rows_snap.iter().enumerate() {
                     let ly = lsp_sec_y + lh + 4 + i as i32 * (lh + 4);
                     if !row_vis(ly) { continue; }
                     draw_str(buf, w, h, g, &format!("  {}", name), r.x, ly + asc, FG, btn_x - cw);
-                    if *running {
-                        fc(buf, btn_x, ly, 10 * cw, lh, ACCENT);
-                        draw_str(buf, w, h, g, " running  ", btn_x, ly + asc, BG, btn_x + 10 * cw);
-                    } else if *installed {
-                        draw_str(buf, w, h, g, " installed", btn_x, ly + asc, FG_DIM, btn_x + 10 * cw);
-                        fc(buf, btn_x + 11 * cw, ly, inst_btn_w, lh, SEL_BG);
-                        draw_str(buf, w, h, g, "[Install]", btn_x + 11 * cw, ly + asc, FG, btn_x + 11 * cw + inst_btn_w);
+                    if *accent {
+                        fc(buf, btn_x, ly, 12 * cw, lh, ACCENT);
+                        draw_str(buf, w, h, g, &format!(" {:<10}", status), btn_x, ly + asc, BG, btn_x + 12 * cw);
                     } else {
-                        draw_str(buf, w, h, g, " not found", btn_x, ly + asc, FG_DIM, btn_x + 10 * cw);
-                        fc(buf, btn_x + 11 * cw, ly, inst_btn_w, lh, SEL_BG);
-                        draw_str(buf, w, h, g, "[Install]", btn_x + 11 * cw, ly + asc, FG, btn_x + 11 * cw + inst_btn_w);
+                        draw_str(buf, w, h, g, &format!(" {:<11}", status), btn_x, ly + asc, FG_DIM, btn_x + 13 * cw);
+                    }
+                    if *show_install {
+                        fc(buf, btn_x + 14 * cw, ly, inst_btn_w, lh, SEL_BG);
+                        draw_str(buf, w, h, g, "[Install]", btn_x + 14 * cw, ly + asc, FG, btn_x + 14 * cw + inst_btn_w);
                     }
                 }
 
@@ -8555,6 +9548,121 @@ fn render(s: &mut State) {
                     if is_focused {
                         let cur_x = save_btn_x + cw + settings_edit_cursor as i32 * cw;
                         fc(buf, cur_x, fy + 1, 1, lh - 2, FG);
+                    }
+                }
+
+                // ── Collaboration section ─────────────────────────────────────
+                let collab_sec_y = save_sec_y + lh + 4 + 3 * (lh + 4) + 8;
+                if row_vis(collab_sec_y) {
+                    draw_str(buf, w, h, g, "  Collaboration", r.x, collab_sec_y + asc, FG, r.x + r.w);
+                }
+                fc(buf, r.x + cw, collab_sec_y + lh - 1, r.w - 2 * cw, 1, BORDER);
+
+                // Port
+                let cp_y = collab_sec_y + lh + 4;
+                if row_vis(cp_y) {
+                    draw_str(buf, w, h, g, "  Collab port", r.x, cp_y + asc, FG, save_btn_x - cw);
+                    let is_focused = settings_edit_field == Some(SettingsFieldId::CollabPort);
+                    let port_str_owned = collab_port.to_string();
+                    let display = if is_focused { settings_edit_text.as_str() } else { &port_str_owned };
+                    let port_w = 6 * cw;
+                    let field_bg = if is_focused { SEL_BG } else { BG2 };
+                    fc(buf, save_btn_x, cp_y, port_w, lh, field_bg);
+                    draw_str(buf, w, h, g, display, save_btn_x + cw, cp_y + asc, FG, save_btn_x + port_w - cw);
+                    if is_focused {
+                        let cur_x = save_btn_x + cw + settings_edit_cursor as i32 * cw;
+                        fc(buf, cur_x, cp_y + 1, 1, lh - 2, FG);
+                    }
+                }
+
+                // Default role
+                let dr_y = cp_y + lh + 4;
+                if row_vis(dr_y) {
+                    draw_str(buf, w, h, g, "  Default role", r.x, dr_y + asc, FG, save_btn_x - cw);
+                    let role_labels = [
+                        (collab::PeerRole::Viewer,       " Viewer "),
+                        (collab::PeerRole::Contributor,  " Contributor "),
+                        (collab::PeerRole::SystemAccess, " Sys.Access "),
+                        (collab::PeerRole::Moderator,    " Moderator "),
+                    ];
+                    let mut rx2 = save_btn_x;
+                    for (role, label) in role_labels {
+                        let rw2 = label.chars().count() as i32 * cw;
+                        let active = collab_role_perms.default_role == role;
+                        let (rbg, rfg) = if active { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
+                        fc(buf, rx2, dr_y, rw2, lh, rbg);
+                        draw_str(buf, w, h, g, label, rx2, dr_y + asc, rfg, rx2 + rw2);
+                        rx2 += rw2 + cw;
+                    }
+                }
+
+                // Include globs
+                let cig_y = dr_y + lh + 4;
+                if row_vis(cig_y) {
+                    draw_str(buf, w, h, g, "  Include globs", r.x, cig_y + asc, FG, save_btn_x - cw);
+                    let is_focused = settings_edit_field == Some(SettingsFieldId::CollabIncludeGlobs);
+                    let display = if is_focused { settings_edit_text.as_str() } else { &collab_include_globs };
+                    let field_bg = if is_focused { SEL_BG } else { BG2 };
+                    fc(buf, save_btn_x, cig_y, field_w, lh, field_bg);
+                    draw_str(buf, w, h, g, display, save_btn_x + cw, cig_y + asc, FG, save_btn_x + field_w - cw);
+                    if is_focused {
+                        let cur_x = save_btn_x + cw + settings_edit_cursor as i32 * cw;
+                        fc(buf, cur_x, cig_y + 1, 1, lh - 2, FG);
+                    }
+                }
+
+                // Exclude globs
+                let ceg_y = cig_y + lh + 4;
+                if row_vis(ceg_y) {
+                    draw_str(buf, w, h, g, "  Exclude globs", r.x, ceg_y + asc, FG, save_btn_x - cw);
+                    let is_focused = settings_edit_field == Some(SettingsFieldId::CollabExcludeGlobs);
+                    let display = if is_focused { settings_edit_text.as_str() } else { &collab_exclude_globs };
+                    let field_bg = if is_focused { SEL_BG } else { BG2 };
+                    fc(buf, save_btn_x, ceg_y, field_w, lh, field_bg);
+                    draw_str(buf, w, h, g, display, save_btn_x + cw, ceg_y + asc, FG, save_btn_x + field_w - cw);
+                    if is_focused {
+                        let cur_x = save_btn_x + cw + settings_edit_cursor as i32 * cw;
+                        fc(buf, cur_x, ceg_y + 1, 1, lh - 2, FG);
+                    }
+                }
+
+                // Permission matrix header
+                let perm_hdr_y = ceg_y + lh + 8;
+                let perm_col_labels = ["vw", "wt", "hv", "hw", "tv", "to", "ro"];
+                let perm_col_w = 4 * cw;
+                if row_vis(perm_hdr_y) {
+                    draw_str(buf, w, h, g, "  Permissions", r.x, perm_hdr_y + asc, FG_DIM, save_btn_x - cw);
+                    for (i, label) in perm_col_labels.iter().enumerate() {
+                        let px2 = save_btn_x + i as i32 * perm_col_w;
+                        draw_str(buf, w, h, g, label, px2, perm_hdr_y + asc, FG_DIM, px2 + perm_col_w);
+                    }
+                }
+                let perm_bits = [
+                    collab::perms::VIEW_FILES, collab::perms::WRITE_FILES,
+                    collab::perms::VIEW_HIDDEN, collab::perms::WRITE_HIDDEN,
+                    collab::perms::VIEW_TERMINALS, collab::perms::OPEN_TERMINALS,
+                    collab::perms::MANAGE_ROLES,
+                ];
+                let perm_rows = [
+                    (collab::PeerRole::Viewer,       "  Viewer",
+                     collab_role_perms.viewer),
+                    (collab::PeerRole::Contributor,  "  Contributor",
+                     collab_role_perms.contributor),
+                    (collab::PeerRole::SystemAccess, "  Sys.Access",
+                     collab_role_perms.system_access),
+                    (collab::PeerRole::Moderator,    "  Moderator",
+                     collab_role_perms.moderator),
+                ];
+                for (ri, (_role, label, bits)) in perm_rows.iter().enumerate() {
+                    let pm_y = perm_hdr_y + lh + 4 + ri as i32 * (lh + 2);
+                    if !row_vis(pm_y) { continue; }
+                    draw_str(buf, w, h, g, label, r.x, pm_y + asc, FG, save_btn_x - cw);
+                    for (ci, &bit) in perm_bits.iter().enumerate() {
+                        let px2 = save_btn_x + ci as i32 * perm_col_w;
+                        let has = bits & bit != 0;
+                        let (pbg, pfg) = if has { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
+                        fc(buf, px2, pm_y, 3 * cw, lh, pbg);
+                        draw_str(buf, w, h, g, if has { "[x]" } else { "[ ]" }, px2, pm_y + asc, pfg, px2 + 3 * cw);
                     }
                 }
 

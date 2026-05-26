@@ -16,6 +16,7 @@ use std::thread;
 
 use winit::event_loop::EventLoopProxy;
 
+use crate::ssh;
 use crate::vpath::{SshHost, VPath};
 use crate::{Diagnostic, DiagSeverity, Lang, UserEvent};
 
@@ -50,12 +51,16 @@ pub struct LspManager {
 impl LspManager {
     pub fn new() -> Self { LspManager { servers: HashMap::new() } }
 
-    pub fn server_for_lang_mut(&mut self, lang: Lang) -> Option<&mut LspServer> {
-        self.servers.values_mut().find(|s| s.lang == lang)
+    pub fn server_for_lang_host(&self, lang: Lang, ssh_host: Option<&SshHost>) -> Option<&LspServer> {
+        self.servers.values().find(|s| s.lang == lang && s.ssh_host.as_ref() == ssh_host)
     }
 
-    pub fn has_server_for(&self, lang: Lang) -> bool {
-        self.servers.values().any(|s| s.lang == lang)
+    pub fn server_for_lang_host_mut(&mut self, lang: Lang, ssh_host: Option<&SshHost>) -> Option<&mut LspServer> {
+        self.servers.values_mut().find(|s| s.lang == lang && s.ssh_host.as_ref() == ssh_host)
+    }
+
+    pub fn has_server_for_lang_host(&self, lang: Lang, ssh_host: Option<&SshHost>) -> bool {
+        self.server_for_lang_host(lang, ssh_host).is_some()
     }
 }
 
@@ -164,6 +169,7 @@ pub fn start_server(
     output_pane_id: usize,
     proxy: EventLoopProxy<UserEvent>,
     ssh_host: Option<SshHost>,
+    remote_path_dirs: Vec<String>,
 ) -> Option<LspServer> {
     let (cmd, args): (&str, &[&str]) = match lang {
         Lang::Rust       => ("rust-analyzer", &["--stdio"]),
@@ -173,15 +179,8 @@ pub fn start_server(
     };
 
     let mut child = if let Some(ref host) = ssh_host {
-        // Run LSP server on remote via SSH, reusing the ControlMaster socket.
-        let control_path = host.control_path();
-        let mut ssh_cmd = Command::new("ssh");
+        let mut ssh_cmd = ssh::ssh_lsp_command(host, cmd, args, &remote_path_dirs);
         ssh_cmd
-            .arg("-o").arg(format!("ControlPath={}", control_path.display()))
-            .arg(host.host_arg())
-            .arg("--")
-            .arg(cmd)
-            .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -223,6 +222,7 @@ pub fn start_server(
                 }
             }
         }
+        let _ = proxy_out.send_event(UserEvent::LspServerStopped { server_id: opi });
     });
 
     // stderr reader: raw log lines → LspOutput events

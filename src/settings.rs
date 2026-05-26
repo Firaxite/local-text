@@ -88,7 +88,7 @@ pub struct Settings {
     pub cpu_double_buffer: bool,   // true = 2 IOSurfaces (tear-free); false = legacy single-buffer
     #[serde(default = "Settings::default_gpu_drawable_count")]
     pub gpu_drawable_count: u8,    // Metal drawable pool size: 2 or 3 (Apple minimum is 2)
-    /// Recently opened remote SSH URIs (most recent first), stored as "ssh://[user@]host[:port]/path".
+    /// Recently opened remote SSH URIs (most recent first), stored as "ssh://[user@]host[:port]:path".
     #[serde(default)]
     pub recent_remote_hosts: Vec<String>,
     /// Per-host extra PATH directories for finding LSP binaries on remote.
@@ -98,10 +98,43 @@ pub struct Settings {
     /// TCP port the host listens on for collab sessions (default 7777).
     #[serde(default = "Settings::default_collab_port")]
     pub collab_port: u16,
+    /// Role permission matrix for collab sessions (which perms each role has).
+    #[serde(default)]
+    pub collab_role_perms: crate::collab::RolePermissions,
+    /// Whitelist globs — if non-empty, only matching workspace paths are shared.
+    #[serde(default)]
+    pub collab_include_globs: Vec<String>,
+    /// Blacklist globs — matching paths are never shared regardless of role.
+    #[serde(default)]
+    pub collab_exclude_globs: Vec<String>,
 }
 
 impl Default for Settings {
-    fn default() -> Self { Settings { renderer: RendererBackend::Cpu, vsync: true, font_size: Self::default_font_size(), rainbow_brackets: false, undo_limit: Self::default_undo_limit(), term_copy_paste: false, term_cmd_bs: false, term_alt_bs: false, term_word_select: TermWordSelect::Whitespace, format_on_save: String::new(), organize_imports_on_save: String::new(), format_command: String::new(), glyph_cache_limit: GlyphCacheLimit::Unlimited, cpu_double_buffer: Self::default_cpu_double_buffer(), gpu_drawable_count: Self::default_gpu_drawable_count(), recent_remote_hosts: Vec::new(), remote_lsp_search_paths: std::collections::HashMap::new(), collab_port: Self::default_collab_port() } }
+    fn default() -> Self {
+        Settings {
+            renderer:                 RendererBackend::Cpu,
+            vsync:                    true,
+            font_size:                Self::default_font_size(),
+            rainbow_brackets:         false,
+            undo_limit:               Self::default_undo_limit(),
+            term_copy_paste:          false,
+            term_cmd_bs:              false,
+            term_alt_bs:              false,
+            term_word_select:         TermWordSelect::Whitespace,
+            format_on_save:           String::new(),
+            organize_imports_on_save: String::new(),
+            format_command:           String::new(),
+            glyph_cache_limit:        GlyphCacheLimit::Unlimited,
+            cpu_double_buffer:        Self::default_cpu_double_buffer(),
+            gpu_drawable_count:       Self::default_gpu_drawable_count(),
+            recent_remote_hosts:      Vec::new(),
+            remote_lsp_search_paths:  std::collections::HashMap::new(),
+            collab_port:              Self::default_collab_port(),
+            collab_role_perms:        crate::collab::RolePermissions::default(),
+            collab_include_globs:     Vec::new(),
+            collab_exclude_globs:     Vec::new(),
+        }
+    }
 }
 
 impl Settings {

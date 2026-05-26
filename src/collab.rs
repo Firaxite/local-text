@@ -31,6 +31,95 @@ use winit::event_loop::EventLoopProxy;
 
 use crate::UserEvent;
 
+// ── Role system ───────────────────────────────────────────────────────────────
+
+/// Five-tier peer role (ascending permissions). Host is implicit (not stored).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerRole { Viewer, Contributor, SystemAccess, Moderator }
+
+impl PeerRole {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Viewer       => "Viewer",
+            Self::Contributor  => "Contributor",
+            Self::SystemAccess => "System Access",
+            Self::Moderator    => "Moderator",
+        }
+    }
+    pub fn all() -> &'static [PeerRole] {
+        &[Self::Viewer, Self::Contributor, Self::SystemAccess, Self::Moderator]
+    }
+}
+
+/// Permission flags stored as a u16 bitfield.
+pub mod perms {
+    pub const VIEW_FILES:     u16 = 0b0000_0001;
+    pub const WRITE_FILES:    u16 = 0b0000_0010;
+    pub const VIEW_HIDDEN:    u16 = 0b0000_0100;
+    pub const WRITE_HIDDEN:   u16 = 0b0000_1000;
+    pub const VIEW_TERMINALS: u16 = 0b0001_0000;
+    pub const OPEN_TERMINALS: u16 = 0b0010_0000;
+    pub const MANAGE_ROLES:   u16 = 0b0100_0000;
+    pub const ALL: u16            = 0b0111_1111;
+}
+
+/// Host-configurable permission set for each non-host role.
+/// Persisted in settings.json so defaults survive session restarts.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct RolePermissions {
+    pub viewer:        u16,
+    pub contributor:   u16,
+    pub system_access: u16,
+    pub moderator:     u16,
+    pub default_role:  PeerRole,
+}
+
+impl Default for RolePermissions {
+    fn default() -> Self {
+        RolePermissions {
+            viewer:        perms::VIEW_FILES,
+            contributor:   perms::VIEW_FILES | perms::WRITE_FILES,
+            system_access: perms::VIEW_FILES | perms::WRITE_FILES
+                         | perms::VIEW_HIDDEN | perms::WRITE_HIDDEN
+                         | perms::VIEW_TERMINALS | perms::OPEN_TERMINALS,
+            moderator:     perms::VIEW_FILES | perms::WRITE_FILES
+                         | perms::VIEW_HIDDEN | perms::WRITE_HIDDEN
+                         | perms::VIEW_TERMINALS | perms::OPEN_TERMINALS
+                         | perms::MANAGE_ROLES,
+            default_role:  PeerRole::Viewer,
+        }
+    }
+}
+
+impl RolePermissions {
+    pub fn for_role(&self, role: PeerRole) -> u16 {
+        match role {
+            PeerRole::Viewer       => self.viewer,
+            PeerRole::Contributor  => self.contributor,
+            PeerRole::SystemAccess => self.system_access,
+            PeerRole::Moderator    => self.moderator,
+        }
+    }
+    pub fn set_for_role(&mut self, role: PeerRole, bits: u16) {
+        match role {
+            PeerRole::Viewer       => self.viewer        = bits,
+            PeerRole::Contributor  => self.contributor   = bits,
+            PeerRole::SystemAccess => self.system_access = bits,
+            PeerRole::Moderator    => self.moderator      = bits,
+        }
+    }
+}
+
+// ── Terminal info ─────────────────────────────────────────────────────────────
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct TermInfo {
+    pub term_id: usize,
+    pub title:   String,
+    pub shared:  bool,
+}
+
 // ── Peer colours (assigned round-robin by host) ───────────────────────────────
 const PEER_COLORS: &[u32] = &[
     0xFF6B6B, // coral red
@@ -63,9 +152,18 @@ pub struct RemoteCursorPos {
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct PeerInfo {
-    pub site_id: u64,
-    pub name:    String,
-    pub color:   u32,
+    pub site_id:      u64,
+    pub name:         String,
+    pub color:        u32,
+    #[serde(default)]
+    pub role:         PeerRole,
+    /// Path of the file the peer currently has open (empty = unknown).
+    #[serde(default)]
+    pub current_file: String,
+}
+
+impl Default for PeerRole {
+    fn default() -> Self { PeerRole::Viewer }
 }
 
 // ── Wire messages ─────────────────────────────────────────────────────────────
@@ -76,12 +174,15 @@ pub enum CollabMsg {
     // Guest → Host
     Join { peer_name: String },
 
-    // Host → Guest
+    // Host → Guest (initial sync — includes role config and filtered file list)
     Welcome {
         your_site_id: u64,
         doc_text:     String,
         server_clock: u64,
         peers:        Vec<PeerInfo>,
+        role:         PeerRole,
+        role_perms:   RolePermissions,
+        file_list:    Vec<String>,
     },
 
     // Client → Host → all others (host also applies to itself)
@@ -93,14 +194,33 @@ pub enum CollabMsg {
     },
 
     // Host → sending client
-    Ack { clock: u64 },
+    Ack { clock: u64, path: String },
 
-    // Cursor broadcast (either direction via host)
-    CursorUpdate { site_id: u64, cursors: Vec<RemoteCursorPos> },
+    // Cursor broadcast with file context (either direction via host)
+    CursorUpdate { site_id: u64, cursors: Vec<RemoteCursorPos>, path: String },
 
     // Host → all
-    PeerJoined { peer: PeerInfo },
-    PeerLeft   { site_id: u64 },
+    PeerJoined    { peer: PeerInfo },
+    PeerLeft      { site_id: u64 },
+
+    // File access
+    FileList      { paths: Vec<String> },                // Host → Guest (re-sent on role/glob change)
+    FileRequest   { path: String },                      // Guest → Host
+    FileResponse  { path: String, content: String, server_clock: u64 }, // Host → Guest
+    FileDenied    { path: String },                      // Host → Guest
+    FileSaved     { path: String, content: String },     // Host → all VIEW_FILES peers (on save)
+
+    // Role management
+    RoleConfig    { perms: RolePermissions },            // Host → all (config changed)
+    PeerRoleChanged { site_id: u64, role: PeerRole },   // Host → all
+    RoleChangeRequest { target_site_id: u64, new_role: PeerRole }, // Moderator → Host
+
+    // Terminal sharing
+    TerminalList  { terms: Vec<TermInfo> },              // Host → VIEW_TERMINALS peers
+    TerminalOutput{ term_id: usize, data: Vec<u8> },     // Host → VIEW_TERMINALS peers
+    TerminalInput { term_id: usize, data: Vec<u8> },     // Guest → Host (OPEN_TERMINALS required)
+    TerminalOpen  { },                                   // Guest → Host (request new shell)
+    TerminalOpened{ term_id: usize },                    // Host → requesting guest
 
     Error { message: String },
 }
@@ -119,14 +239,24 @@ pub struct CollabSession {
     pub site_id:          u64,
     pub role:             CollabRole,
     pub peers:            Vec<PeerInfo>,
-    pub inflight:         Vec<InflightOp>,              // guest only
+    /// In-flight ops per file path (guest only; host acks immediately).
+    pub inflight:         HashMap<String, Vec<InflightOp>>,
     pub local_clock:      u64,
     pub server_clock:     u64,
-    pub remote_cursors:   HashMap<u64, Vec<RemoteCursorPos>>,
-    pub send_tx:          mpsc::Sender<Vec<u8>>,        // main thread → writer thread (encrypted bytes)
+    /// Remote cursor positions, keyed by site_id.  Value includes path.
+    pub remote_cursors:   HashMap<u64, (String, Vec<RemoteCursorPos>)>,
+    pub send_tx:          mpsc::Sender<Vec<u8>>,
     pub doc_path:         String,
     pub session_key:      [u8; 32],
     pub last_cursor_sent: Instant,
+    /// Role permission configuration (host-authoritative, broadcast to guests).
+    pub role_perms:       RolePermissions,
+    /// This peer's own role (None = host).
+    pub my_role:          Option<PeerRole>,
+    /// Include globs (whitelist; empty = all files visible by role).
+    pub include_globs:    Vec<String>,
+    /// Exclude globs (blacklist).
+    pub exclude_globs:    Vec<String>,
 }
 
 pub enum CollabRole {
@@ -140,25 +270,25 @@ pub enum CollabRole {
 }
 
 impl CollabSession {
-    /// Enqueue a local op: add to inflight and send encrypted to the server.
-    pub fn send_local_op(&mut self, ops: Vec<TextOp>) {
+    /// Enqueue a local op for `path`: add to per-path inflight and send to server.
+    pub fn send_local_op(&mut self, path: String, ops: Vec<TextOp>) {
         self.local_clock += 1;
         let clock = self.local_clock;
         let msg = CollabMsg::Op {
             site_id: self.site_id,
             clock,
             ops:     ops.clone(),
-            path:    self.doc_path.clone(),
+            path:    path.clone(),
         };
-        self.inflight.push(InflightOp { clock, ops });
+        self.inflight.entry(path).or_default().push(InflightOp { clock, ops });
         if let Ok(frame) = encrypt_msg(&self.session_key, &msg) {
             let _ = self.send_tx.send(frame);
         }
     }
 
-    /// Send a cursor update (debounced by caller).
-    pub fn send_cursor_update(&mut self, cursors: Vec<RemoteCursorPos>) {
-        let msg = CollabMsg::CursorUpdate { site_id: self.site_id, cursors };
+    /// Send a cursor update with file context (debounced by caller).
+    pub fn send_cursor_update(&mut self, path: String, cursors: Vec<RemoteCursorPos>) {
+        let msg = CollabMsg::CursorUpdate { site_id: self.site_id, cursors, path };
         if let Ok(frame) = encrypt_msg(&self.session_key, &msg) {
             let _ = self.send_tx.send(frame);
         }
@@ -167,6 +297,24 @@ impl CollabSession {
 
     pub fn cursor_debounce_elapsed(&self) -> bool {
         self.last_cursor_sent.elapsed() >= Duration::from_millis(50)
+    }
+
+    /// Return the effective permission bits for a peer by site_id.
+    /// Returns `perms::ALL` for the host (site 0).
+    pub fn peer_perms(&self, site_id: u64) -> u16 {
+        if site_id == 0 { return perms::ALL; }
+        match self.peers.iter().find(|p| p.site_id == site_id) {
+            Some(p) => self.role_perms.for_role(p.role),
+            None    => 0,
+        }
+    }
+
+    /// Return this session's own permission bits.
+    pub fn my_perms(&self) -> u16 {
+        match self.my_role {
+            None       => perms::ALL,
+            Some(role) => self.role_perms.for_role(role),
+        }
     }
 
     /// Send a message directly to a specific guest (host only) or to the host (guest).
@@ -279,6 +427,9 @@ pub fn decrypt_frame(key: &[u8; 32], frame: &[u8]) -> Result<CollabMsg, String> 
     let plain  = cipher.decrypt(nonce, ct)
         .map_err(|_| "decryption failed (wrong key or corrupted frame)".to_owned())?;
     let unpadded = unpad(&plain);
+    if unpadded.is_empty() {
+        return Err("empty payload after unpadding".to_owned());
+    }
     serde_json::from_slice(unpadded)
         .map_err(|e| format!("json parse error: {e}"))
 }
@@ -484,12 +635,99 @@ pub fn extract_ops(before: &Rope, after: &Rope, site_id: u64) -> Vec<TextOp> {
     ops
 }
 
+// ── File access control ───────────────────────────────────────────────────────
+
+/// Returns true if `path` (relative to workspace root, using `/` separators)
+/// is visible to a peer with the given role and permission config.
+///
+/// Rules applied in order:
+/// 1. Role must have VIEW_FILES.
+/// 2. If any path component starts with `.`, role must have VIEW_HIDDEN.
+/// 3. If `include` is non-empty, path must match at least one include glob.
+/// 4. Path must not match any exclude glob.
+pub fn guest_can_view(
+    path:       &str,
+    role:       PeerRole,
+    role_perms: &RolePermissions,
+    include:    &[String],
+    exclude:    &[String],
+) -> bool {
+    let bits = role_perms.for_role(role);
+    if bits & perms::VIEW_FILES == 0 { return false; }
+
+    let is_hidden = path.split('/').any(|c| c.starts_with('.'));
+    if is_hidden && bits & perms::VIEW_HIDDEN == 0 { return false; }
+
+    if !include.is_empty() && !include.iter().any(|g| glob_match(g, path)) {
+        return false;
+    }
+    if exclude.iter().any(|g| glob_match(g, path)) {
+        return false;
+    }
+    true
+}
+
+/// Returns true if `path` is writable for the given role.
+pub fn guest_can_write(path: &str, role: PeerRole, role_perms: &RolePermissions) -> bool {
+    let bits = role_perms.for_role(role);
+    let is_hidden = path.split('/').any(|c| c.starts_with('.'));
+    if is_hidden {
+        bits & perms::WRITE_HIDDEN != 0
+    } else {
+        bits & perms::WRITE_FILES != 0
+    }
+}
+
+/// Minimal glob matcher supporting `*` (non-sep), `**` (any), `?` (single non-sep), `{a,b}`.
+/// Mirrors the existing `glob_match` in main.rs (duplicated here so collab.rs stays self-contained).
+fn glob_match(pattern: &str, path: &str) -> bool {
+    fn inner(pat: &[u8], s: &[u8]) -> bool {
+        match pat.first() {
+            None          => s.is_empty(),
+            Some(&b'?')   => !s.is_empty() && s[0] != b'/' && inner(&pat[1..], &s[1..]),
+            Some(&b'*') if pat.get(1) == Some(&b'*') => {
+                // `**` matches any sequence including `/`
+                let rest = &pat[2..];
+                let rest = if rest.first() == Some(&b'/') { &rest[1..] } else { rest };
+                (0..=s.len()).any(|i| inner(rest, &s[i..]))
+            }
+            Some(&b'*') => {
+                // `*` matches any sequence not containing `/`
+                let rest = &pat[1..];
+                (0..=s.len()).filter(|&i| i == 0 || s[i-1] != b'/').any(|i| inner(rest, &s[i..]))
+            }
+            Some(&b'{') => {
+                // `{a,b,c}` — alternation
+                if let Some(close) = pat.iter().position(|&c| c == b'}') {
+                    let alts = &pat[1..close];
+                    let rest = &pat[close + 1..];
+                    let mut start = 0;
+                    let mut found = false;
+                    for i in 0..=alts.len() {
+                        if i == alts.len() || alts[i] == b',' {
+                            if inner(&[&alts[start..i], rest].concat(), s) { found = true; }
+                            start = i + 1;
+                        }
+                    }
+                    return found;
+                }
+                !s.is_empty() && pat[0] == s[0] && inner(&pat[1..], &s[1..])
+            }
+            Some(&c) => !s.is_empty() && c == s[0] && inner(&pat[1..], &s[1..]),
+        }
+    }
+    inner(pattern.as_bytes(), path.as_bytes())
+}
+
 // ── Host session startup ──────────────────────────────────────────────────────
 
 pub fn start_host(
-    port:     u16,
-    doc_path: String,
-    proxy:    EventLoopProxy<UserEvent>,
+    port:          u16,
+    doc_path:      String,
+    proxy:         EventLoopProxy<UserEvent>,
+    role_perms:    RolePermissions,
+    include_globs: Vec<String>,
+    exclude_globs: Vec<String>,
 ) -> Result<CollabSession, String> {
     // Generate session key
     let mut session_key = [0u8; 32];
@@ -556,7 +794,7 @@ pub fn start_host(
             invite_str,
         },
         peers:           Vec::new(),
-        inflight:        Vec::new(),
+        inflight:        HashMap::new(),
         local_clock:     0,
         server_clock:    0,
         remote_cursors:  HashMap::new(),
@@ -564,6 +802,10 @@ pub fn start_host(
         doc_path,
         session_key,
         last_cursor_sent: Instant::now(),
+        role_perms,
+        my_role:        None,
+        include_globs,
+        exclude_globs,
     })
 }
 
@@ -609,8 +851,15 @@ fn handle_guest(
         };
         match msg {
             CollabMsg::Join { peer_name } => {
-                // Notify main thread with peer info; it will send Welcome and broadcast PeerJoined.
-                let peer = PeerInfo { site_id, name: peer_name, color };
+                // Notify main thread with peer info; it will assign a role,
+                // send Welcome, and broadcast PeerJoined.
+                let peer = PeerInfo {
+                    site_id,
+                    name: peer_name,
+                    color,
+                    role: PeerRole::Viewer, // placeholder; host assigns real role
+                    current_file: String::new(),
+                };
                 let _ = proxy.send_event(UserEvent::CollabGuestJoined { site_id, peer });
             }
             other => {
@@ -685,8 +934,8 @@ pub fn connect_guest(
                 }
             };
             match decrypt_frame(&session_key, &frame) {
-                Ok(CollabMsg::Welcome { your_site_id, doc_text, server_clock, peers }) => {
-                    break (your_site_id, doc_text, server_clock, peers);
+                Ok(CollabMsg::Welcome { your_site_id, doc_text, server_clock, peers, role, role_perms, file_list }) => {
+                    break (your_site_id, doc_text, server_clock, peers, role, role_perms, file_list);
                 }
                 Ok(CollabMsg::Error { message }) => {
                     let _ = proxy.send_event(UserEvent::CollabError { msg: message });
@@ -701,7 +950,7 @@ pub fn connect_guest(
                 _ => { /* ignore other messages before Welcome */ }
             }
         };
-        let (site_id, doc_text, server_clock, peers) = welcome;
+        let (site_id, doc_text, server_clock, peers, my_role, role_perms, file_list) = welcome;
 
         // Writer thread
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
@@ -715,17 +964,21 @@ pub fn connect_guest(
             site_id,
             role:            CollabRole::Guest,
             peers:           peers.clone(),
-            inflight:        Vec::new(),
+            inflight:        HashMap::new(),
             local_clock:     0,
             server_clock,
             remote_cursors:  HashMap::new(),
             send_tx:         tx,
-            doc_path:        String::new(), // will be set from tab path in main
+            doc_path:        String::new(), // set from tab path in main after CollabConnected
             session_key,
             last_cursor_sent: Instant::now(),
+            role_perms,
+            my_role:         Some(my_role),
+            include_globs:   Vec::new(), // host-side only; guests receive filtered FileList
+            exclude_globs:   Vec::new(),
         });
 
-        let _ = proxy.send_event(UserEvent::CollabConnected { session, doc_text, peers });
+        let _ = proxy.send_event(UserEvent::CollabConnected { session, doc_text, peers, file_list });
 
         // Reader loop
         let key = session_key;

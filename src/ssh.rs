@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use winit::event_loop::EventLoopProxy;
 
 use crate::vpath::{SshHost, VPath};
-use crate::UserEvent;
+use crate::{Lang, UserEvent};
 
 /// Increment this when the remote structural setup (directory layout, etc.)
 /// needs to change.  LSP version changes do NOT require a bump.
@@ -56,16 +56,17 @@ pub fn ensure_control_master(host: SshHost, proxy: EventLoopProxy<UserEvent>) {
 }
 
 /// Read a file from a remote host.  Sends `RemoteFileContent` on success or
-/// `SshError` on failure.
+/// `RemoteFileError` on failure.
 pub fn ssh_read_file(host: SshHost, path: PathBuf, token: u64, proxy: EventLoopProxy<UserEvent>) {
     thread::spawn(move || {
         let vpath = VPath::Remote { host: host.clone(), path: path.clone() };
-        match run_ssh_capture(&host, &["cat", &path.to_string_lossy()]) {
+        let cmd = format!("cat -- {}", remote_path_expr(&path));
+        match run_ssh_capture(&host, &["sh", "-c", &cmd]) {
             Ok(content) => {
                 let _ = proxy.send_event(UserEvent::RemoteFileContent { token, path: vpath, content });
             }
             Err(msg) => {
-                let _ = proxy.send_event(UserEvent::SshError { host, msg });
+                let _ = proxy.send_event(UserEvent::RemoteFileError { token, path: vpath, msg });
             }
         }
     });
@@ -92,22 +93,33 @@ pub fn ssh_write_file(host: SshHost, path: PathBuf, content: String, proxy: Even
 pub fn ssh_list_dir(host: SshHost, path: PathBuf, proxy: EventLoopProxy<UserEvent>) {
     thread::spawn(move || {
         let vpath = VPath::Remote { host: host.clone(), path: path.clone() };
-        // Use `ls -1apL` for portable listing: trailing `/` marks directories,
-        // `-a` includes hidden entries (we filter `.` and `..` below).
         let cmd = format!(
-            "ls -1apL {} 2>/dev/null | head -2000",
-            shell_quote(path.to_string_lossy().as_ref()),
+            r#"dir={}
+n=0
+for p in "$dir"/* "$dir"/.[!.]* "$dir"/..?*; do
+    if [ ! -e "$p" ] && [ ! -L "$p" ]; then
+        continue
+    fi
+    name=${{p##*/}}
+    if [ "$name" = "." ] || [ "$name" = ".." ]; then
+        continue
+    fi
+    if [ -d "$p" ]; then
+        kind=d
+    else
+        kind=f
+    fi
+    printf '%s\0%s\0' "$kind" "$name"
+    n=$((n + 1))
+    if [ "$n" -ge 2000 ]; then
+        break
+    fi
+done"#,
+            remote_path_expr(&path),
         );
         match run_ssh_capture(&host, &["sh", "-c", &cmd]) {
             Ok(output) => {
-                let entries: Vec<(String, bool)> = output.lines()
-                    .filter(|l| !l.is_empty() && *l != "./" && *l != "../")
-                    .map(|l| {
-                        let is_dir = l.ends_with('/');
-                        let name = l.trim_end_matches('/').to_owned();
-                        (name, is_dir)
-                    })
-                    .collect();
+                let entries = parse_remote_dir_listing(&output);
                 let _ = proxy.send_event(UserEvent::RemoteDirListing { path: vpath, entries });
             }
             Err(msg) => {
@@ -123,7 +135,7 @@ pub fn ssh_walk_files(host: SshHost, root: PathBuf, token: u64, proxy: EventLoop
     thread::spawn(move || {
         let cmd = format!(
             "find {} -type f -not -path '*/\\.*' 2>/dev/null | head -50000",
-            shell_quote(root.to_string_lossy().as_ref()),
+            remote_path_expr(&root),
         );
         match run_ssh_capture(&host, &["sh", "-c", &cmd]) {
             Ok(output) => {
@@ -140,16 +152,76 @@ pub fn ssh_walk_files(host: SshHost, root: PathBuf, token: u64, proxy: EventLoop
     });
 }
 
+/// Check whether LSP binaries are available on a remote host.
+pub fn ssh_check_lsp_binaries(
+    host: SshHost,
+    bins: Vec<(Lang, Vec<String>)>,
+    path_dirs: Vec<String>,
+    proxy: EventLoopProxy<UserEvent>,
+) {
+    thread::spawn(move || {
+        let langs: Vec<Lang> = bins.iter().map(|(lang, _)| *lang).collect();
+        let mut script = lsp_path_setup(&path_dirs);
+        for (idx, (_, required)) in bins.iter().enumerate() {
+            let checks = if required.is_empty() {
+                "false".to_owned()
+            } else {
+                required.iter()
+                    .map(|bin| format!("command -v {} >/dev/null 2>&1", shell_quote(bin.as_str())))
+                    .collect::<Vec<_>>()
+                    .join(" && ")
+            };
+            script.push_str(&format!(
+                "if {checks}; then printf '{}\\t1\\n'; else printf '{}\\t0\\n'; fi\n",
+                idx, idx,
+            ));
+        }
+
+        let (statuses, error) = match run_ssh_capture(&host, &["sh", "-c", &script]) {
+            Ok(output) => {
+                let mut statuses = Vec::new();
+                for line in output.lines() {
+                    let Some((idx, installed)) = line.split_once('\t') else { continue };
+                    let Ok(idx) = idx.parse::<usize>() else { continue };
+                    let Some(lang) = langs.get(idx).copied() else { continue };
+                    statuses.push((lang, Some(installed == "1")));
+                }
+                (statuses, None)
+            }
+            Err(msg) => {
+                let statuses = langs.into_iter().map(|lang| (lang, None)).collect();
+                (statuses, Some(msg))
+            }
+        };
+        let _ = proxy.send_event(UserEvent::LspBinaryCheckResult { host: Some(host), statuses, error });
+    });
+}
+
 /// Build a `Command` that runs `cmd args` on the remote host, reusing the
 /// ControlMaster socket.  Useful for spawning LSP servers via stdio.
-pub fn ssh_lsp_command(host: &SshHost, bin: &str, args: &[&str]) -> Command {
+pub fn ssh_lsp_command(host: &SshHost, bin: &str, args: &[&str], path_dirs: &[String]) -> Command {
     let mut cmd = Command::new("ssh");
+    let remote_command = if path_dirs.is_empty() {
+        let mut remote_argv = Vec::with_capacity(args.len() + 1);
+        remote_argv.push(bin);
+        remote_argv.extend(args.iter().copied());
+        remote_command(&remote_argv)
+    } else {
+        let mut script = lsp_path_setup(path_dirs);
+        script.push_str("exec ");
+        script.push_str(&shell_quote(bin));
+        for arg in args {
+            script.push(' ');
+            script.push_str(&shell_quote(arg));
+        }
+        remote_command(&["sh", "-c", &script])
+    };
     cmd.arg("-o").arg(format!("ControlPath={}", host.control_path().display()))
        .arg("-o").arg("ControlMaster=no")  // reuse existing master only
+       .arg("-o").arg("BatchMode=yes")
        .arg(host.host_arg())
        .arg("--")
-       .arg(bin)
-       .args(args);
+       .arg(remote_command);
     cmd
 }
 
@@ -243,13 +315,17 @@ fn open_control_master(host: &SshHost) -> Result<(), String> {
 /// Run a command on the remote and capture stdout as a String.
 /// Uses the existing ControlMaster socket (does not create one).
 fn run_ssh_capture(host: &SshHost, remote_argv: &[&str]) -> Result<String, String> {
+    // OpenSSH sends the remote command as one shell string. Quote argv ourselves
+    // so `sh -c <script>` remains one script instead of leaking lines into the
+    // remote login shell with unset variables.
+    let remote_command = remote_command(remote_argv);
     let mut cmd = Command::new("ssh");
     cmd.arg("-o").arg(format!("ControlPath={}", host.control_path().display()))
        .arg("-o").arg("ControlMaster=no")
        .arg("-o").arg("BatchMode=yes")
        .arg(host.host_arg())
        .arg("--")
-       .args(remote_argv)
+       .arg(remote_command)
        .stdin(Stdio::null())
        .stdout(Stdio::piped())
        .stderr(Stdio::piped());
@@ -266,14 +342,15 @@ fn run_ssh_capture(host: &SshHost, remote_argv: &[&str]) -> Result<String, Strin
 
 /// Write `content` to `remote_path` on `host` using `ssh … cat >`.
 fn write_remote_file(host: &SshHost, remote_path: &Path, content: &str) -> Result<(), String> {
+    let script = format!("cat > {}", remote_path_expr(remote_path));
+    let remote_command = remote_command(&["sh", "-c", &script]);
     let mut child = Command::new("ssh")
         .arg("-o").arg(format!("ControlPath={}", host.control_path().display()))
         .arg("-o").arg("ControlMaster=no")
         .arg("-o").arg("BatchMode=yes")
         .arg(host.host_arg())
         .arg("--")
-        .arg("sh").arg("-c")
-        .arg(format!("cat > {}", shell_quote(remote_path.to_string_lossy().as_ref())))
+        .arg(remote_command)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -293,4 +370,100 @@ fn write_remote_file(host: &SshHost, remote_path: &Path, content: &str) -> Resul
 /// Single-quote a shell argument, escaping any embedded single quotes.
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+fn remote_command(argv: &[&str]) -> String {
+    argv.iter()
+        .map(|arg| shell_quote(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn lsp_path_setup(path_dirs: &[String]) -> String {
+    if path_dirs.is_empty() {
+        return String::new();
+    }
+    let mut path = "$PATH".to_owned();
+    for dir in path_dirs.iter().filter(|dir| !dir.is_empty()) {
+        path.push(':');
+        path.push_str(&remote_path_component_expr(dir));
+    }
+    format!("PATH={path}\nexport PATH\n")
+}
+
+fn remote_path_component_expr(path: &str) -> String {
+    if path == "~" {
+        "$HOME".to_owned()
+    } else if let Some(rest) = path.strip_prefix("~/") {
+        format!("$HOME/{}", shell_quote(rest))
+    } else {
+        shell_quote(path)
+    }
+}
+
+fn parse_remote_dir_listing(output: &str) -> Vec<(String, bool)> {
+    let mut entries = Vec::new();
+    let mut fields = output.split('\0');
+    while let Some(kind) = fields.next() {
+        if kind.is_empty() { break; }
+        let Some(name) = fields.next() else { break };
+        if name.is_empty() || name == "." || name == ".." { continue; }
+        match kind {
+            "d" => entries.push((name.to_owned(), true)),
+            "f" => entries.push((name.to_owned(), false)),
+            _ => {}
+        }
+    }
+    entries
+}
+
+fn remote_path_expr(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    if raw == "~" {
+        "~".to_owned()
+    } else if let Some(rest) = raw.strip_prefix("~/") {
+        format!("~/{}", shell_quote(rest))
+    } else {
+        shell_quote(raw.as_ref())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_typed_nul_directory_listing() {
+        let output = "d\0src\0f\0Cargo.toml\0d\0dir with spaces\0f\0tab\tname\0f\0line\nname\0";
+        assert_eq!(
+            parse_remote_dir_listing(output),
+            vec![
+                ("src".to_owned(), true),
+                ("Cargo.toml".to_owned(), false),
+                ("dir with spaces".to_owned(), true),
+                ("tab\tname".to_owned(), false),
+                ("line\nname".to_owned(), false),
+            ],
+        );
+    }
+
+    #[test]
+    fn ignores_malformed_directory_listing_records() {
+        let output = "x\0ignored\0d\0.\0f\0..\0f\0.hidden\0d";
+        assert_eq!(parse_remote_dir_listing(output), vec![(".hidden".to_owned(), false)]);
+    }
+
+    #[test]
+    fn quotes_remote_argv_as_one_shell_command() {
+        let cmd = remote_command(&["sh", "-c", "dir='/tmp/a b'\nfor p in \"$dir\"/*; do :; done"]);
+        assert!(cmd.starts_with("'sh' '-c' 'dir='\\''/tmp/a b'\\''\n"));
+        assert!(cmd.contains("for p in \"$dir\"/*"));
+    }
+
+    #[test]
+    fn preserves_tilde_expansion_in_remote_path_expr() {
+        assert_eq!(remote_path_expr(Path::new("~")), "~");
+        assert_eq!(remote_path_expr(Path::new("~/dir with spaces")), "~/'dir with spaces'");
+        assert_eq!(remote_path_expr(Path::new("/tmp/dir with spaces")), "'/tmp/dir with spaces'");
+    }
 }
