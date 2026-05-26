@@ -1097,9 +1097,14 @@ fn open_terminal_pane(s: &mut State) {
     let proxy = s.proxy.clone();
     // If we're in a remote workspace, open an SSH session instead of a local shell.
     let tp = if let Some(host) = active_workspace_ssh_host(s) {
+        // Build the SSH command. ControlMaster=no so this child never tries to become
+        // a new master (the master is managed separately by ensure_control_master).
+        // Include -p PORT when the host uses a non-standard port.
+        let port_part = host.port.map(|p| format!(" -p {p}")).unwrap_or_default();
         let ssh_cmd = format!(
-            "ssh -o ControlPath={} {}",
+            "ssh -o ControlPath={} -o ControlMaster=no{} {}",
             host.control_path().display(),
+            port_part,
             host.host_arg(),
         );
         terminal::spawn_terminal_with_shell(term_id, cols, rows, proxy, Some(ssh_cmd))

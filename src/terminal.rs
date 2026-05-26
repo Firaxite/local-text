@@ -530,6 +530,8 @@ pub fn spawn_terminal_with_shell(pane_id: usize, cols: usize, rows: usize,
     use std::env;
     use std::ptr;
 
+    // Track whether we got an explicit override so we can choose the right exec strategy.
+    let is_override = shell_override.is_some();
     let shell = shell_override
         .or_else(|| env::var("SHELL").ok())
         .unwrap_or_else(|| "/bin/sh".to_owned());
@@ -549,7 +551,6 @@ pub fn spawn_terminal_with_shell(pane_id: usize, cols: usize, rows: usize,
     assert!(pid >= 0, "forkpty failed: {}", std::io::Error::last_os_error());
 
     if pid == 0 {
-        let shell_c = CString::new(shell.as_str()).unwrap();
         // SAFETY: we are in the forked child process; the NUL-terminated literals and
         // argv array are valid for the duration of these calls. execvp replaces the
         // process image so no cleanup is needed on success; exit(1) handles failure.
@@ -559,7 +560,24 @@ pub fn spawn_terminal_with_shell(pane_id: usize, cols: usize, rows: usize,
                 b"xterm-256color\0".as_ptr().cast(),
                 1,
             );
-            libc::execvp(shell_c.as_ptr(), [shell_c.as_ptr(), ptr::null()].as_ptr());
+            if is_override {
+                // The override is a full command string with arguments (e.g.
+                // "ssh -o ControlPath=... user@host"). execvp does NOT perform
+                // shell word-splitting — it would try to find a file literally
+                // named the whole string, which doesn't exist. Delegate to
+                // `sh -c <cmd>` so the shell parses the arguments correctly.
+                let sh_c   = CString::new("sh").unwrap();
+                let flag_c = CString::new("-c").unwrap();
+                let cmd_c  = CString::new(shell.as_str()).unwrap();
+                libc::execvp(
+                    sh_c.as_ptr(),
+                    [sh_c.as_ptr(), flag_c.as_ptr(), cmd_c.as_ptr(), ptr::null()].as_ptr(),
+                );
+            } else {
+                // Plain shell path (e.g. "/bin/zsh") — exec directly with no extra args.
+                let shell_c = CString::new(shell.as_str()).unwrap();
+                libc::execvp(shell_c.as_ptr(), [shell_c.as_ptr(), ptr::null()].as_ptr());
+            }
             libc::exit(1);
         }
     }

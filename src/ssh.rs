@@ -218,8 +218,11 @@ pub fn ssh_lsp_command(host: &SshHost, bin: &str, args: &[&str], path_dirs: &[St
     };
     cmd.arg("-o").arg(format!("ControlPath={}", host.control_path().display()))
        .arg("-o").arg("ControlMaster=no")  // reuse existing master only
-       .arg("-o").arg("BatchMode=yes")
-       .arg(host.host_arg())
+       .arg("-o").arg("BatchMode=yes");
+    if let Some(port) = host.port {
+        cmd.arg("-p").arg(port.to_string());
+    }
+    cmd.arg(host.host_arg())
        .arg("--")
        .arg(remote_command);
     cmd
@@ -272,17 +275,20 @@ fn run_bootstrap(host: &SshHost, proxy: &EventLoopProxy<UserEvent>) {
 /// Blocks until the socket appears (up to 30 s) or the ssh process exits.
 fn open_control_master(host: &SshHost) -> Result<(), String> {
     let socket = host.control_path();
-    let mut child = Command::new("ssh")
-        .arg("-o").arg("ControlMaster=auto")
-        .arg("-o").arg(format!("ControlPath={}", socket.display()))
-        .arg("-o").arg("ControlPersist=600")  // keep alive 10 min after last use
-        .arg("-o").arg("BatchMode=yes")        // no interactive prompts
-        .arg("-N")                             // don't execute a remote command
-        .arg(host.host_arg())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-o").arg("ControlMaster=auto")
+       .arg("-o").arg(format!("ControlPath={}", socket.display()))
+       .arg("-o").arg("ControlPersist=600")  // keep alive 10 min after last use
+       .arg("-o").arg("BatchMode=yes")        // no interactive prompts
+       .arg("-N");                            // don't execute a remote command
+    if let Some(port) = host.port {
+        cmd.arg("-p").arg(port.to_string());
+    }
+    cmd.arg(host.host_arg())
+       .stdin(Stdio::null())
+       .stdout(Stdio::null())
+       .stderr(Stdio::piped());
+    let mut child = cmd.spawn()
         .map_err(|e| format!("Failed to spawn ssh: {e}"))?;
 
     // Poll for the socket file to appear (ssh creates it once handshake done).
@@ -322,8 +328,11 @@ fn run_ssh_capture(host: &SshHost, remote_argv: &[&str]) -> Result<String, Strin
     let mut cmd = Command::new("ssh");
     cmd.arg("-o").arg(format!("ControlPath={}", host.control_path().display()))
        .arg("-o").arg("ControlMaster=no")
-       .arg("-o").arg("BatchMode=yes")
-       .arg(host.host_arg())
+       .arg("-o").arg("BatchMode=yes");
+    if let Some(port) = host.port {
+        cmd.arg("-p").arg(port.to_string());
+    }
+    cmd.arg(host.host_arg())
        .arg("--")
        .arg(remote_command)
        .stdin(Stdio::null())
@@ -344,17 +353,20 @@ fn run_ssh_capture(host: &SshHost, remote_argv: &[&str]) -> Result<String, Strin
 fn write_remote_file(host: &SshHost, remote_path: &Path, content: &str) -> Result<(), String> {
     let script = format!("cat > {}", remote_path_expr(remote_path));
     let remote_command = remote_command(&["sh", "-c", &script]);
-    let mut child = Command::new("ssh")
-        .arg("-o").arg(format!("ControlPath={}", host.control_path().display()))
-        .arg("-o").arg("ControlMaster=no")
-        .arg("-o").arg("BatchMode=yes")
-        .arg(host.host_arg())
-        .arg("--")
-        .arg(remote_command)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-o").arg(format!("ControlPath={}", host.control_path().display()))
+       .arg("-o").arg("ControlMaster=no")
+       .arg("-o").arg("BatchMode=yes");
+    if let Some(port) = host.port {
+        cmd.arg("-p").arg(port.to_string());
+    }
+    cmd.arg(host.host_arg())
+       .arg("--")
+       .arg(remote_command)
+       .stdin(Stdio::piped())
+       .stdout(Stdio::null())
+       .stderr(Stdio::piped());
+    let mut child = cmd.spawn()
         .map_err(|e| format!("ssh spawn error: {e}"))?;
 
     if let Some(mut stdin) = child.stdin.take() {
