@@ -528,13 +528,14 @@ pub fn resize_pty(pane: &mut TermPane, cols: usize, rows: usize) {
 /// Fork a PTY, exec $SHELL (or shell_override) in the child, and start a reader thread.
 #[cfg(unix)]
 pub fn spawn_terminal(pane_id: usize, cols: usize, rows: usize,
-    proxy: EventLoopProxy<UserEvent>) -> TermPane {
-    spawn_terminal_with_shell(pane_id, cols, rows, proxy, None)
+    proxy: EventLoopProxy<UserEvent>, cwd: Option<std::path::PathBuf>) -> TermPane {
+    spawn_terminal_with_shell(pane_id, cols, rows, proxy, None, cwd)
 }
 
 #[cfg(unix)]
 pub fn spawn_terminal_with_shell(pane_id: usize, cols: usize, rows: usize,
-    proxy: EventLoopProxy<UserEvent>, shell_override: Option<String>) -> TermPane {
+    proxy: EventLoopProxy<UserEvent>, shell_override: Option<String>,
+    cwd: Option<std::path::PathBuf>) -> TermPane {
     use std::env;
     use std::ptr;
 
@@ -563,6 +564,13 @@ pub fn spawn_terminal_with_shell(pane_id: usize, cols: usize, rows: usize,
         // argv array are valid for the duration of these calls. execvp replaces the
         // process image so no cleanup is needed on success; exit(1) handles failure.
         unsafe {
+            // Change to the requested working directory before exec (best effort).
+            if let Some(ref dir) = cwd {
+                use std::os::unix::ffi::OsStrExt;
+                if let Ok(c_dir) = CString::new(dir.as_os_str().as_bytes()) {
+                    libc::chdir(c_dir.as_ptr()); // ignore failure — shell will report it
+                }
+            }
             libc::setenv(
                 b"TERM\0".as_ptr().cast(),
                 b"xterm-256color\0".as_ptr().cast(),

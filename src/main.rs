@@ -274,6 +274,7 @@ struct GitPanel {
     commit_focused: bool,
     sel:            GitSel,
     is_git_repo:    bool,
+    remote_error:   Option<String>,  // SSH/git error message from last remote refresh
     loading:        bool,
     scroll:         usize,
 }
@@ -284,7 +285,7 @@ impl GitPanel {
             staged: vec![], unstaged: vec![],
             commit_msg: String::new(), commit_cursor: 0,
             commit_focused: false, sel: GitSel::None,
-            is_git_repo: true, loading: false, scroll: 0,
+            is_git_repo: true, remote_error: None, loading: false, scroll: 0,
         }
     }
 }
@@ -318,6 +319,7 @@ enum CtxAction {
     TabClose,
     TabSplitRight, TabSplitLeft, TabSplitDown, TabSplitUp,
     ExplorerOpenAsRoot,
+    OpenTerminalHere,
     GitOpenFile, GitViewDiff, GitStage, GitUnstage,
 }
 
@@ -340,6 +342,7 @@ struct ContextMenu {
     tab_source: Option<(usize, usize)>,  // (pane_id, tab_idx) for tab bar menus
     git_entry:  Option<(bool, String)>,  // (staged, path)
     explorer_entry: Option<VPath>,
+    explorer_entry_is_dir: bool,         // true when explorer_entry is a directory
 }
 
 // ── Quick file finder ─────────────────────────────────────────────────────────
@@ -1089,7 +1092,30 @@ fn active_workspace_ssh_host(s: &State) -> Option<vpath::SshHost> {
         .find_map(|path| path.ssh_host().cloned())
 }
 
+/// Returns the directory of the file open in the active editor pane, or the workspace
+/// root if no file is open. Returns `None` only if there is no workspace at all.
+fn active_editor_dir(s: &State) -> Option<VPath> {
+    if let Some(pane) = s.panes.get(&s.active_pane) {
+        if pane.kind == PaneKind::Editor {
+            if let Some(tab) = pane.tabs.get(pane.active) {
+                if let Some(ref vpath) = tab.path {
+                    if let Some(parent) = vpath.parent() {
+                        return Some(parent);
+                    }
+                }
+            }
+        }
+    }
+    // Fall back to workspace root
+    s.explorer.as_ref().map(|ex| ex.root.clone())
+}
+
 fn open_terminal_pane(s: &mut State) {
+    let cwd = active_editor_dir(s);
+    open_terminal_pane_at(s, cwd);
+}
+
+fn open_terminal_pane_at(s: &mut State, cwd: Option<VPath>) {
     let pane_id = s.next_pane_id; s.next_pane_id += 1;
     let term_id = s.next_pane_id; s.next_pane_id += 1;
     let area = s.pane_area();
@@ -1101,16 +1127,39 @@ fn open_terminal_pane(s: &mut State) {
         // Build the SSH command. ControlMaster=no so this child never tries to become
         // a new master (the master is managed separately by ensure_control_master).
         // Include -p PORT when the host uses a non-standard port.
+        // If a remote cwd was requested, prepend `cd '/path' &&` to the remote command so
+        // the SSH session starts in the right directory.
         let port_part = host.port.map(|p| format!(" -p {p}")).unwrap_or_default();
-        let ssh_cmd = format!(
-            "ssh -o ControlPath={} -o ControlMaster=no{} {}",
-            host.control_path().display(),
-            port_part,
-            host.host_arg(),
-        );
-        terminal::spawn_terminal_with_shell(term_id, cols, rows, proxy, Some(ssh_cmd))
+        // Extract the remote path component if a remote cwd was provided.
+        let remote_cwd: Option<String> = cwd.as_ref().and_then(|v| match v {
+            VPath::Remote { path, .. } => Some(path.to_string_lossy().into_owned()),
+            _ => None,
+        });
+        let ssh_cmd = if let Some(ref rdir) = remote_cwd {
+            // Single-quote the remote path (replacing ' with '\'' for shell safety).
+            // Use \$SHELL so the local sh does NOT expand $SHELL — only the remote
+            // shell should resolve it to the remote user's configured shell.
+            let escaped = rdir.replace('\'', r"'\''");
+            format!(
+                "ssh -o ControlPath={} -o ControlMaster=no{} {} \"cd '{}' && exec \\$SHELL\"",
+                host.control_path().display(),
+                port_part,
+                host.host_arg(),
+                escaped,
+            )
+        } else {
+            format!(
+                "ssh -o ControlPath={} -o ControlMaster=no{} {}",
+                host.control_path().display(),
+                port_part,
+                host.host_arg(),
+            )
+        };
+        terminal::spawn_terminal_with_shell(term_id, cols, rows, proxy, Some(ssh_cmd), None)
     } else {
-        terminal::spawn_terminal(term_id, cols, rows, proxy)
+        // Local terminal — pass the local cwd directly to the child via chdir.
+        let local_cwd = cwd.and_then(|v| v.as_local_path().map(|p| p.to_path_buf()));
+        terminal::spawn_terminal(term_id, cols, rows, proxy, local_cwd)
     };
     s.term_panes.insert(term_id, tp);
     let pane = Pane { id: pane_id, kind: PaneKind::Terminal, tabs: vec![],
@@ -1292,7 +1341,7 @@ pub enum UserEvent {
     LspServerStopped { server_id: usize },
     LspBinaryCheckResult { host: Option<vpath::SshHost>, statuses: Vec<(Lang, Option<bool>)>, error: Option<String> },
     FormatterDone  { path: VPath },
-    GitStatusResult { staged: Vec<GitEntry>, unstaged: Vec<GitEntry>, is_git_repo: bool },
+    GitStatusResult { staged: Vec<GitEntry>, unstaged: Vec<GitEntry>, is_git_repo: bool, error: Option<String> },
     GitDiffResult   { buf_id: usize, path: String, lines: Vec<DiffLine> },
     GitOpDone,
     SearchDone        { token: u64, results: Vec<GlobalFindResult> },
@@ -4291,7 +4340,7 @@ fn refresh_git_status(proxy: winit::event_loop::EventLoopProxy<UserEvent>, root:
                 (staged, unstaged, true)
             }
         };
-        let _ = proxy.send_event(UserEvent::GitStatusResult { staged, unstaged, is_git_repo });
+        let _ = proxy.send_event(UserEvent::GitStatusResult { staged, unstaged, is_git_repo, error: None });
     });
 }
 
@@ -4302,17 +4351,19 @@ fn refresh_git_status_remote(
     remote_path: String,
 ) {
     std::thread::spawn(move || {
-        let result = ssh::run_ssh_capture(
-            &host,
-            &["git", "-C", &remote_path, "status", "--porcelain"],
-        );
-        let (staged, unstaged, is_git_repo) = match result {
-            Err(_) => (vec![], vec![], false),
+        // Use `sh -c 'cd /path && git status --porcelain'` rather than `git -C /path ...`
+        // because non-interactive SSH sessions may have a minimal PATH that doesn't include
+        // git, and because `sh -c` reliably resolves git through the user's login PATH.
+        let escaped = remote_path.replace('\'', "'\\''");
+        let cmd = format!("cd '{}' && git status --porcelain", escaped);
+        let result = ssh::run_ssh_capture(&host, &["sh", "-c", &cmd]);
+        let (staged, unstaged, is_git_repo, error) = match result {
+            Err(e) => (vec![], vec![], false, Some(e)),
             Ok(text) if text.trim().is_empty() => {
-                // Could be a clean repo or not a git repo; treat empty as clean/valid
+                // Could be a clean repo or not a git repo; treat empty as clean/valid.
                 // A non-git-repo would have returned an error via the Err arm above
                 // (ssh exit code non-zero). If git exited 0 with no output → clean repo.
-                (vec![], vec![], true)
+                (vec![], vec![], true, None)
             }
             Ok(text) => {
                 let mut staged   = vec![];
@@ -4335,10 +4386,10 @@ fn refresh_git_status_remote(
                         unstaged.push(GitEntry { xy: (x, y), path });
                     }
                 }
-                (staged, unstaged, true)
+                (staged, unstaged, true, None)
             }
         };
-        let _ = proxy.send_event(UserEvent::GitStatusResult { staged, unstaged, is_git_repo });
+        let _ = proxy.send_event(UserEvent::GitStatusResult { staged, unstaged, is_git_repo, error });
     });
 }
 
@@ -5054,22 +5105,33 @@ impl ApplicationHandler<UserEvent> for App {
                         let scroll_off = s.explorer.as_ref().map_or(0, |ex| ex.tree_scroll);
                         let idx = (row - 2) as usize + scroll_off;
                         let entry = s.explorer.as_ref().and_then(|ex| {
-                            if !ex.tree_search.is_empty() || idx >= ex.entries.len() || !ex.entries[idx].is_dir {
-                                None
+                            if ex.tree_search.is_empty() && idx < ex.entries.len() {
+                                Some((explorer_entry_vpath(ex, ex.entries[idx].path.clone()), ex.entries[idx].is_dir))
                             } else {
-                                Some(explorer_entry_vpath(ex, ex.entries[idx].path.clone()))
+                                None
                             }
                         });
-                        if let Some(entry) = entry {
-                            s.context_menu = Some(ContextMenu {
-                                x: mx, y: my, hovered: 0,
-                                tab_source: None, git_entry: None, explorer_entry: Some(entry),
-                                items: vec![ContextMenuItem {
+                        if let Some((entry, is_dir)) = entry {
+                            let mut items = vec![ContextMenuItem {
+                                label: "Open Terminal Here",
+                                shortcut: "",
+                                action: CtxAction::OpenTerminalHere,
+                                enabled: true,
+                            }];
+                            if is_dir {
+                                items.insert(0, ContextMenuItem {
                                     label: "Open Folder Here",
                                     shortcut: "",
                                     action: CtxAction::ExplorerOpenAsRoot,
                                     enabled: true,
-                                }],
+                                });
+                            }
+                            s.context_menu = Some(ContextMenu {
+                                x: mx, y: my, hovered: 0,
+                                tab_source: None, git_entry: None,
+                                explorer_entry: Some(entry),
+                                explorer_entry_is_dir: is_dir,
+                                items,
                             });
                             { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                             return;
@@ -5106,7 +5168,7 @@ impl ApplicationHandler<UserEvent> for App {
                         s.context_menu = Some(ContextMenu {
                             x: mx, y: my, hovered: 0, tab_source: None,
                             git_entry: Some((is_staged, entry_path)),
-                            explorer_entry: None,
+                            explorer_entry: None, explorer_entry_is_dir: false,
                             items: vec![
                                 ContextMenuItem { label: "Open File", shortcut: "", action: CtxAction::GitOpenFile, enabled: true },
                                 ContextMenuItem { label: "View Diff", shortcut: "", action: CtxAction::GitViewDiff, enabled: true },
@@ -5164,7 +5226,7 @@ impl ApplicationHandler<UserEvent> for App {
                     items.push(ContextMenuItem { label: "",            shortcut: "", action: CtxAction::Separator,     enabled: true });
                     items.push(ContextMenuItem { label: "Close",       shortcut: "Cmd+W", action: CtxAction::TabClose, enabled: true });
                     s.context_menu = Some(ContextMenu {
-                        x: mx, y: my, hovered: 0, tab_source: Some((hit.pid, hit.ti)), git_entry: None, explorer_entry: None, items,
+                        x: mx, y: my, hovered: 0, tab_source: Some((hit.pid, hit.ti)), git_entry: None, explorer_entry: None, explorer_entry_is_dir: false, items,
                     });
                 } else {
                     // Editor text-area context menu
@@ -5181,7 +5243,7 @@ impl ApplicationHandler<UserEvent> for App {
                             s.context_menu = Some(ContextMenu {
                                 x: mx, y: my,
                                 hovered: 0,
-                                tab_source: None, git_entry: None, explorer_entry: None,
+                                tab_source: None, git_entry: None, explorer_entry: None, explorer_entry_is_dir: false,
                                 items: vec![
                                     ContextMenuItem { label: "Go to Definition",   shortcut: "Cmd+Click / F12",   action: CtxAction::GotoDefinition,  enabled: lsp_avail },
                                     ContextMenuItem { label: "Find All References", shortcut: "Cmd+Shift+F12",    action: CtxAction::FindReferences,   enabled: lsp_avail },
@@ -5266,6 +5328,7 @@ impl ApplicationHandler<UserEvent> for App {
                         let tab_source = cm.tab_source;
                         let git_entry  = cm.git_entry.clone();
                         let explorer_entry = cm.explorer_entry.clone();
+                        let explorer_entry_is_dir = cm.explorer_entry_is_dir;
                         s.context_menu = None;
                         if let Some(action) = action_taken {
                             let root_ga = s.explorer.as_ref()
@@ -5319,6 +5382,18 @@ impl ApplicationHandler<UserEvent> for App {
                                             s.explorer = Some(FileExplorer::new(path));
                                             s.left_view = LeftView::FileTree;
                                         }
+                                    }
+                                }
+                                CtxAction::OpenTerminalHere => {
+                                    if let Some(path) = explorer_entry {
+                                        // For files, open a terminal in the parent directory;
+                                        // for directories, use the directory itself.
+                                        let dir = if !explorer_entry_is_dir {
+                                            path.parent().unwrap_or(path)
+                                        } else {
+                                            path
+                                        };
+                                        open_terminal_pane_at(s, Some(dir));
                                     }
                                 }
                                 CtxAction::TabCopyRelPath => {
@@ -5448,7 +5523,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 x: act_w, y: gear_y,
                                 items: vec![ContextMenuItem { label: "Open Settings", shortcut: "", action: CtxAction::OpenSettings, enabled: true }],
                                 hovered: 0,
-                                tab_source: None, git_entry: None, explorer_entry: None,
+                                tab_source: None, git_entry: None, explorer_entry: None, explorer_entry_is_dir: false,
                             });
                         }
                     }
@@ -7057,7 +7132,7 @@ impl ApplicationHandler<UserEvent> for App {
                         let cols = (area.w / s.glyphs.cw).max(1) as usize;
                         let rows = ((area.h / 2) / s.glyphs.lh).max(1) as usize;
                         let proxy = s.proxy.clone();
-                        let tp = terminal::spawn_terminal_with_shell(term_id, cols, rows, proxy, Some(shell));
+                        let tp = terminal::spawn_terminal_with_shell(term_id, cols, rows, proxy, Some(shell), None);
                         s.term_panes.insert(term_id, tp);
                         let new_pane = Pane { id: pane_id, kind: PaneKind::Terminal, tabs: vec![],
                                               term_ids: vec![term_id], active: 0, find: FindBar::new() };
@@ -7140,7 +7215,20 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         return;
                     }
-                    // Forward all other key events to the active PTY
+                    // Forward all other key events to the active PTY.
+                    // Guard: modifier-only keypresses (Cmd, Ctrl, Alt, Shift, etc.) must
+                    // NOT clear the terminal selection. On macOS, pressing Cmd alone fires
+                    // a KeyboardInput event; clearing term_sel here would destroy the
+                    // selection before the user can press C for Cmd+C.
+                    if matches!(&event.logical_key, Key::Named(k) if matches!(k,
+                        NamedKey::Super | NamedKey::Hyper | NamedKey::Meta
+                        | NamedKey::Control | NamedKey::Alt | NamedKey::Shift
+                        | NamedKey::CapsLock | NamedKey::Fn | NamedKey::FnLock))
+                    {
+                        s.needs_redraw = true;
+                        self.dirty.store(true, Ordering::Release);
+                        return;
+                    }
                     s.term_sel = None;
                     let bytes = terminal::encode_key(&event.logical_key, s.mods, event.text.as_deref());
                     if let Some(bytes) = bytes {
@@ -7757,11 +7845,12 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 s.needs_redraw = true;
             }
-            UserEvent::GitStatusResult { staged, unstaged, is_git_repo } => {
-                s.git_panel.staged      = staged;
-                s.git_panel.unstaged    = unstaged;
-                s.git_panel.is_git_repo = is_git_repo;
-                s.git_panel.loading     = false;
+            UserEvent::GitStatusResult { staged, unstaged, is_git_repo, error } => {
+                s.git_panel.staged        = staged;
+                s.git_panel.unstaged      = unstaged;
+                s.git_panel.is_git_repo   = is_git_repo;
+                s.git_panel.remote_error  = error;
+                s.git_panel.loading       = false;
                 s.needs_redraw = true;
             }
             UserEvent::GitDiffResult { buf_id, path, lines } => {
@@ -8878,6 +8967,7 @@ fn render(s: &mut State) {
         commit_cursor:  usize,
         commit_focused: bool,
         is_git_repo:    bool,
+        remote_error:   Option<String>,
         sel:            GitSel,
         loading:        bool,
         scroll:         usize,
@@ -8891,6 +8981,7 @@ fn render(s: &mut State) {
             commit_cursor:  gp.commit_cursor,
             commit_focused: gp.commit_focused,
             is_git_repo:    gp.is_git_repo,
+            remote_error:   gp.remote_error.clone(),
             sel:            gp.sel.clone(),
             loading:        gp.loading,
             scroll:         gp.scroll,
@@ -9223,7 +9314,11 @@ fn render(s: &mut State) {
                 let px = act_w;
                 let pw = explorer_w;
                 if !gs.is_git_repo {
-                    draw_str(buf, w, h, g, " Not a git repo", px + 2, asc + 4, FG_DIM, px + pw - 1);
+                    if let Some(ref err) = gs.remote_error {
+                        draw_str(buf, w, h, g, &format!(" Error: {}", err.lines().next().unwrap_or(err)), px + 2, asc + 4, FG_DIM, px + pw - 1);
+                    } else {
+                        draw_str(buf, w, h, g, " Not a git repo", px + 2, asc + 4, FG_DIM, px + pw - 1);
+                    }
                 } else if gs.loading {
                     draw_str(buf, w, h, g, " Loading...", px + 2, asc + 4, FG_DIM, px + pw - 1);
                 } else {
@@ -10065,6 +10160,7 @@ fn render(s: &mut State) {
             // Grid rows
             for (vi, row) in snap.visible_rows.iter().enumerate() {
                 let py       = r.y + tab_h + vi as i32 * lh;
+                if py + lh > r.y + r.h { break; }  // clip to pane bottom
                 let baseline = py + asc;
                 for (ci, cell) in row.iter().enumerate() {
                     let cx = r.x + ci as i32 * cw;
@@ -10083,7 +10179,9 @@ fn render(s: &mut State) {
             if snap.is_active && snap.cursor_visible {
                 let cx = r.x + snap.cursor_col as i32 * cw;
                 let cy = r.y + tab_h + snap.cursor_row as i32 * lh;
-                fill(buf, w, h, cx, cy, 2, lh, ACCENT);
+                if cy + lh <= r.y + r.h {  // clip cursor to pane bottom
+                    fill(buf, w, h, cx, cy, 2, lh, ACCENT);
+                }
             }
         }
 
