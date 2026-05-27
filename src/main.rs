@@ -72,18 +72,20 @@ const RAINBOW: [u32; 6] = [0xFF79C6, 0xFFB86C, 0xF1FA8C, 0x50FA7B, 0x8BE9FD, 0xB
 
 // ── Language detection ────────────────────────────────────────────────────────
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-enum Lang { None, Rust, Python, TypeScript, Json, Jsonc, Markdown }
+enum Lang { None, Rust, Python, TypeScript, Json, Jsonc, Markdown, Css, Html }
 
 impl Lang {
     fn from_path(path: &std::path::Path) -> Self {
         match path.extension().and_then(|e| e.to_str()) {
-            Some("rs")                          => Lang::Rust,
-            Some("py" | "pyw")                  => Lang::Python,
-            Some("ts" | "tsx" | "js" | "jsx")   => Lang::TypeScript,
-            Some("json")                        => Lang::Json,
-            Some("jsonc")                       => Lang::Jsonc,
-            Some("md" | "markdown")             => Lang::Markdown,
-            _                                   => Lang::None,
+            Some("rs")                              => Lang::Rust,
+            Some("py" | "pyw")                      => Lang::Python,
+            Some("ts" | "tsx" | "js" | "jsx")       => Lang::TypeScript,
+            Some("json")                            => Lang::Json,
+            Some("jsonc")                           => Lang::Jsonc,
+            Some("md" | "markdown")                 => Lang::Markdown,
+            Some("css" | "less" | "scss")           => Lang::Css,
+            Some("html" | "htm" | "svg" | "xml")    => Lang::Html,
+            _                                       => Lang::None,
         }
     }
 }
@@ -97,6 +99,8 @@ enum MlState {
     PyTripleSingle,
     PyTripleDouble,
     CodeFence,
+    HtmlComment,  // <!-- ... -->  used by HTML/SVG/XML
+    HtmlTag,      // inside < tag attrs > used by HTML and JSX/TSX
 }
 
 // ── Layout ────────────────────────────────────────────────────────────────────
@@ -1144,15 +1148,20 @@ fn open_terminal_pane_at(s: &mut State, cwd: Option<VPath>) {
             // leaves as literal $HOME, allowing the remote shell to expand it to the
             // remote user's home directory). Use double-quoting on the remote side so
             // spaces in the rest of the path work too.
+            // -t: force PTY allocation on the remote side. Without -t, SSH doesn't
+            // allocate a remote PTY when a command is given, so $TERM is unknown,
+            // ncurses/nano/htop fail, Ctrl+D doesn't work, and closing the tab hangs
+            // the app (reader thread blocks waiting for a PTY that never sends EOF).
+            // -l: start the replacement shell as a login shell so ~/.bash_profile /
+            // ~/.zprofile are sourced and PATH is complete.
             if rdir.starts_with('~') {
                 let after_tilde = &rdir[1..]; // "" for "~", "/rest" for "~/rest"
                 // Escape \ and " for the inner double-quoted path on the remote.
-                // (Paths with these chars are extremely rare in practice.)
                 let rest_esc = after_tilde
                     .replace('\\', "\\\\\\\\") // \ → \\\\ (4 chars → remote sees \)
                     .replace('"', "\\\\\"");    // " → \\\" (remote sees \")
                 format!(
-                    "ssh -o ControlPath={} -o ControlMaster=no{} {} \"cd \\\"\\$HOME{}\\\" && exec \\$SHELL\"",
+                    "ssh -t -o ControlPath={} -o ControlMaster=no{} {} \"cd \\\"\\$HOME{}\\\" && exec \\$SHELL -l\"",
                     host.control_path().display(),
                     port_part,
                     host.host_arg(),
@@ -1162,7 +1171,7 @@ fn open_terminal_pane_at(s: &mut State, cwd: Option<VPath>) {
                 // Absolute path — single-quote with standard ' → '\'' escaping.
                 let escaped = rdir.replace('\'', r"'\''");
                 format!(
-                    "ssh -o ControlPath={} -o ControlMaster=no{} {} \"cd '{}' && exec \\$SHELL\"",
+                    "ssh -t -o ControlPath={} -o ControlMaster=no{} {} \"cd '{}' && exec \\$SHELL -l\"",
                     host.control_path().display(),
                     port_part,
                     host.host_arg(),
@@ -1226,7 +1235,7 @@ fn lsp_binary(lang: Lang) -> Option<&'static str> {
         Lang::TypeScript => Some("typescript-language-server"),
         Lang::Rust       => Some("rust-analyzer"),
         Lang::Python     => Some("pylsp"),
-        Lang::None | Lang::Json | Lang::Jsonc | Lang::Markdown => None,
+        Lang::None | Lang::Json | Lang::Jsonc | Lang::Markdown | Lang::Css | Lang::Html => None,
     }
 }
 
@@ -1235,7 +1244,7 @@ fn lsp_required_binaries(lang: Lang) -> &'static [&'static str] {
         Lang::TypeScript => &["typescript-language-server", "tsserver"],
         Lang::Rust       => &["rust-analyzer"],
         Lang::Python     => &["pylsp"],
-        Lang::None | Lang::Json | Lang::Jsonc | Lang::Markdown => &[],
+        Lang::None | Lang::Json | Lang::Jsonc | Lang::Markdown | Lang::Css | Lang::Html => &[],
     }
 }
 
@@ -1244,7 +1253,7 @@ fn lsp_install_command(lang: Lang) -> Option<&'static str> {
         Lang::TypeScript => Some("npm install -g typescript-language-server typescript\n"),
         Lang::Rust       => Some("rustup component add rust-analyzer\n"),
         Lang::Python     => Some("pip install python-lsp-server\n"),
-        Lang::None | Lang::Json | Lang::Jsonc | Lang::Markdown => None,
+        Lang::None | Lang::Json | Lang::Jsonc | Lang::Markdown | Lang::Css | Lang::Html => None,
     }
 }
 
@@ -2601,7 +2610,7 @@ fn is_keyword(word: &str, lang: Lang) -> bool {
             "satisfies"|"static"|"super"|"switch"|"this"|"throw"|"true"|"try"|
             "type"|"typeof"|"undefined"|"var"|"void"|"while"|"with"|"yield"
         ),
-        Lang::None | Lang::Json | Lang::Jsonc | Lang::Markdown => false,
+        Lang::None | Lang::Json | Lang::Jsonc | Lang::Markdown | Lang::Css | Lang::Html => false,
     }
 }
 
@@ -2619,7 +2628,7 @@ fn is_type_kw(word: &str, lang: Lang) -> bool {
         Lang::TypeScript => matches!(word,
             "boolean"|"bigint"|"never"|"number"|"string"|"symbol"|"unknown"
         ),
-        Lang::None | Lang::Json | Lang::Jsonc | Lang::Markdown => false,
+        Lang::None | Lang::Json | Lang::Jsonc | Lang::Markdown | Lang::Css | Lang::Html => false,
     }
 }
 
@@ -2970,12 +2979,343 @@ fn render_markdown_to_lines(text: &ropey::Rope) -> Vec<(String, Vec<u32>)> {
     }).collect()
 }
 
+// ── CSS / Less / SCSS highlighter ────────────────────────────────────────────
+fn highlight_css_line(chars: &[char], mut state: MlState, mut bracket_depth: i32) -> (Vec<u32>, MlState, i32) {
+    let len = chars.len();
+    let mut out = vec![FG; len];
+    let mut i = 0;
+
+    macro_rules! fill {
+        ($from:expr, $to:expr, $color:expr) => {
+            for k in $from..($to).min(len) { out[k] = $color; }
+        };
+    }
+
+    // Continue a block comment carried from the previous line
+    if state == MlState::BlockComment {
+        while i < len {
+            out[i] = HL_COMMENT;
+            if chars[i] == '*' && i + 1 < len && chars[i+1] == '/' {
+                out[i+1] = HL_COMMENT; i += 2;
+                state = MlState::Normal;
+                break;
+            }
+            i += 1;
+        }
+    }
+
+    while i < len {
+        let ch = chars[i];
+
+        // /* ... */ block comment
+        if ch == '/' && i + 1 < len && chars[i+1] == '*' {
+            fill!(i, i + 2, HL_COMMENT); i += 2;
+            state = MlState::BlockComment;
+            while i < len {
+                out[i] = HL_COMMENT;
+                if chars[i] == '*' && i + 1 < len && chars[i+1] == '/' {
+                    out[i+1] = HL_COMMENT; i += 2;
+                    state = MlState::Normal;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        // // line comment (Less / SCSS)
+        if ch == '/' && i + 1 < len && chars[i+1] == '/' {
+            fill!(i, len, HL_COMMENT);
+            break;
+        }
+
+        // String literals
+        if ch == '"' || ch == '\'' {
+            let q = ch;
+            out[i] = HL_STRING; i += 1;
+            while i < len {
+                out[i] = HL_STRING;
+                if chars[i] == '\\' && i + 1 < len { out[i+1] = HL_STRING; i += 2; }
+                else if chars[i] == q { i += 1; break; }
+                else { i += 1; }
+            }
+            continue;
+        }
+
+        // @rule or @var (Less) — @media, @import, @keyframes, @font-face, etc.
+        if ch == '@' {
+            let start = i;
+            i += 1;
+            while i < len && (chars[i].is_alphanumeric() || chars[i] == '-' || chars[i] == '_') {
+                i += 1;
+            }
+            fill!(start, i, HL_KEYWORD);
+            continue;
+        }
+
+        // $var — SCSS variable
+        if ch == '$' {
+            let start = i;
+            i += 1;
+            while i < len && (chars[i].is_alphanumeric() || chars[i] == '-' || chars[i] == '_') {
+                i += 1;
+            }
+            fill!(start, i, HL_TYPE);
+            continue;
+        }
+
+        // #hex color or #id selector
+        if ch == '#' {
+            let start = i;
+            i += 1;
+            // If next chars are hex digits only and 3 or 6 long → color literal
+            let hex_start = i;
+            while i < len && chars[i].is_ascii_alphanumeric() { i += 1; }
+            let word_len = i - hex_start;
+            let all_hex = chars[hex_start..i].iter().all(|c| c.is_ascii_hexdigit());
+            if all_hex && (word_len == 3 || word_len == 4 || word_len == 6 || word_len == 8) {
+                fill!(start, i, HL_NUMBER); // color literal
+            } else {
+                fill!(start, i, HL_FUNC);  // #id selector
+            }
+            continue;
+        }
+
+        // { / } track depth
+        if ch == '{' { bracket_depth += 1; i += 1; continue; }
+        if ch == '}' { bracket_depth = bracket_depth.saturating_sub(1); i += 1; continue; }
+
+        // !important
+        if ch == '!' {
+            let start = i;
+            i += 1;
+            while i < len && chars[i].is_alphabetic() { i += 1; }
+            fill!(start, i, HL_KEYWORD);
+            continue;
+        }
+
+        // . class selector or : / :: pseudo-class/element
+        if ch == '.' || ch == ':' {
+            let color = if ch == ':' { HL_TYPE } else { HL_FUNC };
+            out[i] = color; i += 1;
+            if ch == ':' && i < len && chars[i] == ':' { out[i] = HL_TYPE; i += 1; } // ::pseudo
+            let _start = i;
+            while i < len && (chars[i].is_alphanumeric() || chars[i] == '-' || chars[i] == '_') {
+                out[i] = color; i += 1;
+            }
+            continue;
+        }
+
+        // [attribute] selector
+        if ch == '[' {
+            let start = i;
+            i += 1;
+            while i < len && chars[i] != ']' { i += 1; }
+            if i < len { i += 1; }
+            fill!(start, i, HL_TYPE);
+            continue;
+        }
+
+        // CSS custom property (--var)
+        if ch == '-' && i + 1 < len && chars[i+1] == '-' {
+            let start = i;
+            while i < len && (chars[i].is_alphanumeric() || chars[i] == '-' || chars[i] == '_') {
+                i += 1;
+            }
+            fill!(start, i, HL_TYPE);
+            continue;
+        }
+
+        // Number with optional unit
+        if ch.is_ascii_digit() || (ch == '.' && i + 1 < len && chars[i+1].is_ascii_digit()) {
+            let start = i;
+            while i < len && (chars[i].is_ascii_digit() || chars[i] == '.') { i += 1; }
+            fill!(start, i, HL_NUMBER);
+            // unit immediately following
+            let unit_start = i;
+            while i < len && chars[i].is_alphabetic() { i += 1; }
+            if i > unit_start { fill!(unit_start, i, HL_TYPE); }
+            if i < len && chars[i] == '%' { out[i] = HL_TYPE; i += 1; }
+            continue;
+        }
+
+        // Identifier: property name (inside {}) or element selector / value keyword (outside)
+        if ch.is_alphabetic() || ch == '_' {
+            let start = i;
+            while i < len && (chars[i].is_alphanumeric() || chars[i] == '-' || chars[i] == '_') {
+                i += 1;
+            }
+            let word: String = chars[start..i].iter().collect();
+
+            // Check what follows (skip whitespace) to determine property vs value
+            let mut j = i;
+            while j < len && chars[j] == ' ' { j += 1; }
+            let followed_by_colon = j < len && chars[j] == ':' && j + 1 < len && chars[j+1] != ':';
+
+            let color = if bracket_depth > 0 && followed_by_colon {
+                HL_FUNC // CSS property name
+            } else if bracket_depth > 0 {
+                // Value keyword or unit
+                match word.as_str() {
+                    "none" | "auto" | "inherit" | "initial" | "unset" | "revert" |
+                    "normal" | "bold" | "italic" | "oblique" | "bolder" | "lighter" |
+                    "solid" | "dashed" | "dotted" | "double" | "groove" | "ridge" |
+                    "inset" | "outset" | "hidden" | "visible" | "collapse" |
+                    "block" | "inline" | "flex" | "grid" | "contents" | "flow" |
+                    "table" | "list-item" | "run-in" |
+                    "absolute" | "relative" | "fixed" | "sticky" | "static" |
+                    "center" | "left" | "right" | "top" | "bottom" | "middle" |
+                    "start" | "end" | "stretch" | "baseline" |
+                    "transparent" | "currentColor" | "currentcolor" |
+                    "serif" | "sans-serif" | "monospace" | "cursive" | "fantasy" |
+                    "pointer" | "default" | "crosshair" | "move" | "not-allowed" |
+                    "nowrap" | "wrap" | "pre" | "clip" | "ellipsis" | "break-word" |
+                    "uppercase" | "lowercase" | "capitalize" |
+                    "ltr" | "rtl" | "both" | "forwards" | "backwards" | "infinite" |
+                    "ease" | "linear" | "ease-in" | "ease-out" | "ease-in-out" |
+                    "alternate" | "reverse" | "paused" | "running" | "fill" | "stroke" |
+                    // common color names
+                    "black" | "white" | "red" | "green" | "blue" | "yellow" |
+                    "orange" | "purple" | "pink" | "gray" | "grey" | "cyan" | "magenta"
+                        => HL_KEYWORD,
+                    // units (standalone without preceding number, e.g. in calc())
+                    "px" | "em" | "rem" | "vh" | "vw" | "vmin" | "vmax" |
+                    "pt" | "cm" | "mm" | "in" | "ex" | "ch" | "fr" |
+                    "deg" | "rad" | "turn" | "ms" | "s" | "dpi" | "dpcm" | "dppx"
+                        => HL_TYPE,
+                    _ => FG
+                }
+            } else {
+                FG // element name in selector — keep as foreground
+            };
+            fill!(start, i, color);
+            continue;
+        }
+
+        i += 1;
+    }
+
+    (out, state, bracket_depth)
+}
+
+// ── HTML / SVG / XML highlighter ─────────────────────────────────────────────
+fn highlight_html_line(chars: &[char], mut state: MlState) -> (Vec<u32>, MlState, i32) {
+    let len = chars.len();
+    let mut out = vec![FG; len];
+    let mut i = 0;
+
+    macro_rules! fill {
+        ($from:expr, $to:expr, $color:expr) => {
+            for k in $from..($to).min(len) { out[k] = $color; }
+        };
+    }
+
+    while i < len {
+        match state {
+            MlState::HtmlComment => {
+                // Scan for -->
+                if i + 2 < len && chars[i] == '-' && chars[i+1] == '-' && chars[i+2] == '>' {
+                    fill!(i, i + 3, HL_COMMENT); i += 3;
+                    state = MlState::Normal;
+                } else {
+                    out[i] = HL_COMMENT; i += 1;
+                }
+            }
+            MlState::HtmlTag => {
+                // Inside a tag: highlight attributes and values, exit on > or />
+                if chars[i] == '>' {
+                    i += 1; state = MlState::Normal;
+                } else if chars[i] == '/' && i + 1 < len && chars[i+1] == '>' {
+                    fill!(i, i + 2, FG); i += 2; state = MlState::Normal;
+                } else if chars[i] == '"' || chars[i] == '\'' {
+                    let q = chars[i];
+                    out[i] = HL_STRING; i += 1;
+                    while i < len {
+                        out[i] = HL_STRING;
+                        if chars[i] == '\\' && i + 1 < len { out[i+1] = HL_STRING; i += 2; }
+                        else if chars[i] == q { i += 1; break; }
+                        else { i += 1; }
+                    }
+                } else if chars[i].is_alphabetic() || chars[i] == '_' || chars[i] == '-'
+                    || chars[i] == ':' // namespace prefix (xml:lang etc.)
+                {
+                    let start = i;
+                    while i < len && (chars[i].is_alphanumeric() || matches!(chars[i], '_' | '-' | ':' | '.')) {
+                        i += 1;
+                    }
+                    fill!(start, i, HL_TYPE); // attribute name
+                } else {
+                    i += 1;
+                }
+            }
+            _ => {
+                // Normal / any other state — parse HTML content
+                // <!-- comment -->
+                if i + 3 < len && chars[i] == '<' && chars[i+1] == '!' && chars[i+2] == '-' && chars[i+3] == '-' {
+                    fill!(i, i + 4, HL_COMMENT); i += 4;
+                    state = MlState::HtmlComment;
+                    continue;
+                }
+                // <! DOCTYPE etc.
+                if chars[i] == '<' && i + 1 < len && chars[i+1] == '!' {
+                    let start = i;
+                    i += 2;
+                    while i < len && chars[i] != '>' { i += 1; }
+                    if i < len { i += 1; }
+                    fill!(start, i, HL_KEYWORD);
+                    continue;
+                }
+                // </closing-tag>
+                if chars[i] == '<' && i + 1 < len && chars[i+1] == '/' {
+                    out[i] = FG; out[i+1] = FG; i += 2;
+                    let _start = i;
+                    while i < len && (chars[i].is_alphanumeric() || matches!(chars[i], '-' | '_' | ':' | '.')) {
+                        out[i] = HL_FUNC; i += 1;
+                    }
+                    // consume rest up to >
+                    while i < len && chars[i] != '>' { i += 1; }
+                    if i < len { i += 1; }
+                    continue;
+                }
+                // <opening-tag
+                if chars[i] == '<' && i + 1 < len && chars[i+1].is_alphabetic() {
+                    out[i] = FG; i += 1;
+                    let _start = i;
+                    while i < len && (chars[i].is_alphanumeric() || matches!(chars[i], '-' | '_' | ':' | '.')) {
+                        out[i] = HL_FUNC; i += 1;
+                    }
+                    state = MlState::HtmlTag;
+                    continue;
+                }
+                // &entity; references
+                if chars[i] == '&' {
+                    let start = i;
+                    i += 1;
+                    while i < len && chars[i] != ';' && chars[i] != ' ' && i - start < 12 { i += 1; }
+                    if i < len && chars[i] == ';' { i += 1; fill!(start, i, HL_KEYWORD); }
+                    else { fill!(start, i, FG); } // not a valid entity, leave as-is
+                    continue;
+                }
+                i += 1;
+            }
+        }
+    }
+
+    (out, state, 0)
+}
+
 fn highlight_line(chars: &[char], lang: Lang, mut state: MlState, rainbow: bool, mut bracket_depth: i32) -> (Vec<u32>, MlState, i32) {
     if matches!(lang, Lang::Json | Lang::Jsonc) {
         return highlight_json_line(chars, lang == Lang::Jsonc, state, rainbow, bracket_depth);
     }
     if lang == Lang::Markdown {
         return highlight_markdown_line(chars, state, rainbow, bracket_depth);
+    }
+    if lang == Lang::Css {
+        return highlight_css_line(chars, state, bracket_depth);
+    }
+    if lang == Lang::Html {
+        return highlight_html_line(chars, state);
     }
     let len = chars.len();
     let mut out = vec![FG; len];
@@ -3018,6 +3358,51 @@ fn highlight_line(chars: &[char], lang: Lang, mut state: MlState, rainbow: bool,
             MlState::CodeFence => {
                 // CodeFence is only used by highlight_markdown_line; treat as normal here
                 state = MlState::Normal;
+            }
+            // HtmlComment and HtmlTag are used by highlight_html_line and also by the
+            // TypeScript/JSX path for multi-line JSX tags and HTML comments in TSX.
+            MlState::HtmlComment => {
+                if i + 2 < len && chars[i] == '-' && chars[i+1] == '-' && chars[i+2] == '>' {
+                    fill!(i, i + 3, HL_COMMENT);
+                    i += 3;
+                    state = MlState::Normal;
+                } else {
+                    out[i] = HL_COMMENT;
+                    i += 1;
+                }
+            }
+            MlState::HtmlTag => {
+                // Inside a JSX/HTML tag: color attributes and values, exit on > or />
+                if chars[i] == '>' {
+                    i += 1;
+                    state = MlState::Normal;
+                } else if chars[i] == '/' && i + 1 < len && chars[i+1] == '>' {
+                    fill!(i, i + 2, FG);
+                    i += 2;
+                    state = MlState::Normal;
+                } else if chars[i] == '"' || chars[i] == '\'' {
+                    let q = chars[i];
+                    out[i] = HL_STRING; i += 1;
+                    while i < len {
+                        out[i] = HL_STRING;
+                        if chars[i] == '\\' && i + 1 < len { out[i+1] = HL_STRING; i += 2; }
+                        else if chars[i] == q { i += 1; break; }
+                        else { i += 1; }
+                    }
+                } else if chars[i] == '{' {
+                    // JSX expression in attribute — leave as FG, exit tag mode to handle braces
+                    i += 1;
+                    state = MlState::Normal;
+                } else if chars[i].is_alphabetic() || chars[i] == '_' || chars[i] == '-' {
+                    let start = i;
+                    while i < len && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '-' || chars[i] == '.') {
+                        i += 1;
+                    }
+                    // Check if this is an attribute name (followed by = or whitespace or >)
+                    fill!(start, i, HL_TYPE);
+                } else {
+                    i += 1;
+                }
             }
             MlState::Normal => {
                 let py_comment = lang == Lang::Python && chars[i] == '#';
@@ -3111,6 +3496,43 @@ fn highlight_line(chars: &[char], lang: Lang, mut state: MlState, rainbow: bool,
                     i += 1;
                     state = MlState::TemplateStr;
                     continue;
+                }
+
+                // JSX/TSX: detect < as tag opener (not less-than operator).
+                // Heuristic: < followed by letter/slash is a tag; preceded by a
+                // space/operator/start-of-line or ( context makes it unambiguous.
+                if lang == Lang::TypeScript && chars[i] == '<' {
+                    let next = chars.get(i + 1).copied();
+                    if next == Some('/') {
+                        // Closing tag </Foo> or </div>
+                        out[i] = FG; out[i+1] = FG; i += 2;
+                        let _start = i;
+                        while i < len && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '.' || chars[i] == '-') {
+                            out[i] = HL_FUNC; i += 1;
+                        }
+                        continue;
+                    } else if next.map_or(false, |c| c.is_alphabetic()) {
+                        // Opening tag — peek at tag name to decide component vs element
+                        let tag_start = i + 1;
+                        let mut j = tag_start;
+                        while j < len && (chars[j].is_alphanumeric() || chars[j] == '_' || chars[j] == '.' || chars[j] == '-') {
+                            j += 1;
+                        }
+                        // Only treat as JSX if tag name is followed by space, >, /, or newline
+                        // (avoids false positives on generics like Vec<i32>)
+                        let after_tag = chars.get(j).copied();
+                        let is_jsx_tag = matches!(after_tag, Some(' ') | Some('\t') | Some('>') | Some('/') | Some('\n') | None)
+                            || j == len; // tag name goes to end of line (multi-line JSX)
+                        if is_jsx_tag {
+                            let is_component = chars[tag_start].is_uppercase();
+                            let tag_color = if is_component { HL_TYPE } else { HL_FUNC };
+                            out[i] = FG; i += 1; // '<'
+                            fill!(i, j, tag_color);
+                            i = j;
+                            state = MlState::HtmlTag;
+                            continue;
+                        }
+                    }
                 }
 
                 if chars[i].is_ascii_digit()
@@ -4376,8 +4798,19 @@ fn refresh_git_status_remote(
         // Use `sh -c 'cd /path && git status --porcelain'` rather than `git -C /path ...`
         // because non-interactive SSH sessions may have a minimal PATH that doesn't include
         // git, and because `sh -c` reliably resolves git through the user's login PATH.
-        let escaped = remote_path.replace('\'', "'\\''");
-        let cmd = format!("cd '{}' && git status --porcelain", escaped);
+        //
+        // Tilde paths (~/dir): single-quoting prevents ~ from expanding on the remote.
+        // Use cd "$HOME/rest" (double-quoted) for tilde paths so the remote sh expands
+        // $HOME correctly. run_ssh_capture's shell_quote wraps the whole cmd in '...',
+        // which passes $HOME through as a literal string for the remote sh to expand.
+        let cd_cmd = if remote_path.starts_with('~') {
+            let rest = remote_path[1..].replace('\'', r"'\''");
+            format!("cd \"$HOME{}\"", rest)
+        } else {
+            let esc = remote_path.replace('\'', r"'\''");
+            format!("cd '{}'", esc)
+        };
+        let cmd = format!("{} && git status --porcelain", cd_cmd);
         let result = ssh::run_ssh_capture(&host, &["sh", "-c", &cmd]);
         let (staged, unstaged, is_git_repo, error) = match result {
             Err(e) => (vec![], vec![], false, Some(e)),

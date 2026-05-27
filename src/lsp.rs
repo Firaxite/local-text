@@ -175,7 +175,7 @@ pub fn start_server(
         Lang::Rust       => ("rust-analyzer", &["--stdio"]),
         Lang::TypeScript => ("typescript-language-server", &["--stdio"]),
         Lang::Python     => ("pylsp", &[]),
-        Lang::None | Lang::Json | Lang::Jsonc | Lang::Markdown => return None,
+        Lang::None | Lang::Json | Lang::Jsonc | Lang::Markdown | Lang::Css | Lang::Html => return None,
     };
 
     let mut child = if let Some(ref host) = ssh_host {
@@ -308,7 +308,7 @@ pub fn notify_did_open(server: &mut LspServer, path: &VPath, text: &str) {
         Lang::Json       => "json",
         Lang::Jsonc      => "jsonc",
         Lang::Markdown   => "markdown",
-        Lang::None       => "text",
+        Lang::None | Lang::Css | Lang::Html => "text",
     };
     let params = did_open_params(path, text, lang_id);
     send_notification(server, "textDocument/didOpen", params);
