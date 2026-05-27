@@ -211,7 +211,13 @@ impl VPath {
     /// For remote paths we still produce `file:///remote/path` because the
     /// LSP server process runs *on the remote*, where that path is local.
     pub fn to_lsp_uri(&self) -> String {
-        format!("file://{}", self.as_path().display())
+        match self {
+            VPath::Local(p) => format!("file://{}", p.display()),
+            VPath::Remote { host, path } => {
+                let path = remote_lsp_path(host, path);
+                format!("file://{}", path.display())
+            }
+        }
     }
 
     /// Short human-readable display for status bar / command palette.
@@ -239,6 +245,20 @@ impl VPath {
                 format!("[{}] {}", host.display(), dir)
             }
         }
+    }
+}
+
+fn remote_lsp_path(host: &SshHost, path: &Path) -> PathBuf {
+    let Some(user) = host.user.as_deref() else {
+        return path.to_path_buf();
+    };
+    let path_str = path.to_string_lossy();
+    if path_str == "~" {
+        PathBuf::from(format!("/home/{user}"))
+    } else if let Some(rest) = path_str.strip_prefix("~/") {
+        PathBuf::from(format!("/home/{user}/{rest}"))
+    } else {
+        path.to_path_buf()
     }
 }
 
@@ -354,5 +374,11 @@ mod tests {
     fn keeps_legacy_slash_path_form() {
         assert_remote("ssh://example.com/srv/app", None, "example.com", None, "/srv/app");
         assert_remote("ssh://example.com:2222/srv/app", None, "example.com", Some(2222), "/srv/app");
+    }
+
+    #[test]
+    fn expands_remote_tilde_for_lsp_uri_when_user_is_known() {
+        let path = VPath::parse("ssh://me@example.com:~/src/app/main.ts");
+        assert_eq!(path.to_lsp_uri(), "file:///home/me/src/app/main.ts");
     }
 }

@@ -79,7 +79,7 @@ impl Lang {
         match path.extension().and_then(|e| e.to_str()) {
             Some("rs")                              => Lang::Rust,
             Some("py" | "pyw")                      => Lang::Python,
-            Some("ts" | "tsx" | "js" | "jsx")       => Lang::TypeScript,
+            Some("ts" | "tsx" | "js" | "jsx" | "mts" | "cts" | "mjs" | "cjs") => Lang::TypeScript,
             Some("json")                            => Lang::Json,
             Some("jsonc")                           => Lang::Jsonc,
             Some("md" | "markdown")                 => Lang::Markdown,
@@ -375,6 +375,7 @@ enum CommandAction {
     CursorBack, CursorForward,
     FormatDocument, OrganizeImports,
     OpenMarkdownPreview,
+    OpenLspOutput,
     OpenRemoteDirectory,
     StartCollab,
     JoinCollab,
@@ -404,6 +405,7 @@ const COMMANDS: &[CommandEntry] = &[
     CommandEntry { name: "Format Document",       shortcut: "Opt+Shift+F",   action: CommandAction::FormatDocument },
     CommandEntry { name: "Organize Imports",      shortcut: "Opt+Shift+O",   action: CommandAction::OrganizeImports },
     CommandEntry { name: "Open Markdown Preview", shortcut: "Cmd+Shift+M",   action: CommandAction::OpenMarkdownPreview },
+    CommandEntry { name: "Open LSP Output",       shortcut: "",              action: CommandAction::OpenLspOutput },
     CommandEntry { name: "Open Remote Directory…", shortcut: "",              action: CommandAction::OpenRemoteDirectory },
     CommandEntry { name: "Start Collab Session",   shortcut: "",              action: CommandAction::StartCollab },
     CommandEntry { name: "Join Collab Session…",   shortcut: "",              action: CommandAction::JoinCollab },
@@ -958,6 +960,203 @@ fn remove_pane_from_tree(tree: PaneTree, target_id: usize) -> Option<PaneTree> {
     }
 }
 
+fn pane_tree_contains(tree: &PaneTree, target_id: usize) -> bool {
+    match tree {
+        PaneTree::Leaf(id) => *id == target_id,
+        PaneTree::Split { a, b, .. } => pane_tree_contains(a, target_id) || pane_tree_contains(b, target_id),
+    }
+}
+
+fn first_visible_pane_id(s: &State) -> Option<usize> {
+    layout_tree(&s.pane_tree, s.pane_area())
+        .into_iter()
+        .map(|(id, _)| id)
+        .find(|id| s.panes.contains_key(id))
+}
+
+fn remove_pane_from_layout(s: &mut State, pane_id: usize) -> bool {
+    if !pane_tree_contains(&s.pane_tree, pane_id) {
+        if !pane_tree_contains(&s.pane_tree, s.active_pane) || !s.panes.contains_key(&s.active_pane) {
+            if let Some(id) = first_visible_pane_id(s) {
+                s.active_pane = id;
+            } else {
+                s.pane_tree = PaneTree::Leaf(0);
+                s.active_pane = 0;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    let old_tree = std::mem::replace(&mut s.pane_tree, PaneTree::Leaf(0));
+    if let Some(new_tree) = remove_pane_from_tree(old_tree, pane_id) {
+        s.pane_tree = new_tree;
+        if let Some(id) = first_visible_pane_id(s) {
+            if !pane_tree_contains(&s.pane_tree, s.active_pane) || !s.panes.contains_key(&s.active_pane) {
+                s.active_pane = id;
+            }
+            false
+        } else {
+            s.pane_tree = PaneTree::Leaf(0);
+            s.active_pane = 0;
+            true
+        }
+    } else {
+        s.pane_tree = PaneTree::Leaf(0);
+        s.active_pane = 0;
+        true
+    }
+}
+
+fn notify_lsp_tab_closed(s: &mut State, path: Option<VPath>) {
+    let Some(path) = path else { return };
+    let lang = Lang::from_path(path.as_path());
+    if let Some(srv) = s.lsp.server_for_lang_host_mut(lang, path.ssh_host()) {
+        lsp::notify_did_close(srv, &path);
+    }
+}
+
+fn close_editor_tab(s: &mut State, pane_id: usize, tab_idx: usize) -> bool {
+    let closed_path = {
+        let Some(pane) = s.panes.get_mut(&pane_id) else { return false };
+        if pane.kind != PaneKind::Editor || tab_idx >= pane.tabs.len() {
+            return false;
+        }
+        let closed = pane.tabs.remove(tab_idx);
+        if pane.active >= pane.tabs.len() && !pane.tabs.is_empty() {
+            pane.active = pane.tabs.len() - 1;
+        }
+        closed.path
+    };
+
+    notify_lsp_tab_closed(s, closed_path);
+
+    if s.panes.get(&pane_id).map_or(false, |p| p.tabs.is_empty()) {
+        s.md_panes.remove(&pane_id);
+        s.panes.remove(&pane_id);
+        remove_pane_from_layout(s, pane_id)
+    } else {
+        false
+    }
+}
+
+fn close_terminal_tab(s: &mut State, pane_id: usize, tab_idx: usize) -> bool {
+    let term_id = {
+        let Some(pane) = s.panes.get_mut(&pane_id) else { return false };
+        if pane.kind != PaneKind::Terminal || tab_idx >= pane.term_ids.len() {
+            return false;
+        }
+        let term_id = pane.term_ids.remove(tab_idx);
+        if pane.active >= pane.term_ids.len() && !pane.term_ids.is_empty() {
+            pane.active = pane.term_ids.len() - 1;
+        }
+        term_id
+    };
+    s.term_panes.remove(&term_id);
+
+    if s.panes.get(&pane_id).map_or(false, |p| p.term_ids.is_empty()) {
+        s.panes.remove(&pane_id);
+        remove_pane_from_layout(s, pane_id)
+    } else {
+        false
+    }
+}
+
+fn show_lsp_output_pane(s: &mut State, pane_id: usize) {
+    if !s.panes.get(&pane_id).map_or(false, |p| p.kind == PaneKind::LspOutput) {
+        return;
+    }
+    if pane_tree_contains(&s.pane_tree, pane_id) {
+        s.active_pane = pane_id;
+        return;
+    }
+
+    let target = if pane_tree_contains(&s.pane_tree, s.active_pane) && s.panes.contains_key(&s.active_pane) {
+        Some(s.active_pane)
+    } else {
+        first_visible_pane_id(s)
+    };
+
+    if let Some(target_id) = target {
+        let old_tree = std::mem::replace(&mut s.pane_tree, PaneTree::Leaf(0));
+        s.pane_tree = insert_pane(old_tree, target_id, pane_id, DropZone::Bottom);
+    } else {
+        s.pane_tree = PaneTree::Leaf(pane_id);
+    }
+    s.active_pane = pane_id;
+}
+
+fn open_lsp_output_for_context(s: &mut State) {
+    let active_lsp_scope = s.panes.get(&s.active_pane)
+        .filter(|pane| pane.kind == PaneKind::Editor)
+        .and_then(|pane| pane.tabs.get(pane.active))
+        .and_then(|tab| tab.path.as_ref())
+        .map(|path| (Lang::from_path(path.as_path()), path.ssh_host().cloned()))
+        .filter(|(lang, _)| *lang != Lang::None);
+
+    let target = active_lsp_scope
+        .and_then(|(lang, host)| {
+            s.lsp.servers.iter()
+                .find(|(_, srv)| srv.lang == lang && srv.ssh_host == host)
+                .map(|(&id, _)| id)
+        })
+        .or_else(|| s.lsp.servers.keys().copied().max())
+        .or_else(|| s.lsp_panes.keys().copied().max());
+
+    if let Some(pane_id) = target {
+        show_lsp_output_pane(s, pane_id);
+    } else {
+        s.status_msg = Some("No LSP output is available yet".to_owned());
+    }
+}
+
+fn hide_lsp_output_pane(s: &mut State, pane_id: usize) -> bool {
+    remove_pane_from_layout(s, pane_id)
+}
+
+fn jump_to_path_line_col(s: &mut State, path: VPath, line: usize, col: usize) -> bool {
+    open_or_reuse_tab(s, path.clone());
+
+    let Some((pane_id, tab_idx)) = s.panes.iter()
+        .filter(|(_, pane)| pane.kind == PaneKind::Editor)
+        .find_map(|(&pid, pane)| {
+            pane.tabs.iter()
+                .position(|tab| tab.path.as_ref() == Some(&path))
+                .map(|idx| (pid, idx))
+        })
+    else { return false };
+
+    s.active_pane = pane_id;
+    if let Some(pane) = s.panes.get_mut(&pane_id) {
+        pane.active = tab_idx;
+    }
+
+    let jump = {
+        let Some(tab) = s.panes.get(&pane_id).and_then(|pane| pane.tabs.get(tab_idx)) else {
+            return false;
+        };
+        if tab.remote_load_token.is_some() {
+            s.status_msg = Some(format!(
+                "Loading {} before jumping to line {}",
+                path.display_short(),
+                line.saturating_add(1)
+            ));
+            return false;
+        }
+        let target_line = line.min(State::last_line(&tab.text));
+        let target_col = col.min(State::line_len(&tab.text, target_line));
+        tab.text.line_to_char(target_line) + target_col
+    };
+
+    if let Some(pane) = s.panes.get_mut(&pane_id) {
+        if let Some(tab) = pane.tabs.get_mut(tab_idx) {
+            tab.cursors = vec![Cursor::new(jump)];
+        }
+    }
+    s.ensure_visible();
+    true
+}
+
 fn perform_drop(s: &mut State, drag: DragState) {
     let (src_pid, src_tidx) = (drag.source_pane, drag.source_tab);
     let Some(dst_pid) = drag.over_pane else { return };
@@ -1294,6 +1493,12 @@ fn lsp_installed_for(s: &State, lang: Lang, host: Option<&vpath::SshHost>) -> Op
     }
 }
 
+fn settings_tab_open(s: &State) -> bool {
+    s.panes.values().any(|p| {
+        p.kind == PaneKind::Editor && p.tabs.iter().any(|t| t.kind == TabKind::Settings)
+    })
+}
+
 fn check_lsp_binaries(s: &mut State) {
     let langs = [Lang::TypeScript, Lang::Rust, Lang::Python];
     if let Some(host) = lsp_scope_host(s) {
@@ -1320,6 +1525,12 @@ fn check_lsp_binaries(s: &mut State) {
                 .map(|o| o.status.success()).unwrap_or(false)
         });
         s.lsp_installed.insert(lang, installed);
+    }
+}
+
+fn check_lsp_binaries_if_settings_open(s: &mut State) {
+    if settings_tab_open(s) {
+        check_lsp_binaries(s);
     }
 }
 
@@ -1438,6 +1649,8 @@ struct State {
     term_buttons_held: u8,  // bitmask: bit0=left, bit1=mid, bit2=right
     term_sel:    Option<TermSel>,  // text selection in the active terminal
     term_selecting: bool,          // true while left-drag selecting in terminal
+    lsp_output_sel: Option<(usize, OutputSel)>, // (pane_id, absolute output-line selection)
+    lsp_output_selecting: bool,
     term_click_count:     u32,
     term_last_click_time: Instant,
     term_last_click_row:  usize,
@@ -1514,6 +1727,54 @@ impl TermSel {
     fn is_empty(&self) -> bool {
         self.start_vi == self.end_vi && self.start_col == self.end_col
     }
+}
+
+#[derive(Clone)]
+struct OutputSel {
+    start_line: usize,
+    start_col:  usize,
+    end_line:   usize,
+    end_col:    usize,
+}
+
+impl OutputSel {
+    fn normalized(&self) -> ((usize, usize), (usize, usize)) {
+        let start = (self.start_line, self.start_col);
+        let end = (self.end_line, self.end_col);
+        if start <= end { (start, end) } else { (end, start) }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.start_line == self.end_line && self.start_col == self.end_col
+    }
+
+    fn range_for_line(&self, line: usize, line_len: usize) -> Option<(usize, usize)> {
+        if self.is_empty() { return None; }
+        let ((sl, sc), (el, ec)) = self.normalized();
+        if line < sl || line > el { return None; }
+        let start = if line == sl { sc.min(line_len) } else { 0 };
+        let end = if line == el { ec.min(line_len) } else { line_len };
+        if end > start { Some((start, end)) } else { None }
+    }
+}
+
+fn slice_chars(s: &str, start: usize, end: usize) -> String {
+    s.chars().skip(start).take(end.saturating_sub(start)).collect()
+}
+
+fn output_selection_text(op: &OutputPane, sel: &OutputSel) -> String {
+    if sel.is_empty() { return String::new(); }
+    let ((sl, sc), (el, ec)) = sel.normalized();
+    let mut out = String::new();
+    for line_idx in sl..=el {
+        if line_idx > sl { out.push('\n'); }
+        let Some(line) = op.lines.get(line_idx) else { continue };
+        let line_len = line.chars().count();
+        let start = if line_idx == sl { sc.min(line_len) } else { 0 };
+        let end = if line_idx == el { ec.min(line_len) } else { line_len };
+        out.push_str(&slice_chars(line, start, end));
+    }
+    out
 }
 
 fn clipboard_write(text: &str) {
@@ -2247,16 +2508,20 @@ fn open_or_reuse_tab(s: &mut State, path: VPath) {
         s.active_pane = id;
         id
     };
+    let mut reused_existing = false;
     let (loaded, target_tab_idx) = {
         let pane = s.panes.get_mut(&ap).unwrap();
         for i in 0..pane.tabs.len() {
             if pane.tabs[i].kind == TabKind::GitDiff { continue; }
             if pane.tabs[i].path.as_ref() == Some(&path) {
                 pane.active = i;
-                return;
+                reused_existing = true;
+                break;
             }
         }
-        if pane.tab().kind != TabKind::GitDiff && pane.tab().is_empty_untitled() {
+        if reused_existing {
+            (true, pane.active)
+        } else if pane.tab().kind != TabKind::GitDiff && pane.tab().is_empty_untitled() {
             let loaded = pane.tab_mut().load_file(path.clone());
             (loaded, pane.active)
         } else {
@@ -2268,10 +2533,15 @@ fn open_or_reuse_tab(s: &mut State, path: VPath) {
             (loaded, pane.active)
         }
     };
+    if reused_existing {
+        notify_lsp_open(s, &path);
+        return;
+    }
     if !loaded {
         match &path {
             VPath::Remote { .. } => {
                 begin_remote_tab_read(s, ap, target_tab_idx, path.clone());
+                return;
             }
             VPath::Local(_) => {
                 // Local file that failed to load (too large).
@@ -2300,12 +2570,7 @@ fn apply_goto_definition(s: &mut State, result: &serde_json::Value, ssh_host: Op
     let col  = loc["range"]["start"]["character"].as_u64().unwrap_or(0) as usize;
     let Some(path) = lsp_uri_to_vpath(uri, ssh_host.as_ref()) else { return };
     push_cursor_history(s);
-    open_or_reuse_tab(s, path);
-    let target_line = line.min(s.tab().text.len_lines().saturating_sub(1));
-    let target_col = col.min(State::line_len(&s.tab().text, target_line));
-    let pos = s.tab().text.line_to_char(target_line) + target_col;
-    s.tab_mut().cursors = vec![Cursor::new(pos)];
-    s.ensure_visible();
+    jump_to_path_line_col(s, path, line, col);
 }
 
 fn apply_references(s: &mut State, result: &serde_json::Value, ssh_host: Option<vpath::SshHost>) {
@@ -2449,6 +2714,30 @@ fn term_word_bounds(row: &[terminal::Cell], col: usize) -> (usize, usize) {
     (lo, hi)
 }
 
+fn lsp_output_pos_at(s: &State, pane_id: usize, mx: i32, my: i32) -> Option<(usize, usize)> {
+    let op = s.lsp_panes.get(&pane_id)?;
+    let rect = layout_tree(&s.pane_tree, s.pane_area()).into_iter()
+        .find(|(id, _)| *id == pane_id)
+        .map(|(_, r)| r)?;
+    let content_y = rect.y + s.tab_h();
+    if my < content_y { return None; }
+
+    let lh = s.glyphs.lh.max(1);
+    let cw = s.glyphs.cw.max(1);
+    let content_h = (rect.h - s.tab_h()).max(0);
+    let visible_rows = (content_h / lh).max(1) as usize;
+    let row = ((my - content_y) / lh).clamp(0, visible_rows.saturating_sub(1) as i32) as usize;
+    let line = if op.lines.is_empty() {
+        0
+    } else {
+        (op.scroll + row).min(op.lines.len().saturating_sub(1))
+    };
+    let line_len = op.lines.get(line).map(|s| s.chars().count()).unwrap_or(0);
+    let text_x = rect.x + 4;
+    let col = ((mx - text_x + cw / 2).max(0) / cw) as usize;
+    Some((line, col.min(line_len)))
+}
+
 fn open_token(s: &mut State, token: &str) {
     if token.is_empty() { return; }
     if token.starts_with("http://") || token.starts_with("https://") {
@@ -2469,6 +2758,12 @@ fn open_token(s: &mut State, token: &str) {
 fn notify_lsp_open(s: &mut State, path: &VPath) {
     let lang = Lang::from_path(path.as_path());
     if lang == Lang::None { return; }
+    let text = s.panes.values()
+        .filter(|p| p.kind == PaneKind::Editor)
+        .flat_map(|p| p.tabs.iter())
+        .find(|t| t.path.as_ref() == Some(path))
+        .map(|t| t.text.to_string());
+    let Some(text) = text else { return; };
     let ssh_host = path.ssh_host().cloned();
     // Start server if not running
     if !s.lsp.has_server_for_lang_host(lang, ssh_host.as_ref()) {
@@ -2504,12 +2799,10 @@ fn notify_lsp_open(s: &mut State, path: &VPath) {
         }
     }
     // Send didOpen to the server for this language
-    let text = {
-        let ap = s.active_pane;
-        s.panes.get(&ap).and_then(|p| p.tabs.get(p.active)).map(|t| t.text.to_string())
-    };
-    if let Some(text) = text {
-        if let Some(srv) = s.lsp.server_for_lang_host_mut(lang, path.ssh_host()) {
+    if let Some(srv) = s.lsp.server_for_lang_host_mut(lang, path.ssh_host()) {
+        if srv.doc_version.contains_key(path) {
+            lsp::notify_did_change(srv, path, &text);
+        } else {
             lsp::notify_did_open(srv, path, &text);
         }
     }
@@ -2528,7 +2821,11 @@ fn notify_lsp_change(s: &mut State) {
         (path, tab.text.to_string(), lang)
     };
     if let Some(srv) = s.lsp.server_for_lang_host_mut(lang, path.ssh_host()) {
-        lsp::notify_did_change(srv, &path, &text);
+        if srv.doc_version.contains_key(&path) {
+            lsp::notify_did_change(srv, &path, &text);
+        } else {
+            lsp::notify_did_open(srv, &path, &text);
+        }
     }
 }
 
@@ -4606,6 +4903,7 @@ fn execute_command(s: &mut State, action: CommandAction) {
             }
         }
         CommandAction::OpenMarkdownPreview => open_markdown_preview(s),
+        CommandAction::OpenLspOutput => open_lsp_output_for_context(s),
         CommandAction::OpenRemoteDirectory => {
             let query = s.quick_finder.query.trim().to_owned();
             if query.starts_with("ssh://") {
@@ -5145,8 +5443,12 @@ impl ApplicationHandler<UserEvent> for App {
             ssh::ensure_control_master(host, self.proxy.clone());
         }
 
+        let mut initial_lsp_path: Option<VPath> = None;
         if let Some(path) = file_arg {
-            if !initial_pane.tabs[0].load_file(path.clone()) && path.as_local_path().is_some() {
+            let loaded = initial_pane.tabs[0].load_file(path.clone());
+            if loaded {
+                initial_lsp_path = Some(path.clone());
+            } else if path.as_local_path().is_some() {
                 startup_status = Some(format!("File too large to open (>256 MB): {path}"));
             }
             // Remote files: async load triggered via ensure_control_master → SshConnected
@@ -5158,7 +5460,7 @@ impl ApplicationHandler<UserEvent> for App {
         let explorer = dir_arg.map(FileExplorer::new);
         let sz = win.inner_size();
 
-        let s = State {
+        let mut s = State {
             win,
             renderer,
             w: sz.width,
@@ -5196,6 +5498,8 @@ impl ApplicationHandler<UserEvent> for App {
             term_buttons_held: 0,
             term_sel:        None,
             term_selecting:  false,
+            lsp_output_sel: None,
+            lsp_output_selecting: false,
             term_click_count:     0,
             term_last_click_time: Instant::now() - Duration::from_secs(1),
             term_last_click_row:  0,
@@ -5250,6 +5554,9 @@ impl ApplicationHandler<UserEvent> for App {
             collab_file_list: Vec::new(),
         };
 
+        if let Some(path) = initial_lsp_path {
+            notify_lsp_open(&mut s, &path);
+        }
         s.win.request_redraw();
         self.state = Some(s);
         self.apply_vsync_setting();
@@ -5404,7 +5711,24 @@ impl ApplicationHandler<UserEvent> for App {
                         s.win.set_cursor(cursor);
                     }
                 }
-                if s.mouse_down && s.panes.contains_key(&s.active_pane) {
+                if s.lsp_output_selecting {
+                    let pane_id = s.lsp_output_sel.as_ref()
+                        .map(|(pid, _)| *pid)
+                        .unwrap_or(s.active_pane);
+                    if let Some((line, col)) = lsp_output_pos_at(s, pane_id, mx, my) {
+                        if let Some((sel_pid, sel)) = s.lsp_output_sel.as_mut() {
+                            if *sel_pid == pane_id {
+                                sel.end_line = line;
+                                sel.end_col = col;
+                            }
+                        }
+                    }
+                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                    return;
+                }
+                if s.mouse_down
+                    && s.panes.get(&s.active_pane).map_or(false, |p| p.kind == PaneKind::Editor && !p.tabs.is_empty())
+                {
                     let pos = s.xy_to_char(mx, my);
                     s.tab_mut().primary_mut().head = pos;
                     s.ensure_visible();
@@ -5491,7 +5815,11 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 s.mouse_down = false;
                 s.term_selecting = false;
+                s.lsp_output_selecting = false;
                 if s.term_sel.as_ref().map_or(false, |sel| sel.is_empty()) { s.term_sel = None; }
+                if s.lsp_output_sel.as_ref().map_or(false, |(_, sel)| sel.is_empty()) {
+                    s.lsp_output_sel = None;
+                }
                 s.drag_pending = None;
                 if let Some(drag) = s.drag.take() {
                     perform_drop(s, drag);
@@ -5898,23 +6226,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 CtxAction::TabClose => {
                                     if let Some((pid, ti)) = tab_source {
                                         s.active_pane = pid;
-                                        if s.panes.get(&pid).map_or(0, |p| p.tabs.len()) > 1 {
-                                            let pane = s.panes.get_mut(&pid).unwrap();
-                                            let closed = pane.tabs.remove(ti);
-                                            if let Some(ref p) = closed.path {
-                                                let lang = Lang::from_path(p.as_path());
-                                                if let Some(srv) = s.lsp.server_for_lang_host_mut(lang, p.ssh_host()) {
-                                                    lsp::notify_did_close(srv, p);
-                                                }
-                                            }
-                                            if pane.active >= pane.tabs.len() { pane.active = pane.tabs.len() - 1; }
-                                        } else if s.panes.len() > 1 {
-                                            s.md_panes.remove(&pid);
-                                            s.panes.remove(&pid);
-                                            let old_tree = std::mem::replace(&mut s.pane_tree, PaneTree::Leaf(0));
-                                            if let Some(t) = remove_pane_from_tree(old_tree, pid) { s.pane_tree = t; }
-                                            s.active_pane = layout_tree(&s.pane_tree, s.pane_area()).first().map(|(id, _)| *id).unwrap_or(0);
-                                        } else {
+                                        if close_editor_tab(s, pid, ti) {
                                             s.panes.clear();
                                             el.exit();
                                         }
@@ -6090,10 +6402,7 @@ impl ApplicationHandler<UserEvent> for App {
                             if idx < sev_items.len() {
                                 s.diag_panel_sel = idx;
                                 let (_, path, line) = sev_items[idx].clone();
-                                open_or_reuse_tab(s, path);
-                                let pos = s.tab().text.line_to_char(line);
-                                s.tab_mut().cursors = vec![Cursor::new(pos)];
-                                s.ensure_visible();
+                                jump_to_path_line_col(s, path, line, 0);
                             }
                         }
                     } else if s.left_view == LeftView::Git {
@@ -6251,12 +6560,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 s.global_find.selected = ri;
                                 s.global_find.focus    = GlobalFindFocus::Results;
                                 let r = s.global_find.results[ri].clone();
-                                open_or_reuse_tab(s, r.path.clone());
-                                let line = r.line_num;
-                                let col  = r.match_col;
-                                let pos  = s.tab().text.line_to_char(line) + col;
-                                s.tab_mut().cursors = vec![Cursor::new(pos)];
-                                s.ensure_visible();
+                                jump_to_path_line_col(s, r.path, r.line_num, r.match_col);
                             }
                         }
                     }
@@ -6298,28 +6602,13 @@ impl ApplicationHandler<UserEvent> for App {
                                 if mx >= tx + tw - cw {
                                     // × close
                                     s.active_pane = clicked_pane_id;
-                                    let tid = s.panes.get_mut(&clicked_pane_id).unwrap().term_ids.remove(i);
-                                    s.term_panes.remove(&tid);
-                                    let pane = s.panes.get_mut(&clicked_pane_id).unwrap();
-                                    if pane.term_ids.is_empty() {
-                                        s.panes.remove(&clicked_pane_id);
-                                        if s.panes.is_empty() {
-                                            el.exit();
-                                            { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
-                                            return;
-                                        }
-                                        let old_tree = std::mem::replace(&mut s.pane_tree, PaneTree::Leaf(0));
-                                        if let Some(t) = remove_pane_from_tree(old_tree, clicked_pane_id) {
-                                            s.pane_tree = t;
-                                        }
-                                        let new_active = layout_tree(&s.pane_tree, s.pane_area())
-                                            .first().map(|(id, _)| *id).unwrap_or(0);
-                                        s.active_pane = new_active;
-                                    } else {
-                                        if pane.active >= pane.term_ids.len() {
-                                            pane.active = pane.term_ids.len() - 1;
-                                        }
+                                    if close_terminal_tab(s, clicked_pane_id, i) {
+                                        s.panes.clear();
+                                        el.exit();
+                                        { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                                        return;
                                     }
+                                    check_lsp_binaries_if_settings_open(s);
                                 } else {
                                     s.panes.get_mut(&clicked_pane_id).unwrap().active = i;
                                     s.active_pane = clicked_pane_id;
@@ -6349,19 +6638,7 @@ impl ApplicationHandler<UserEvent> for App {
                             if mx >= tx + tw - cw {
                                 s.active_pane = clicked_pane_id;
                                 let pane_id = clicked_pane_id;
-                                if s.panes[&pane_id].tabs.len() > 1 {
-                                    let pane = s.panes.get_mut(&pane_id).unwrap();
-                                    pane.tabs.remove(i);
-                                    if pane.active >= pane.tabs.len() { pane.active = pane.tabs.len() - 1; }
-                                } else if s.panes.len() > 1 {
-                                    s.panes.remove(&pane_id);
-                                    let old_tree = std::mem::replace(&mut s.pane_tree, PaneTree::Leaf(0));
-                                    if let Some(new_tree) = remove_pane_from_tree(old_tree, pane_id) {
-                                        s.pane_tree = new_tree;
-                                    }
-                                    let new_active = layout_tree(&s.pane_tree, s.pane_area()).first().map(|(id, _)| *id).unwrap_or(0);
-                                    s.active_pane = new_active;
-                                } else {
+                                if close_editor_tab(s, pane_id, i) {
                                     s.panes.clear();
                                     el.exit();
                                 }
@@ -6457,6 +6734,25 @@ impl ApplicationHandler<UserEvent> for App {
                                     }
                                 }
                             }
+                        }
+                    }
+                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                    return;
+                }
+                if s.panes[&clicked_pane_id].kind == PaneKind::LspOutput {
+                    let content_y = pane_rect.y + tab_h;
+                    if my >= content_y {
+                        if let Some((line, col)) = lsp_output_pos_at(s, clicked_pane_id, mx, my) {
+                            s.lsp_output_sel = Some((clicked_pane_id, OutputSel {
+                                start_line: line,
+                                start_col: col,
+                                end_line: line,
+                                end_col: col,
+                            }));
+                            s.lsp_output_selecting = true;
+                        } else {
+                            s.lsp_output_sel = None;
+                            s.lsp_output_selecting = false;
                         }
                     }
                     { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
@@ -7426,10 +7722,7 @@ impl ApplicationHandler<UserEvent> for App {
                             if idx < sev_items.len() {
                                 let (_, path, line) = sev_items[idx].clone();
                                 push_cursor_history(s);
-                                open_or_reuse_tab(s, path);
-                                let pos = s.tab().text.line_to_char(line);
-                                s.tab_mut().cursors = vec![Cursor::new(pos)];
-                                s.ensure_visible();
+                                jump_to_path_line_col(s, path, line, 0);
                             }
                         }
                         _ => {}
@@ -7454,12 +7747,7 @@ impl ApplicationHandler<UserEvent> for App {
                         Key::Named(NamedKey::Enter) => {
                             let r = s.global_find.results[s.global_find.selected].clone();
                             push_cursor_history(s);
-                            open_or_reuse_tab(s, r.path.clone());
-                            let line = r.line_num;
-                            let col  = r.match_col;
-                            let pos  = s.tab().text.line_to_char(line) + col;
-                            s.tab_mut().cursors = vec![Cursor::new(pos)];
-                            s.ensure_visible();
+                            jump_to_path_line_col(s, r.path, r.line_num, r.match_col);
                         }
                         _ => {}
                     }
@@ -7537,32 +7825,13 @@ impl ApplicationHandler<UserEvent> for App {
                     // Cmd+W — close active terminal tab or pane
                     if cmd && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "w") {
                         let pane_id = s.active_pane;
-                        let n = s.panes[&pane_id].term_ids.len();
-                        if n > 1 {
-                            let idx = s.panes[&pane_id].active;
-                            let tid = s.panes.get_mut(&pane_id).unwrap().term_ids.remove(idx);
-                            s.term_panes.remove(&tid);
-                            let pane = s.panes.get_mut(&pane_id).unwrap();
-                            if pane.active >= pane.term_ids.len() {
-                                pane.active = pane.term_ids.len().saturating_sub(1);
-                            }
-                        } else {
-                            let tids: Vec<usize> = s.panes.get(&pane_id)
-                                .map(|p| p.term_ids.clone()).unwrap_or_default();
-                            for tid in tids { s.term_panes.remove(&tid); }
-                            s.panes.remove(&pane_id);
-                            if s.panes.is_empty() {
-                                s.pane_tree  = PaneTree::Leaf(0);
-                                s.active_pane = 0;
-                                el.exit();
-                                return;
-                            }
-                            let old_tree = std::mem::replace(&mut s.pane_tree, PaneTree::Leaf(0));
-                            if let Some(t) = remove_pane_from_tree(old_tree, pane_id) { s.pane_tree = t; }
-                            let new_active = layout_tree(&s.pane_tree, s.pane_area())
-                                .first().map(|(id, _)| *id).unwrap_or(0);
-                            s.active_pane = new_active;
+                        let idx = s.panes.get(&pane_id).map(|p| p.active).unwrap_or(0);
+                        if close_terminal_tab(s, pane_id, idx) {
+                            s.panes.clear();
+                            el.exit();
+                            return;
                         }
+                        check_lsp_binaries_if_settings_open(s);
                         { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                         return;
                     }
@@ -7704,24 +7973,38 @@ impl ApplicationHandler<UserEvent> for App {
                         let pane_id = s.active_pane;
                         s.md_panes.remove(&pane_id);
                         s.panes.remove(&pane_id);
-                        if s.panes.is_empty() {
-                            s.pane_tree  = PaneTree::Leaf(0);
-                            s.active_pane = 0;
+                        if remove_pane_from_layout(s, pane_id) {
+                            s.panes.clear();
                             el.exit();
                             return;
                         }
-                        let old_tree = std::mem::replace(&mut s.pane_tree, PaneTree::Leaf(0));
-                        if let Some(t) = remove_pane_from_tree(old_tree, pane_id) { s.pane_tree = t; }
-                        let new_active = layout_tree(&s.pane_tree, s.pane_area())
-                            .first().map(|(id, _)| *id).unwrap_or(0);
-                        s.active_pane = new_active;
                         { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                     }
                     return;
                 }
 
-                // LspOutput pane: read-only, ignore all input except pane-switch shortcuts
+                // LspOutput pane: read-only, Cmd+W hides the pane.
                 if s.panes.get(&s.active_pane).map_or(false, |p| p.kind == PaneKind::LspOutput) {
+                    if cmd && matches!(&event.logical_key, Key::Character(c) if matches!(c.as_str(), "c" | "C")) {
+                        if let Some((pane_id, sel)) = s.lsp_output_sel.clone() {
+                            if pane_id == s.active_pane && !sel.is_empty() {
+                                if let Some(op) = s.lsp_panes.get(&pane_id) {
+                                    let text = output_selection_text(op, &sel);
+                                    if !text.is_empty() { clipboard_write(&text); }
+                                }
+                            }
+                        }
+                        return;
+                    }
+                    if cmd && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "w") {
+                        let pane_id = s.active_pane;
+                        if hide_lsp_output_pane(s, pane_id) {
+                            s.panes.clear();
+                            el.exit();
+                            return;
+                        }
+                        { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                    }
                     return;
                 }
 
@@ -7771,17 +8054,14 @@ impl ApplicationHandler<UserEvent> for App {
                         let pane_id = s.active_pane;
                         if s.panes.get(&pane_id).and_then(|p| p.tabs.get(p.active))
                                 .map_or(false, |t| t.kind == TabKind::Settings) {
-                            let pane = s.panes.get_mut(&pane_id).unwrap();
-                            pane.tabs.remove(pane.active);
-                            if pane.active >= pane.tabs.len() && !pane.tabs.is_empty() {
-                                pane.active = pane.tabs.len() - 1;
+                            let tab_idx = s.panes.get(&pane_id).map(|p| p.active).unwrap_or(0);
+                            if close_editor_tab(s, pane_id, tab_idx) {
+                                s.panes.clear();
+                                el.exit();
                             }
-                            if !pane.tabs.is_empty() {
-                                s.needs_redraw = true;
-                                self.dirty.store(true, Ordering::Release);
-                                return;
-                            }
-                            // else: no tabs left → fall through to normal Cmd+W pane-close logic
+                            s.needs_redraw = true;
+                            self.dirty.store(true, Ordering::Release);
+                            return;
                         }
                     }
 
@@ -7896,29 +8176,11 @@ impl ApplicationHandler<UserEvent> for App {
                             true
                         } else if cmd && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "w") {
                             let pane_id = s.active_pane;
-                            // Terminal panes are handled before PTY forwarding; only editor/lsp reach here
-                            let pane = s.panes.get_mut(&pane_id).unwrap();
-                            if pane.tabs.len() > 1 {
-                                let closed = pane.tabs.remove(pane.active);
-                                if let Some(ref p) = closed.path {
-                                    let lang = Lang::from_path(p.as_path());
-                                    if let Some(srv) = s.lsp.server_for_lang_host_mut(lang, p.ssh_host()) {
-                                        lsp::notify_did_close(srv, p);
-                                    }
-                                }
-                                if pane.active >= pane.tabs.len() { pane.active = pane.tabs.len() - 1; }
-                            } else if s.panes.len() > 1 {
-                                s.panes.remove(&pane_id);
-                                let old_tree = std::mem::replace(&mut s.pane_tree, PaneTree::Leaf(0));
-                                if let Some(new_tree) = remove_pane_from_tree(old_tree, pane_id) {
-                                    s.pane_tree = new_tree;
-                                }
-                                let new_active = layout_tree(&s.pane_tree, s.pane_area())
-                                    .first().map(|(id, _)| *id).unwrap_or(0);
-                                s.active_pane = new_active;
-                            } else {
+                            let tab_idx = s.panes.get(&pane_id).map(|p| p.active).unwrap_or(0);
+                            if close_editor_tab(s, pane_id, tab_idx) {
                                 s.panes.clear();
                                 el.exit();
+                                return;
                             }
                             true
                         } else if cmd && !shift && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "\\") {
@@ -8180,10 +8442,15 @@ impl ApplicationHandler<UserEvent> for App {
     fn user_event(&mut self, _el: &ActiveEventLoop, event: UserEvent) {
         let Some(s) = self.state.as_mut() else { return };
         if s.panes.is_empty() { return; }
+        // Background events can arrive in bursts, especially PTY output. Mark
+        // dirty here and let about_to_wait/display-link coalesce redraws.
+        let mut schedule_redraw = true;
         match event {
             UserEvent::TermOutput { pane_id, data } => {
+                schedule_redraw = false;
                 if let Some(tp) = s.term_panes.get_mut(&pane_id) {
                     terminal::feed_bytes(tp, &data);
+                    schedule_redraw = true;
                 }
             }
             UserEvent::LspOutput { pane_id, data } => {
@@ -8243,6 +8510,11 @@ impl ApplicationHandler<UserEvent> for App {
                         format!("{bin} failed to initialize on {scope}; check LSP output")
                     };
                     s.lsp_start_errors.insert((srv.ssh_host, srv.lang), msg.clone());
+                    if let Some(op) = s.lsp_panes.get_mut(&server_id) {
+                        op.lines.push(format!("[local-text] {msg}"));
+                        op.scroll = op.lines.len().saturating_sub(1);
+                    }
+                    show_lsp_output_pane(s, server_id);
                     s.status_msg = Some(msg);
                 }
                 s.needs_redraw = true;
@@ -8359,7 +8631,11 @@ impl ApplicationHandler<UserEvent> for App {
                 trigger_git_status_refresh(s);
                 s.needs_redraw = true;
             }
-            UserEvent::Redraw => {}
+            UserEvent::Redraw => {
+                s.needs_redraw = false;
+                s.win.request_redraw();
+                return;
+            }
 
             // ── SSH remote events ─────────────────────────────────────────────
             UserEvent::SshConnecting { host } => {
@@ -8415,6 +8691,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // Always clear the token so it doesn't linger; only insert content
                 // if the tab is still clean (user hasn't typed anything yet).
                 let mut content_dropped = false;
+                let mut content_loaded = false;
                 for pane in s.panes.values_mut() {
                     for tab in pane.tabs.iter_mut() {
                         if tab.path.as_ref() == Some(&path) && tab.remote_load_token == Some(token) {
@@ -8426,6 +8703,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 tab.hl_color_cache.clear();
                                 tab.max_line_len = None;
                                 tab.edit_generation += 1;
+                                content_loaded = true;
                             } else {
                                 content_dropped = true;
                             }
@@ -8437,6 +8715,9 @@ impl ApplicationHandler<UserEvent> for App {
                         "Remote load: tab was edited before {} arrived — content discarded",
                         path.display_short()
                     ));
+                }
+                if content_loaded {
+                    notify_lsp_open(s, &path);
                 }
                 s.needs_redraw = true;
                 self.dirty.store(true, Ordering::Release);
@@ -8654,7 +8935,14 @@ impl ApplicationHandler<UserEvent> for App {
                 self.dirty.store(true, Ordering::Release);
             }
         }
-        s.win.request_redraw();
+        if schedule_redraw {
+            s.needs_redraw = true;
+            self.dirty.store(true, Ordering::Release);
+            if s.settings.vsync && self.display_link.is_none() {
+                s.needs_redraw = false;
+                s.win.request_redraw();
+            }
+        }
     }
 }
 
@@ -8869,6 +9157,7 @@ fn render(s: &mut State) {
     }
 
     // Build LSP output pane snapshots
+    let active_output_sel = s.lsp_output_sel.clone();
     struct OutPaneSnap {
         rect:          Rect,
         is_active:     bool,
@@ -8876,6 +9165,7 @@ fn render(s: &mut State) {
         title:         String,
         total_lines:   usize,
         scroll:        usize,
+        sel:           Option<OutputSel>,
     }
     let out_snaps: Vec<OutPaneSnap> = layout.iter().filter_map(|&(pid, rect)| {
         let pane = s.panes.get(&pid)?;
@@ -8893,6 +9183,8 @@ fn render(s: &mut State) {
             title: op.title.clone(),
             total_lines: op.lines.len(),
             scroll,
+            sel: active_output_sel.as_ref()
+                .and_then(|(sel_pid, sel)| if *sel_pid == pid && pid == active_pane_id { Some(sel.clone()) } else { None }),
         })
     }).collect();
 
@@ -9239,7 +9531,7 @@ fn render(s: &mut State) {
                     }
                 } else {
                     match installed {
-                        Some(true)  => ("not started".to_owned(), false, false),
+                        Some(true)  => ("installed".to_owned(), false, false),
                         Some(false) => ("not found".to_owned(), false, true),
                         None if check_failed || connection_failed => ("check failed".to_owned(), false, false),
                         None        => ("checking".to_owned(), false, false),
@@ -10652,6 +10944,14 @@ fn render(s: &mut State) {
             for (vi, line) in snap.visible_lines.iter().enumerate() {
                 let py       = r.y + tab_h + vi as i32 * lh;
                 let baseline = py + asc;
+                let line_idx = snap.scroll + vi;
+                if let Some((sel_start, sel_end)) = snap.sel.as_ref()
+                    .and_then(|sel| sel.range_for_line(line_idx, line.chars().count()))
+                {
+                    let x0 = (r.x + 4 + sel_start as i32 * cw).min(r.x + r.w).max(r.x + 4);
+                    let x1 = (r.x + 4 + sel_end as i32 * cw).min(r.x + r.w).max(x0);
+                    if x1 > x0 { fill(buf, w, h, x0, py, x1 - x0, lh, SEL_BG); }
+                }
                 draw_str(buf, w, h, g, line, r.x + 4, baseline, FG_DIM, r.x + r.w);
             }
             // Scrollbar

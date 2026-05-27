@@ -8,6 +8,8 @@
 
 use std::collections::VecDeque;
 use std::ffi::CString;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use vte::{Perform, Parser};
 use winit::event_loop::EventLoopProxy;
 use winit::keyboard::{Key, ModifiersState, NamedKey};
@@ -494,6 +496,9 @@ pub struct TermPane {
     pub grid:    TermGrid,
     parser:      Parser,
     pub pty_fd:  i32,
+    child_pid:   libc::pid_t,
+    child_alive: Arc<AtomicBool>,
+    closed:      Arc<AtomicBool>,
     pub _reader: std::thread::JoinHandle<()>,
     pub title:   String,
     pub shell:   String,
@@ -501,9 +506,19 @@ pub struct TermPane {
 
 impl Drop for TermPane {
     fn drop(&mut self) {
+        self.closed.store(true, Ordering::Release);
+        if self.child_pid > 0 && self.child_alive.load(Ordering::Acquire) {
+            // Ask the whole terminal session to exit, then fall back to the
+            // shell process itself in case it is not the process-group leader.
+            unsafe {
+                let _ = libc::kill(-self.child_pid, libc::SIGHUP);
+                let _ = libc::kill(self.child_pid, libc::SIGHUP);
+            }
+        }
         if self.pty_fd >= 0 {
             // SAFETY: pty_fd is a valid open file descriptor owned by this TermPane.
             unsafe { libc::close(self.pty_fd); }
+            self.pty_fd = -1;
         }
     }
 }
@@ -599,19 +614,37 @@ pub fn spawn_terminal_with_shell(pane_id: usize, cols: usize, rows: usize,
     }
 
     // Parent: spawn reader thread
+    let closed = Arc::new(AtomicBool::new(false));
+    let child_alive = Arc::new(AtomicBool::new(true));
+    let reader_closed = Arc::clone(&closed);
+    let reader_child_alive = Arc::clone(&child_alive);
     let reader = std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
         loop {
+            if reader_closed.load(Ordering::Acquire) { break; }
             // SAFETY: master_fd is a valid open PTY master fd; buf is a mutable
             // stack-allocated slice sized to match the length argument.
             let n = unsafe { libc::read(master_fd, buf.as_mut_ptr().cast(), buf.len()) };
+            if n < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EINTR) { continue; }
+                let _ = proxy.send_event(UserEvent::Redraw);
+                break;
+            }
             if n <= 0 {
                 let _ = proxy.send_event(UserEvent::Redraw);
                 break;
             }
+            if reader_closed.load(Ordering::Acquire) { break; }
             // Box<[u8]> carries exactly n bytes with no excess capacity.
             let data: Box<[u8]> = buf[..n as usize].into();
             if proxy.send_event(UserEvent::TermOutput { pane_id, data }).is_err() { break; }
+        }
+        if pid > 0 {
+            let mut status: libc::c_int = 0;
+            // Reap the forked shell/ssh process off the UI thread.
+            unsafe { let _ = libc::waitpid(pid, &mut status, 0); }
+            reader_child_alive.store(false, Ordering::Release);
         }
     });
 
@@ -620,6 +653,9 @@ pub fn spawn_terminal_with_shell(pane_id: usize, cols: usize, rows: usize,
         grid: TermGrid::new(cols, rows),
         parser: Parser::new(),
         pty_fd: master_fd,
+        child_pid: pid,
+        child_alive,
+        closed,
         _reader: reader,
         title: "Terminal".to_owned(),
         shell,

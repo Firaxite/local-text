@@ -392,15 +392,35 @@ fn remote_command(argv: &[&str]) -> String {
 }
 
 fn lsp_path_setup(path_dirs: &[String]) -> String {
-    if path_dirs.is_empty() {
-        return String::new();
-    }
-    let mut path = "$PATH".to_owned();
+    let mut script = String::from("PATH=${PATH:-}\n");
     for dir in path_dirs.iter().filter(|dir| !dir.is_empty()) {
-        path.push(':');
-        path.push_str(&remote_path_component_expr(dir));
+        let expr = remote_path_component_expr(dir);
+        script.push_str(&format!("if [ -d {expr} ]; then PATH={expr}:\"$PATH\"; fi\n"));
     }
-    format!("PATH={path}\nexport PATH\n")
+    script.push_str(
+        r#"for d in \
+    "$HOME"/.nvm/versions/node/*/bin \
+    "$HOME"/.volta/bin \
+    "$HOME"/.asdf/shims \
+    "$HOME"/.asdf/installs/nodejs/*/bin \
+    "$HOME"/.fnm/node-versions/*/installation/bin \
+    "$HOME"/.local/share/fnm/node-versions/*/installation/bin \
+    "$HOME"/.bun/bin \
+    "$HOME"/.yarn/bin \
+    "$HOME"/.config/yarn/global/node_modules/.bin \
+    "$HOME"/.local/share/pnpm; do
+    if [ -d "$d" ]; then PATH="$d:$PATH"; fi
+done
+if command -v npm >/dev/null 2>&1; then
+    npm_prefix=$(npm config get prefix 2>/dev/null)
+    if [ -n "$npm_prefix" ] && [ "$npm_prefix" != "undefined" ] && [ -d "$npm_prefix/bin" ]; then
+        PATH="$npm_prefix/bin:$PATH"
+    fi
+fi
+export PATH
+"#,
+    );
+    script
 }
 
 fn remote_path_component_expr(path: &str) -> String {
