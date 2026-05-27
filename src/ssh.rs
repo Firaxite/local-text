@@ -320,7 +320,7 @@ fn open_control_master(host: &SshHost) -> Result<(), String> {
 
 /// Run a command on the remote and capture stdout as a String.
 /// Uses the existing ControlMaster socket (does not create one).
-fn run_ssh_capture(host: &SshHost, remote_argv: &[&str]) -> Result<String, String> {
+pub fn run_ssh_capture(host: &SshHost, remote_argv: &[&str]) -> Result<String, String> {
     // OpenSSH sends the remote command as one shell string. Quote argv ourselves
     // so `sh -c <script>` remains one script instead of leaking lines into the
     // remote login shell with unset variables.

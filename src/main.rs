@@ -598,6 +598,7 @@ struct FileExplorer {
     entries:                 Vec<FileEntry>,
     selected:                usize,
     show_hidden:             bool,
+    tree_scroll:             usize,  // first visible entry index
     tree_search:             String,
     tree_search_cursor:      usize,
     tree_search_sel_anchor:  Option<usize>,
@@ -615,7 +616,7 @@ impl FileExplorer {
             .map(|p| load_dir_entries(p, 0, false))
             .unwrap_or_default();
         FileExplorer {
-            root, entries, selected: 0, show_hidden: false,
+            root, entries, selected: 0, show_hidden: false, tree_scroll: 0,
             tree_search: String::new(), tree_search_cursor: 0, tree_search_sel_anchor: None,
             tree_search_focused: false, tree_search_fuzzy: true,
             tree_search_entries: vec![], tree_search_results: vec![], tree_search_sel: 0,
@@ -1046,7 +1047,7 @@ fn resize_terminal_panes(s: &mut State) {
     for (pid, rect) in layout {
         if s.panes.get(&pid).map_or(false, |p| p.kind == PaneKind::Terminal) {
             let cols = (rect.w / cw).max(1) as usize;
-            let rows = ((rect.h - tab_h) / lh).max(1) as usize;
+            let rows = if rect.h > tab_h { ((rect.h - tab_h) / lh).max(1) as usize } else { 1 };
             let tids: Vec<usize> = s.panes.get(&pid).map(|p| p.term_ids.clone()).unwrap_or_default();
             for tid in tids {
                 if let Some(tp) = s.term_panes.get_mut(&tid) {
@@ -4237,6 +4238,25 @@ fn glob_match_impl(pat: &[char], txt: &[char]) -> bool {
     false
 }
 
+/// Route git status refresh to local or remote implementation based on workspace root.
+fn trigger_git_status_refresh(s: &mut State) {
+    let proxy = s.proxy.clone();
+    if let Some(ex) = &s.explorer {
+        if let Some(host) = ex.root.ssh_host().cloned() {
+            // Remote workspace — run git over SSH.
+            let remote_path = ex.root.as_path().to_string_lossy().into_owned();
+            refresh_git_status_remote(proxy, host, remote_path);
+            return;
+        }
+        if let Some(local) = ex.root.as_local_path() {
+            refresh_git_status(proxy, local.to_path_buf());
+            return;
+        }
+    }
+    // Fallback to current directory.
+    refresh_git_status(proxy, std::env::current_dir().unwrap_or_default());
+}
+
 fn refresh_git_status(proxy: winit::event_loop::EventLoopProxy<UserEvent>, root: PathBuf) {
     std::thread::spawn(move || {
         let out = std::process::Command::new("git")
@@ -4248,6 +4268,53 @@ fn refresh_git_status(proxy: winit::event_loop::EventLoopProxy<UserEvent>, root:
             Ok(o) if o.status.code() == Some(128) => (vec![], vec![], false),
             Ok(o) => {
                 let text = String::from_utf8_lossy(&o.stdout).into_owned();
+                let mut staged   = vec![];
+                let mut unstaged = vec![];
+                for line in text.lines() {
+                    if line.len() < 4 { continue; }
+                    let mut chars = line.chars();
+                    let x = chars.next().unwrap_or(' ');
+                    let y = chars.next().unwrap_or(' ');
+                    let path_part = &line[3..];
+                    let path = if (x == 'R' || y == 'R') && path_part.contains(" -> ") {
+                        path_part.split(" -> ").last().unwrap_or(path_part).to_owned()
+                    } else {
+                        path_part.to_owned()
+                    };
+                    if x != ' ' && x != '?' {
+                        staged.push(GitEntry { xy: (x, y), path: path.clone() });
+                    }
+                    if (y != ' ' && y != '?') || (x == '?' && y == '?') {
+                        unstaged.push(GitEntry { xy: (x, y), path });
+                    }
+                }
+                (staged, unstaged, true)
+            }
+        };
+        let _ = proxy.send_event(UserEvent::GitStatusResult { staged, unstaged, is_git_repo });
+    });
+}
+
+/// Like `refresh_git_status` but runs `git` on the remote host via SSH.
+fn refresh_git_status_remote(
+    proxy: winit::event_loop::EventLoopProxy<UserEvent>,
+    host: vpath::SshHost,
+    remote_path: String,
+) {
+    std::thread::spawn(move || {
+        let result = ssh::run_ssh_capture(
+            &host,
+            &["git", "-C", &remote_path, "status", "--porcelain"],
+        );
+        let (staged, unstaged, is_git_repo) = match result {
+            Err(_) => (vec![], vec![], false),
+            Ok(text) if text.trim().is_empty() => {
+                // Could be a clean repo or not a git repo; treat empty as clean/valid
+                // A non-git-repo would have returned an error via the Err arm above
+                // (ssh exit code non-zero). If git exited 0 with no output → clean repo.
+                (vec![], vec![], true)
+            }
+            Ok(text) => {
                 let mut staged   = vec![];
                 let mut unstaged = vec![];
                 for line in text.lines() {
@@ -4922,6 +4989,7 @@ impl ApplicationHandler<UserEvent> for App {
                 s.drag_pending = None;
                 if let Some(drag) = s.drag.take() {
                     perform_drop(s, drag);
+                    resize_terminal_panes(s); // update PTY size after any layout change
                     { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                 }
                 // Forward release to terminal if mouse reporting enabled
@@ -4983,7 +5051,8 @@ impl ApplicationHandler<UserEvent> for App {
                 {
                     let row = my / lh;
                     if row >= 2 {
-                        let idx = (row - 2) as usize;
+                        let scroll_off = s.explorer.as_ref().map_or(0, |ex| ex.tree_scroll);
+                        let idx = (row - 2) as usize + scroll_off;
                         let entry = s.explorer.as_ref().and_then(|ex| {
                             if !ex.tree_search.is_empty() || idx >= ex.entries.len() || !ex.entries[idx].is_dir {
                                 None
@@ -5365,11 +5434,8 @@ impl ApplicationHandler<UserEvent> for App {
                                 s.global_find.focus = GlobalFindFocus::Query;
                             }
                             if view == LeftView::Git {
-                                let root = s.explorer.as_ref()
-                                    .and_then(|e| e.root.as_local_path().map(|p| p.to_path_buf()))
-                                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
                                 s.git_panel.loading = true;
-                                refresh_git_status(s.proxy.clone(), root);
+                                trigger_git_status_refresh(s);
                             } else {
                                 s.git_panel.commit_focused = false;
                             }
@@ -5444,11 +5510,13 @@ impl ApplicationHandler<UserEvent> for App {
                                 ex.tree_search_sel_anchor = None;
                             }
                         } else if row >= 2 {
-                            let idx = (row - 2) as usize;
+                            let scroll_off = s.explorer.as_ref().map_or(0, |ex| ex.tree_scroll);
+                            let idx = (row - 2) as usize + scroll_off;
                             let in_search = s.explorer.as_ref().map_or(false, |ex| !ex.tree_search.is_empty());
                             if in_search {
+                                let search_idx = (row - 2) as usize; // search results not scrolled
                                 let path = s.explorer.as_ref()
-                                    .and_then(|ex| ex.tree_search_results.get(idx).cloned());
+                                    .and_then(|ex| ex.tree_search_results.get(search_idx).cloned());
                                 if let Some(path) = path { open_or_reuse_tab(s, VPath::Local(path)); }
                             } else {
                                 // Unfocus tree search if clicking entries
@@ -6306,10 +6374,10 @@ impl ApplicationHandler<UserEvent> for App {
                     && mx >= act_w && mx < act_w + s.explorer_w() && dy != 0
                 {
                     let n = s.global_find.results.len();
-                    if dy < 0 {
-                        s.global_find.scroll = (s.global_find.scroll + (-dy) as usize).min(n.saturating_sub(1));
+                    if dy > 0 {
+                        s.global_find.scroll = (s.global_find.scroll + dy as usize).min(n.saturating_sub(1));
                     } else {
-                        s.global_find.scroll = s.global_find.scroll.saturating_sub(dy as usize);
+                        s.global_find.scroll = s.global_find.scroll.saturating_sub((-dy) as usize);
                     }
                     { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                     return;
@@ -6323,6 +6391,15 @@ impl ApplicationHandler<UserEvent> for App {
                         s.git_panel.scroll = (s.git_panel.scroll as i32 + dy)
                             .max(0) as usize;
                         s.git_panel.scroll = s.git_panel.scroll.min(total.saturating_sub(1));
+                    } else if s.left_view == LeftView::FileTree {
+                        if let Some(ref mut ex) = s.explorer {
+                            let n = ex.entries.len();
+                            if dy > 0 {
+                                ex.tree_scroll = (ex.tree_scroll + dy as usize).min(n.saturating_sub(1));
+                            } else {
+                                ex.tree_scroll = ex.tree_scroll.saturating_sub((-dy) as usize);
+                            }
+                        }
                     }
                     { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                     return;
@@ -6387,10 +6464,10 @@ impl ApplicationHandler<UserEvent> for App {
                         if dy != 0 {
                             let op = s.lsp_panes.get_mut(&s.active_pane).unwrap();
                             let max_scroll = op.lines.len().saturating_sub(1);
-                            if dy < 0 {
-                                op.scroll = (op.scroll + (-dy) as usize).min(max_scroll);
+                            if dy > 0 {
+                                op.scroll = (op.scroll + dy as usize).min(max_scroll);
                             } else {
-                                op.scroll = op.scroll.saturating_sub(dy as usize);
+                                op.scroll = op.scroll.saturating_sub((-dy) as usize);
                             }
                             { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                         }
@@ -6405,10 +6482,10 @@ impl ApplicationHandler<UserEvent> for App {
                                 .unwrap_or(1);
                             let mp = s.md_panes.get_mut(&s.active_pane).unwrap();
                             let max_scroll = total.saturating_sub(1);
-                            if dy < 0 {
-                                mp.scroll = (mp.scroll + (-dy) as usize).min(max_scroll);
+                            if dy > 0 {
+                                mp.scroll = (mp.scroll + dy as usize).min(max_scroll);
                             } else {
-                                mp.scroll = mp.scroll.saturating_sub(dy as usize);
+                                mp.scroll = mp.scroll.saturating_sub((-dy) as usize);
                             }
                             { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                         }
@@ -6425,10 +6502,10 @@ impl ApplicationHandler<UserEvent> for App {
                                 let content_h = if s.settings.undo_limit.is_some() { 34 * lh + 148 } else { 33 * lh + 144 };
                                 let max_scroll = content_h.saturating_sub(visible_h) / lh + 1;
                                 let t = s.tab_mut();
-                                if dy < 0 {
-                                    t.scroll = (t.scroll + (-dy) as usize).min(max_scroll);
+                                if dy > 0 {
+                                    t.scroll = (t.scroll + dy as usize).min(max_scroll);
                                 } else {
-                                    t.scroll = t.scroll.saturating_sub(dy as usize);
+                                    t.scroll = t.scroll.saturating_sub((-dy) as usize);
                                 }
                                 { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                             }
@@ -7675,11 +7752,8 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
                 if s.left_view == LeftView::Git && s.left_panel_visible {
-                    let root = s.explorer.as_ref()
-                        .and_then(|e| e.root.as_local_path().map(|p| p.to_path_buf()))
-                        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
                     s.git_panel.loading = true;
-                    refresh_git_status(s.proxy.clone(), root);
+                    trigger_git_status_refresh(s);
                 }
                 s.needs_redraw = true;
             }
@@ -7737,11 +7811,8 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
                 for id in removed_buf_ids { s.git_diff_tabs.remove(&id); }
-                let root = s.explorer.as_ref()
-                    .and_then(|e| e.root.as_local_path().map(|p| p.to_path_buf()))
-                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
                 s.git_panel.loading = true;
-                refresh_git_status(s.proxy.clone(), root);
+                trigger_git_status_refresh(s);
                 s.needs_redraw = true;
             }
             UserEvent::Redraw => {}
@@ -8574,6 +8645,10 @@ fn render(s: &mut State) {
         .map_or(false, |p| p.kind == PaneKind::Terminal);
 
     let show_hidden = s.explorer.as_ref().map_or(false, |ex| ex.show_hidden);
+    let tree_scroll_snap = s.explorer.as_ref().map_or(0, |ex| {
+        // Clamp in case entries shrank (collapse/search) since last scroll update
+        ex.tree_scroll.min(ex.entries.len().saturating_sub(1))
+    });
     let explorer_snap: Option<Vec<(String, bool, bool, usize, bool)>> =
         s.explorer.as_ref().map(|ex| {
             ex.entries.iter().enumerate().map(|(i, e)| {
@@ -9008,7 +9083,8 @@ fn render(s: &mut State) {
                 let entries_start = 2 * lh;
                 if ts_query.is_empty() {
                     for (i, (name, is_dir, expanded, depth, selected)) in entries.iter().enumerate() {
-                        let ey = entries_start + i as i32 * lh;
+                        let ey = entries_start + (i as i32 - tree_scroll_snap as i32) * lh;
+                        if ey + lh <= entries_start { continue; } // scrolled above top
                         if ey + lh > h as i32 - status_h { break; }
                         let baseline = ey + asc;
                         if *selected { fill(buf, w, h, px, ey, pw - 1, lh, SEL_BG); }

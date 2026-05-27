@@ -113,24 +113,28 @@ impl TermGrid {
 
     /// Scroll the scroll region up by one line. Only adds to scrollback when region is full-screen.
     fn scroll_up(&mut self) {
-        if self.scroll_top == 0 && self.scroll_bot == self.rows - 1 {
+        // Defensive clamp: scroll_bot must never exceed rows-1.
+        let scroll_bot = self.scroll_bot.min(self.rows.saturating_sub(1));
+        if self.scroll_top == 0 && scroll_bot == self.rows.saturating_sub(1) {
             let row: Vec<Cell> = self.cells[0..self.cols].to_vec();
             if self.scrollback.len() >= 1000 { self.scrollback.pop_front(); }
             self.scrollback.push_back(row);
         }
         let top = self.scroll_top * self.cols;
-        let bot = (self.scroll_bot + 1) * self.cols;
+        let bot = (scroll_bot + 1) * self.cols;
         if bot > top + self.cols {
             self.cells.copy_within(top + self.cols..bot, top);
         }
-        let last = self.scroll_bot * self.cols;
+        let last = scroll_bot * self.cols;
         for c in &mut self.cells[last..last + self.cols] { *c = Cell::default(); }
     }
 
     /// Scroll the scroll region down by one line (for insert-line / reverse-index).
     fn scroll_down(&mut self) {
+        // Defensive clamp: scroll_bot must never exceed rows-1.
+        let scroll_bot = self.scroll_bot.min(self.rows.saturating_sub(1));
         let top = self.scroll_top * self.cols;
-        let bot = (self.scroll_bot + 1) * self.cols;
+        let bot = (scroll_bot + 1) * self.cols;
         if bot > top + self.cols {
             self.cells.copy_within(top..bot - self.cols, top + self.cols);
         }
@@ -345,7 +349,9 @@ impl<'a> Perform for VteHandler<'a> {
                                     g.cur_col = g.alt_cur_col;
                                     g.cur_row = g.alt_cur_row;
                                     g.scroll_top = g.alt_scroll_top;
-                                    g.scroll_bot = g.alt_scroll_bot;
+                                    // Clamp restored scroll_bot — it may be stale if the grid
+                                    // was resized while the alt screen was active.
+                                    g.scroll_bot = g.alt_scroll_bot.min(g.rows.saturating_sub(1));
                                 }
                             }
                             _ => {}
@@ -374,8 +380,9 @@ impl<'a> Perform for VteHandler<'a> {
             }
             // Insert / delete lines at cursor
             'L' => {
-                let n = p0.max(1).min(g.scroll_bot.saturating_sub(g.cur_row) + 1);
-                let src_end = g.scroll_bot.saturating_sub(n - 1) * g.cols;
+                let eff_bot = g.scroll_bot.min(g.rows.saturating_sub(1));
+                let n = p0.max(1).min(eff_bot.saturating_sub(g.cur_row) + 1);
+                let src_end = eff_bot.saturating_sub(n - 1) * g.cols;
                 let dst_start = (g.cur_row + n) * g.cols;
                 let src_start = g.cur_row * g.cols;
                 if src_end > src_start {
@@ -387,15 +394,16 @@ impl<'a> Perform for VteHandler<'a> {
                 }
             }
             'M' => {
-                let n = p0.max(1).min(g.scroll_bot.saturating_sub(g.cur_row) + 1);
+                let eff_bot = g.scroll_bot.min(g.rows.saturating_sub(1));
+                let n = p0.max(1).min(eff_bot.saturating_sub(g.cur_row) + 1);
                 let src_start = (g.cur_row + n) * g.cols;
-                let src_end = (g.scroll_bot + 1) * g.cols;
+                let src_end = (eff_bot + 1) * g.cols;
                 let dst_start = g.cur_row * g.cols;
                 if src_end > src_start {
                     g.cells.copy_within(src_start..src_end, dst_start);
                 }
-                let clear_start = (g.scroll_bot + 1 - n) * g.cols;
-                let clear_end = (g.scroll_bot + 1) * g.cols;
+                let clear_start = (eff_bot + 1 - n) * g.cols;
+                let clear_end = (eff_bot + 1) * g.cols;
                 for c in &mut g.cells[clear_start..clear_end] { *c = Cell::default(); }
             }
             // Delete / erase / insert characters in current line
