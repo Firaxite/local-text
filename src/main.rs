@@ -1136,17 +1136,39 @@ fn open_terminal_pane_at(s: &mut State, cwd: Option<VPath>) {
             _ => None,
         });
         let ssh_cmd = if let Some(ref rdir) = remote_cwd {
-            // Single-quote the remote path (replacing ' with '\'' for shell safety).
-            // Use \$SHELL so the local sh does NOT expand $SHELL — only the remote
-            // shell should resolve it to the remote user's configured shell.
-            let escaped = rdir.replace('\'', r"'\''");
-            format!(
-                "ssh -o ControlPath={} -o ControlMaster=no{} {} \"cd '{}' && exec \\$SHELL\"",
-                host.control_path().display(),
-                port_part,
-                host.host_arg(),
-                escaped,
-            )
+            // Build `ssh ... host "cd '<path>' && exec \$SHELL"`.
+            // \$SHELL prevents local sh from expanding $SHELL; the remote shell does it.
+            //
+            // Tilde handling: single-quotes prevent ~ from expanding on the remote.
+            // If the path starts with ~, replace it with \$HOME (which the local sh
+            // leaves as literal $HOME, allowing the remote shell to expand it to the
+            // remote user's home directory). Use double-quoting on the remote side so
+            // spaces in the rest of the path work too.
+            if rdir.starts_with('~') {
+                let after_tilde = &rdir[1..]; // "" for "~", "/rest" for "~/rest"
+                // Escape \ and " for the inner double-quoted path on the remote.
+                // (Paths with these chars are extremely rare in practice.)
+                let rest_esc = after_tilde
+                    .replace('\\', "\\\\\\\\") // \ → \\\\ (4 chars → remote sees \)
+                    .replace('"', "\\\\\"");    // " → \\\" (remote sees \")
+                format!(
+                    "ssh -o ControlPath={} -o ControlMaster=no{} {} \"cd \\\"\\$HOME{}\\\" && exec \\$SHELL\"",
+                    host.control_path().display(),
+                    port_part,
+                    host.host_arg(),
+                    rest_esc,
+                )
+            } else {
+                // Absolute path — single-quote with standard ' → '\'' escaping.
+                let escaped = rdir.replace('\'', r"'\''");
+                format!(
+                    "ssh -o ControlPath={} -o ControlMaster=no{} {} \"cd '{}' && exec \\$SHELL\"",
+                    host.control_path().display(),
+                    port_part,
+                    host.host_arg(),
+                    escaped,
+                )
+            }
         } else {
             format!(
                 "ssh -o ControlPath={} -o ControlMaster=no{} {}",
