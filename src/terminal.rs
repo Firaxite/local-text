@@ -662,6 +662,28 @@ pub fn spawn_terminal_with_shell(pane_id: usize, cols: usize, rows: usize,
     }
 }
 
+/// Create a display-only TermPane with no PTY and no child process.
+/// Used to show LSP server output (stderr/stdout) with full VT100 rendering.
+/// `pty_fd = -1` means writes are silently discarded; Drop guards are already
+/// conditioned on `child_pid > 0` and `pty_fd >= 0`.
+#[cfg(unix)]
+pub fn new_log_pane(id: usize, cols: usize, rows: usize, title: String) -> TermPane {
+    let child_alive = Arc::new(AtomicBool::new(false));
+    let closed      = Arc::new(AtomicBool::new(false));
+    TermPane {
+        id,
+        grid:        TermGrid::new(cols, rows),
+        parser:      Parser::new(),
+        pty_fd:      -1,
+        child_pid:   -1,
+        child_alive,
+        closed,
+        _reader:     std::thread::spawn(|| {}),
+        title,
+        shell:       String::new(),
+    }
+}
+
 // ── Key encoding ──────────────────────────────────────────────────────────────
 
 /// Encode a winit keyboard event into bytes to write to the PTY master fd.

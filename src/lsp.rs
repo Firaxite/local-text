@@ -199,21 +199,26 @@ pub fn start_server(
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
 
-    // stdout reader: JSON-RPC messages → LspOutput + LspDiagnostics/LspResponse events
+    // stdout reader: JSON-RPC messages → LspOutput (protocol) + TermOutput (display)
     let proxy_out = proxy.clone();
     let opi = output_pane_id;
     let host_for_thread = ssh_host.clone();
     thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
         while let Some(msg) = read_message(&mut reader) {
-            // Log to output pane
+            // Protocol: used by main loop for init detection, diagnostics, responses
             let _ = proxy_out.send_event(UserEvent::LspOutput {
                 pane_id: opi,
                 data:    msg.as_bytes().to_vec(),
             });
+            // Display: show in terminal pane with a dim prefix so it's distinguishable
+            let display = format!("\x1b[36m[stdout]\x1b[0m {msg}\n");
+            let _ = proxy_out.send_event(UserEvent::TermOutput {
+                pane_id: opi,
+                data:    display.into_bytes().into_boxed_slice(),
+            });
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&msg) {
                 if v["id"].is_u64() && v.get("method").is_none() {
-                    // It's a response to a request
                     let id = v["id"].as_u64().unwrap();
                     let result = v["result"].clone();
                     let _ = proxy_out.send_event(UserEvent::LspResponse { server_id: opi, id, result });
@@ -225,14 +230,16 @@ pub fn start_server(
         let _ = proxy_out.send_event(UserEvent::LspServerStopped { server_id: opi });
     });
 
-    // stderr reader: raw log lines → LspOutput events
+    // stderr reader: raw bytes → TermOutput (preserves ANSI colors from the server)
     let proxy_err = proxy;
     thread::spawn(move || {
         let reader = BufReader::new(stderr);
         for line in reader.lines().flatten() {
-            let _ = proxy_err.send_event(UserEvent::LspOutput {
+            let mut bytes = line.into_bytes();
+            bytes.push(b'\n');
+            let _ = proxy_err.send_event(UserEvent::TermOutput {
                 pane_id: opi,
-                data:    line.into_bytes(),
+                data:    bytes.into_boxed_slice(),
             });
         }
     });
