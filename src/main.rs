@@ -1240,7 +1240,22 @@ fn perform_drop(s: &mut State, drag: DragState) {
                 }
             }
         }
-        _ => {}
+        PaneKind::LspOutput | PaneKind::MarkdownPreview => {
+            // Single-unit pane: can't merge into another pane, only re-split
+            if src_pid == dst_pid { return; }
+            if zone == DropZone::Center { return; }
+            // Remove from old tree location
+            let old_tree = std::mem::replace(&mut s.pane_tree, PaneTree::Leaf(0));
+            let Some(trimmed) = remove_pane_from_tree(old_tree, src_pid) else { return; };
+            s.pane_tree = trimmed;
+            if !pane_tree_contains(&s.pane_tree, s.active_pane) || !s.panes.contains_key(&s.active_pane) {
+                if let Some(id) = first_visible_pane_id(s) { s.active_pane = id; }
+            }
+            // Insert at new location
+            let old_tree = std::mem::replace(&mut s.pane_tree, PaneTree::Leaf(0));
+            s.pane_tree = insert_pane(old_tree, dst_pid, src_pid, zone);
+            s.active_pane = src_pid;
+        }
     }
 }
 
@@ -6586,6 +6601,33 @@ impl ApplicationHandler<UserEvent> for App {
                 if pane_local_y < tab_h {
                     let cw = s.glyphs.cw;
 
+                    // LspOutput pane tab bar (single draggable tab thumb with × close)
+                    if s.panes[&clicked_pane_id].kind == PaneKind::LspOutput {
+                        let title_len = s.lsp_panes.get(&clicked_pane_id)
+                            .map(|op| op.title.chars().count()).unwrap_or(10);
+                        let tw = (title_len + 3) as i32 * cw;
+                        if mx < pane_rect.x + tw {
+                            if mx >= pane_rect.x + tw - cw {
+                                // × close
+                                s.active_pane = clicked_pane_id;
+                                let pane_id = clicked_pane_id;
+                                if hide_lsp_output_pane(s, pane_id) {
+                                    s.panes.clear();
+                                    el.exit();
+                                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                                    return;
+                                }
+                            } else {
+                                s.active_pane = clicked_pane_id;
+                                s.drag_pending = Some((clicked_pane_id, 0, s.mouse_x, s.mouse_y));
+                            }
+                        } else {
+                            s.active_pane = clicked_pane_id;
+                        }
+                        { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                        return;
+                    }
+
                     // Terminal pane tab bar
                     if s.panes[&clicked_pane_id].kind == PaneKind::Terminal {
                         let mut tx = pane_rect.x;
@@ -7983,7 +8025,7 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
 
-                // LspOutput pane: read-only, Cmd+W hides the pane.
+                // LspOutput pane: read-only; Cmd+C copies selection, Cmd+W hides, arrows scroll.
                 if s.panes.get(&s.active_pane).map_or(false, |p| p.kind == PaneKind::LspOutput) {
                     if cmd && matches!(&event.logical_key, Key::Character(c) if matches!(c.as_str(), "c" | "C")) {
                         if let Some((pane_id, sel)) = s.lsp_output_sel.clone() {
@@ -8004,6 +8046,26 @@ impl ApplicationHandler<UserEvent> for App {
                             return;
                         }
                         { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                        return;
+                    }
+                    // Arrow / page navigation
+                    let lh = s.glyphs.lh;
+                    let area = s.pane_area();
+                    let pane_rect = layout_tree(&s.pane_tree, area).into_iter()
+                        .find(|(id, _)| *id == s.active_pane).map(|(_, r)| r).unwrap_or(area);
+                    let vis = ((pane_rect.h - s.tab_h()).max(0) / lh).max(1) as usize;
+                    if let Some(op) = s.lsp_panes.get_mut(&s.active_pane) {
+                        let max_scroll = op.lines.len().saturating_sub(1);
+                        let scrolled = match &event.logical_key {
+                            Key::Named(NamedKey::ArrowDown)  => { op.scroll = (op.scroll + 1).min(max_scroll); true }
+                            Key::Named(NamedKey::ArrowUp)    => { op.scroll = op.scroll.saturating_sub(1); true }
+                            Key::Named(NamedKey::PageDown)   => { op.scroll = (op.scroll + vis).min(max_scroll); true }
+                            Key::Named(NamedKey::PageUp)     => { op.scroll = op.scroll.saturating_sub(vis); true }
+                            Key::Named(NamedKey::End)        => { op.scroll = max_scroll; true }
+                            Key::Named(NamedKey::Home)       => { op.scroll = 0; true }
+                            _ => false,
+                        };
+                        if scrolled { { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); } }
                     }
                     return;
                 }
@@ -9159,6 +9221,7 @@ fn render(s: &mut State) {
     // Build LSP output pane snapshots
     let active_output_sel = s.lsp_output_sel.clone();
     struct OutPaneSnap {
+        id:            usize,
         rect:          Rect,
         is_active:     bool,
         visible_lines: Vec<String>,
@@ -9177,6 +9240,7 @@ fn render(s: &mut State) {
         let start = scroll.min(op.lines.len());
         let visible_lines: Vec<String> = op.lines[start..].iter().take(vis).cloned().collect();
         Some(OutPaneSnap {
+            id: pid,
             rect,
             is_active: pid == active_pane_id,
             visible_lines,
@@ -10935,11 +10999,18 @@ fn render(s: &mut State) {
         // ── LSP output panes ──────────────────────────────────────────────
         for snap in &out_snaps {
             let r = snap.rect;
-            // Tab bar
+            // Tab bar background
             fill(buf, w, h, r.x, r.y, r.w, tab_h, BG2);
             fill(buf, w, h, r.x, r.y + tab_h - 1, r.w, 1, BORDER);
             if snap.is_active { fill(buf, w, h, r.x, r.y, 2, tab_h - 1, ACCENT); }
-            draw_str(buf, w, h, g, &format!(" {}", snap.title), r.x + 4, r.y + tab_h * 3 / 4, FG_DIM, r.x + r.w);
+            // Tab thumb (draggable, with × close button, like terminal tabs)
+            let label = format!(" {}  ", snap.title);
+            let tw = label.chars().count() as i32 * cw;
+            fill(buf, w, h, r.x, r.y, tw.min(r.w), tab_h - 1, BG);
+            fill(buf, w, h, r.x, r.y + tab_h - 2, tw.min(r.w), 2, ACCENT);
+            draw_str(buf, w, h, g, &label, r.x, r.y + tab_h * 3 / 4, FG, (r.x + tw - cw).min(r.x + r.w));
+            draw_str(buf, w, h, g, "×", r.x + tw - cw, r.y + tab_h * 3 / 4, FG, (r.x + tw).min(r.x + r.w));
+            fill(buf, w, h, r.x + tw, r.y, 1, tab_h, BORDER);
             // Lines
             for (vi, line) in snap.visible_lines.iter().enumerate() {
                 let py       = r.y + tab_h + vi as i32 * lh;
@@ -11026,9 +11097,11 @@ fn render(s: &mut State) {
             let target_rect = if drag_src_is_terminal {
                 term_snaps.iter().find(|t| t.id == over_id).map(|t| t.rect)
                     .or_else(|| pane_snaps.iter().find(|p| p.id == over_id).map(|p| p.rect))
+                    .or_else(|| out_snaps.iter().find(|o| o.id == over_id).map(|o| o.rect))
             } else {
                 pane_snaps.iter().find(|p| p.id == over_id).map(|p| p.rect)
                     .or_else(|| term_snaps.iter().find(|t| t.id == over_id).map(|t| t.rect))
+                    .or_else(|| out_snaps.iter().find(|o| o.id == over_id).map(|o| o.rect))
             };
             if let Some(r) = target_rect {
                 let th = tab_h;

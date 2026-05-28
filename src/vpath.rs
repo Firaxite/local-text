@@ -110,10 +110,10 @@ impl VPath {
             };
 
             if !host.is_empty() {
-                return VPath::Remote {
-                    host: SshHost { user, host, port },
-                    path: PathBuf::from(path_part),
-                };
+                let ssh_host = SshHost { user, host, port };
+                let raw = PathBuf::from(path_part);
+                let path = expand_tilde(&ssh_host, &raw);
+                return VPath::Remote { host: ssh_host, path };
             }
         }
         VPath::Local(PathBuf::from(s))
@@ -248,7 +248,9 @@ impl VPath {
     }
 }
 
-fn remote_lsp_path(host: &SshHost, path: &Path) -> PathBuf {
+/// Expand a leading `~` to `/home/{user}` when the host has a known user.
+/// Returns the path unchanged if no user is set or the path is already absolute.
+fn expand_tilde(host: &SshHost, path: &Path) -> PathBuf {
     let Some(user) = host.user.as_deref() else {
         return path.to_path_buf();
     };
@@ -260,6 +262,10 @@ fn remote_lsp_path(host: &SshHost, path: &Path) -> PathBuf {
     } else {
         path.to_path_buf()
     }
+}
+
+fn remote_lsp_path(host: &SshHost, path: &Path) -> PathBuf {
+    expand_tilde(host, path)
 }
 
 fn split_ssh_host_and_path(rest: &str) -> Option<(&str, &str)> {
@@ -361,7 +367,7 @@ mod tests {
         assert_remote("ssh://example.com:/srv/app", None, "example.com", None, "/srv/app");
         assert_remote("ssh://example.com:2222", None, "example.com", Some(2222), "~");
         assert_remote("ssh://example.com:2222:/srv/app", None, "example.com", Some(2222), "/srv/app");
-        assert_remote("ssh://me@example.com:~/src/app", Some("me"), "example.com", None, "~/src/app");
+        assert_remote("ssh://me@example.com:~/src/app", Some("me"), "example.com", None, "/home/me/src/app");
     }
 
     #[test]
