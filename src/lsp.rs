@@ -9,7 +9,7 @@
 // to the main loop via EventLoopProxy<UserEvent>.
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::thread;
@@ -199,26 +199,51 @@ pub fn start_server(
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
 
-    // stdout reader: JSON-RPC messages → LspOutput (protocol) + TermOutput (display)
+    // stdout reader: framed JSON-RPC → LspOutput (protocol only, not displayed);
+    // unframed output (error tracebacks, Node.js crash messages, etc.) → TermOutput.
     let proxy_out = proxy.clone();
     let opi = output_pane_id;
     let host_for_thread = ssh_host.clone();
     thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
-        while let Some(msg) = read_message(&mut reader) {
-            // Protocol: used by main loop for init detection, diagnostics, responses
-            let _ = proxy_out.send_event(UserEvent::LspOutput {
-                pane_id: opi,
-                data:    msg.as_bytes().to_vec(),
-            });
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&msg) {
-                if v["id"].is_u64() && v.get("method").is_none() {
-                    let id = v["id"].as_u64().unwrap();
-                    let result = v["result"].clone();
-                    let _ = proxy_out.send_event(UserEvent::LspResponse { server_id: opi, id, result });
-                } else if let Some((path, diags)) = parse_diagnostics(&msg, host_for_thread.as_ref()) {
-                    let _ = proxy_out.send_event(UserEvent::LspDiagnostics { path, diagnostics: diags });
+        loop {
+            let mut first_line = String::new();
+            match reader.read_line(&mut first_line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let trimmed = first_line.trim_end_matches(['\r', '\n']);
+            if let Some(rest) = trimmed.strip_prefix("Content-Length: ") {
+                // Framed JSON-RPC message: parse for protocol, do not display
+                let Ok(n) = rest.trim().parse::<usize>() else { continue };
+                // Consume remaining headers (up to the blank separator line)
+                loop {
+                    let mut hdr = String::new();
+                    if reader.read_line(&mut hdr).unwrap_or(0) == 0 { break; }
+                    if hdr.trim_end_matches(['\r', '\n']).is_empty() { break; }
                 }
+                let mut buf = vec![0u8; n];
+                if reader.read_exact(&mut buf).is_err() { break; }
+                let Ok(msg) = String::from_utf8(buf) else { continue };
+                let _ = proxy_out.send_event(UserEvent::LspOutput {
+                    pane_id: opi,
+                    data:    msg.as_bytes().to_vec(),
+                });
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&msg) {
+                    if v["id"].is_u64() && v.get("method").is_none() {
+                        let id = v["id"].as_u64().unwrap();
+                        let result = v["result"].clone();
+                        let _ = proxy_out.send_event(UserEvent::LspResponse { server_id: opi, id, result });
+                    } else if let Some((path, diags)) = parse_diagnostics(&msg, host_for_thread.as_ref()) {
+                        let _ = proxy_out.send_event(UserEvent::LspDiagnostics { path, diagnostics: diags });
+                    }
+                }
+            } else {
+                // Unframed stdout output (crash message, missing-module error, etc.): show in terminal
+                let _ = proxy_out.send_event(UserEvent::TermOutput {
+                    pane_id: opi,
+                    data:    first_line.into_bytes().into_boxed_slice(),
+                });
             }
         }
         let _ = proxy_out.send_event(UserEvent::LspServerStopped { server_id: opi });
@@ -379,4 +404,99 @@ pub fn request_organize_imports(srv: &mut LspServer, path: &VPath) -> u64 {
     }));
     srv.pending.insert(id, PendingKind::OrganizeImports { path: path.clone() });
     id
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn read_message_parses_framed() {
+        let body = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+        let raw = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
+        let mut cur = Cursor::new(raw.as_bytes().to_vec());
+        assert_eq!(read_message(&mut cur).as_deref(), Some(body));
+    }
+
+    #[test]
+    fn read_message_returns_none_for_unframed() {
+        // Simulates what happens when the server writes an error to stdout without framing
+        let raw = "Error: Cannot find module 'typescript'\n";
+        let mut cur = Cursor::new(raw.as_bytes().to_vec());
+        // read_message sees the line as a header with no Content-Length, hits EOF → None
+        assert_eq!(read_message(&mut cur), None);
+    }
+
+    #[test]
+    fn stdout_reader_surfaces_unframed_lines() {
+        // Simulate a stdout stream that starts with an unframed error then EOF.
+        // The new stdout thread logic should send TermOutput for the unframed line.
+        // We verify this by replaying the logic inline.
+        let raw = b"Error: Cannot find module 'typescript'\n";
+        let mut reader = BufReader::new(Cursor::new(raw.to_vec()));
+        let mut unframed_lines: Vec<String> = vec![];
+        let mut framed_bodies: Vec<String> = vec![];
+        loop {
+            let mut first_line = String::new();
+            match reader.read_line(&mut first_line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let trimmed = first_line.trim_end_matches(['\r', '\n']);
+            if let Some(rest) = trimmed.strip_prefix("Content-Length: ") {
+                let Ok(n) = rest.trim().parse::<usize>() else { continue };
+                loop {
+                    let mut hdr = String::new();
+                    if reader.read_line(&mut hdr).unwrap_or(0) == 0 { break; }
+                    if hdr.trim_end_matches(['\r', '\n']).is_empty() { break; }
+                }
+                let mut buf = vec![0u8; n];
+                if reader.read_exact(&mut buf).is_err() { break; }
+                framed_bodies.push(String::from_utf8(buf).unwrap());
+            } else {
+                unframed_lines.push(first_line);
+            }
+        }
+        assert_eq!(unframed_lines, vec!["Error: Cannot find module 'typescript'\n"]);
+        assert!(framed_bodies.is_empty());
+    }
+
+    #[test]
+    fn stdout_reader_handles_framed_then_unframed() {
+        // Framed message followed by an unframed crash dump — both must be captured.
+        let body = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+        let raw = format!(
+            "Content-Length: {}\r\n\r\n{}node crashed\n",
+            body.len(), body
+        );
+        let mut reader = BufReader::new(Cursor::new(raw.as_bytes().to_vec()));
+        let mut unframed: Vec<String> = vec![];
+        let mut framed: Vec<String> = vec![];
+        loop {
+            let mut first_line = String::new();
+            match reader.read_line(&mut first_line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let trimmed = first_line.trim_end_matches(['\r', '\n']);
+            if let Some(rest) = trimmed.strip_prefix("Content-Length: ") {
+                let Ok(n) = rest.trim().parse::<usize>() else { continue };
+                loop {
+                    let mut hdr = String::new();
+                    if reader.read_line(&mut hdr).unwrap_or(0) == 0 { break; }
+                    if hdr.trim_end_matches(['\r', '\n']).is_empty() { break; }
+                }
+                let mut buf = vec![0u8; n];
+                if reader.read_exact(&mut buf).is_err() { break; }
+                framed.push(String::from_utf8(buf).unwrap());
+            } else {
+                unframed.push(first_line);
+            }
+        }
+        assert_eq!(framed, vec![body]);
+        assert_eq!(unframed, vec!["node crashed\n"]);
+    }
 }
