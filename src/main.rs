@@ -1454,6 +1454,15 @@ fn lsp_binary(lang: Lang) -> Option<&'static str> {
     }
 }
 
+fn lsp_invocation(lang: Lang) -> Option<&'static str> {
+    match lang {
+        Lang::TypeScript => Some("typescript-language-server --stdio"),
+        Lang::Rust       => Some("rust-analyzer --stdio"),
+        Lang::Python     => Some("pylsp"),
+        Lang::None | Lang::Json | Lang::Jsonc | Lang::Markdown | Lang::Css | Lang::Html => None,
+    }
+}
+
 fn lsp_required_binaries(lang: Lang) -> &'static [&'static str] {
     match lang {
         Lang::TypeScript => &["typescript-language-server", "tsserver"],
@@ -2713,11 +2722,18 @@ fn notify_lsp_open(s: &mut State, path: &VPath) {
             lsp::send_initialize(&mut srv, root.as_ref());
             // Register LSP output pane backed by a display-only TermPane.
             // Not shown in the layout tree until an error occurs or the user opens it.
+            let bin = lsp_binary(lang).unwrap_or("lsp");
+            let invocation = lsp_invocation(lang).unwrap_or(bin);
             let title = match &ssh_host {
-                Some(host) => format!("{:?} LSP Output ({})", lang, host.display()),
-                None       => format!("{:?} LSP Output (local)", lang),
+                Some(host) => format!("{} @ {}", bin, host.display()),
+                None       => bin.to_owned(),
             };
-            let tp = terminal::new_log_pane(op_id, 120, 40, title);
+            let banner = match &ssh_host {
+                Some(host) => format!("[{}]$ {}\r\n", host.display(), invocation),
+                None       => format!("$ {}\r\n", invocation),
+            };
+            let mut tp = terminal::new_log_pane(op_id, 120, 40, title);
+            terminal::feed_bytes(&mut tp, banner.as_bytes());
             s.term_panes.insert(op_id, tp);
             let shell_pane = Pane { id: op_id, kind: PaneKind::Terminal, tabs: vec![], term_ids: vec![op_id], active: 0, find: FindBar::new() };
             s.panes.insert(op_id, shell_pane);
