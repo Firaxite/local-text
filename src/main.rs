@@ -781,7 +781,7 @@ enum PaneTree {
 }
 
 #[derive(Clone, PartialEq)]
-enum PaneKind { Editor, Terminal, LspOutput, MarkdownPreview }
+enum PaneKind { Editor, Terminal, MarkdownPreview }
 
 struct Pane {
     id:       usize,
@@ -1063,7 +1063,7 @@ fn close_terminal_tab(s: &mut State, pane_id: usize, tab_idx: usize) -> bool {
 }
 
 fn show_lsp_output_pane(s: &mut State, pane_id: usize) {
-    if !s.panes.get(&pane_id).map_or(false, |p| p.kind == PaneKind::LspOutput) {
+    if !s.panes.contains_key(&pane_id) {
         return;
     }
     if pane_tree_contains(&s.pane_tree, pane_id) {
@@ -1101,7 +1101,7 @@ fn open_lsp_output_for_context(s: &mut State) {
                 .map(|(&id, _)| id)
         })
         .or_else(|| s.lsp.servers.keys().copied().max())
-        .or_else(|| s.panes.values().filter(|p| p.kind == PaneKind::LspOutput).map(|p| p.id).max());
+        .or_else(|| s.panes.values().filter(|p| s.lsp.servers.contains_key(&p.id)).map(|p| p.id).max());
 
     if let Some(pane_id) = target {
         show_lsp_output_pane(s, pane_id);
@@ -1240,7 +1240,7 @@ fn perform_drop(s: &mut State, drag: DragState) {
                 }
             }
         }
-        PaneKind::LspOutput | PaneKind::MarkdownPreview => {
+        PaneKind::MarkdownPreview => {
             // Single-unit pane: can't merge into another pane, only re-split
             if src_pid == dst_pid { return; }
             if zone == DropZone::Center { return; }
@@ -1266,8 +1266,7 @@ fn resize_terminal_panes(s: &mut State) {
     let cw    = s.glyphs.cw;
     let layout = layout_tree(&s.pane_tree, area);
     for (pid, rect) in layout {
-        let is_term_like = s.panes.get(&pid).map_or(false, |p|
-            p.kind == PaneKind::Terminal || p.kind == PaneKind::LspOutput);
+        let is_term_like = s.panes.get(&pid).map_or(false, |p| p.kind == PaneKind::Terminal);
         if is_term_like {
             let cols = (rect.w / cw).max(1) as usize;
             let rows = if rect.h > tab_h { ((rect.h - tab_h) / lh).max(1) as usize } else { 1 };
@@ -2720,7 +2719,7 @@ fn notify_lsp_open(s: &mut State, path: &VPath) {
             };
             let tp = terminal::new_log_pane(op_id, 120, 40, title);
             s.term_panes.insert(op_id, tp);
-            let shell_pane = Pane { id: op_id, kind: PaneKind::LspOutput, tabs: vec![], term_ids: vec![op_id], active: 0, find: FindBar::new() };
+            let shell_pane = Pane { id: op_id, kind: PaneKind::Terminal, tabs: vec![], term_ids: vec![op_id], active: 0, find: FindBar::new() };
             s.panes.insert(op_id, shell_pane);
             s.lsp.servers.insert(op_id, srv);
             s.lsp_start_errors.remove(&(ssh_host.clone(), lang));
@@ -6500,34 +6499,6 @@ impl ApplicationHandler<UserEvent> for App {
                 if pane_local_y < tab_h {
                     let cw = s.glyphs.cw;
 
-                    // LspOutput pane tab bar (single draggable tab thumb with × close)
-                    if s.panes[&clicked_pane_id].kind == PaneKind::LspOutput {
-                        let tid = s.panes[&clicked_pane_id].term_ids.first().copied().unwrap_or(clicked_pane_id);
-                        let title_len = s.term_panes.get(&tid)
-                            .map(|tp| tp.title.chars().count()).unwrap_or(10);
-                        let tw = (title_len + 3) as i32 * cw;
-                        if mx < pane_rect.x + tw {
-                            if mx >= pane_rect.x + tw - cw {
-                                // × close
-                                s.active_pane = clicked_pane_id;
-                                let pane_id = clicked_pane_id;
-                                if hide_lsp_output_pane(s, pane_id) {
-                                    s.panes.clear();
-                                    el.exit();
-                                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
-                                    return;
-                                }
-                            } else {
-                                s.active_pane = clicked_pane_id;
-                                s.drag_pending = Some((clicked_pane_id, 0, s.mouse_x, s.mouse_y));
-                            }
-                        } else {
-                            s.active_pane = clicked_pane_id;
-                        }
-                        { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
-                        return;
-                    }
-
                     // Terminal pane tab bar
                     if s.panes[&clicked_pane_id].kind == PaneKind::Terminal {
                         let mut tx = pane_rect.x;
@@ -6542,9 +6513,11 @@ impl ApplicationHandler<UserEvent> for App {
                             if mx < tx + tw {
                                 hit = true;
                                 if mx >= tx + tw - cw {
-                                    // × close
+                                    // × close: LSP output panes hide (minimize); regular terminals close
                                     s.active_pane = clicked_pane_id;
-                                    if close_terminal_tab(s, clicked_pane_id, i) {
+                                    if s.lsp.servers.contains_key(&clicked_pane_id) {
+                                        hide_lsp_output_pane(s, clicked_pane_id);
+                                    } else if close_terminal_tab(s, clicked_pane_id, i) {
                                         s.panes.clear();
                                         el.exit();
                                         { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
@@ -6603,7 +6576,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // Switch active pane on click
                 s.active_pane = clicked_pane_id;
 
-                // Non-editor panes (Terminal, LspOutput) have no tabs/find bar/cursors
+                // Non-editor panes (Terminal) have no tabs/find bar/cursors
                 if s.panes[&clicked_pane_id].kind == PaneKind::Terminal {
                     let content_y = pane_rect.y + tab_h;
                     if my >= content_y {
@@ -6675,30 +6648,6 @@ impl ApplicationHandler<UserEvent> for App {
                                         s.term_selecting = true;
                                     }
                                 }
-                            }
-                        }
-                    }
-                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
-                    return;
-                }
-                if s.panes[&clicked_pane_id].kind == PaneKind::LspOutput {
-                    // Delegate content-area interaction to terminal selection logic
-                    let content_y = pane_rect.y + tab_h;
-                    if my >= content_y {
-                        let tid = s.panes[&clicked_pane_id].term_ids.first().copied();
-                        if let Some(tid) = tid {
-                            if let Some(tp) = s.term_panes.get(&tid) {
-                                let cw = s.glyphs.cw;
-                                let lh = s.glyphs.lh;
-                                let term_col = ((mx - pane_rect.x) / cw)
-                                    .clamp(0, tp.grid.cols as i32 - 1) as usize;
-                                let term_row = ((my - content_y) / lh)
-                                    .clamp(0, tp.grid.rows as i32 - 1) as usize;
-                                s.term_sel = Some(TermSel {
-                                    start_vi: term_row, start_col: term_col,
-                                    end_vi:   term_row, end_col:   term_col,
-                                });
-                                s.term_selecting = true;
                             }
                         }
                     }
@@ -7233,22 +7182,6 @@ impl ApplicationHandler<UserEvent> for App {
                             { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                         }
                     }
-                    PaneKind::LspOutput => {
-                        if dy != 0 {
-                            let tid = s.panes[&s.active_pane].term_ids.first().copied();
-                            if let Some(tid) = tid {
-                                if let Some(tp) = s.term_panes.get_mut(&tid) {
-                                    let sb = tp.grid.scrollback.len();
-                                    if dy < 0 {
-                                        tp.grid.scroll_offset = (tp.grid.scroll_offset + (-dy) as usize).min(sb);
-                                    } else {
-                                        tp.grid.scroll_offset = tp.grid.scroll_offset.saturating_sub(dy as usize);
-                                    }
-                                }
-                            }
-                            { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
-                        }
-                    }
                     PaneKind::MarkdownPreview => {
                         if dy != 0 {
                             let source_buf_id = s.md_panes[&s.active_pane].source_buf_id;
@@ -7773,9 +7706,14 @@ impl ApplicationHandler<UserEvent> for App {
 
                 // Terminal pane intercepts (before PTY forwarding)
                 if s.panes.get(&s.active_pane).map_or(false, |p| p.kind == PaneKind::Terminal) {
-                    // Cmd+W — close active terminal tab or pane
+                    // Cmd+W — LSP output panes hide (minimize); regular terminals close their tab
                     if cmd && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "w") {
                         let pane_id = s.active_pane;
+                        if s.lsp.servers.contains_key(&pane_id) {
+                            hide_lsp_output_pane(s, pane_id);
+                            { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                            return;
+                        }
                         let idx = s.panes.get(&pane_id).map(|p| p.active).unwrap_or(0);
                         if close_terminal_tab(s, pane_id, idx) {
                             s.panes.clear();
@@ -7930,40 +7868,6 @@ impl ApplicationHandler<UserEvent> for App {
                             return;
                         }
                         { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
-                    }
-                    return;
-                }
-
-                // LspOutput pane: read-only log terminal. Cmd+W hides; arrows scroll scrollback.
-                // Cmd+C copies terminal selection (falls through to terminal copy logic below).
-                // All other keys are consumed (pane is display-only; pty_fd=-1 discards writes).
-                if s.panes.get(&s.active_pane).map_or(false, |p| p.kind == PaneKind::LspOutput) {
-                    if cmd && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "w") {
-                        let pane_id = s.active_pane;
-                        if hide_lsp_output_pane(s, pane_id) {
-                            s.panes.clear();
-                            el.exit();
-                            return;
-                        }
-                        { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
-                        return;
-                    }
-                    // Arrow / page navigation via scrollback offset
-                    let tid = s.panes[&s.active_pane].term_ids.first().copied();
-                    if let Some(tid) = tid {
-                        if let Some(tp) = s.term_panes.get_mut(&tid) {
-                            let sb = tp.grid.scrollback.len();
-                            let scrolled = match &event.logical_key {
-                                Key::Named(NamedKey::ArrowDown)  => { tp.grid.scroll_offset = tp.grid.scroll_offset.saturating_sub(1); true }
-                                Key::Named(NamedKey::ArrowUp)    => { tp.grid.scroll_offset = (tp.grid.scroll_offset + 1).min(sb); true }
-                                Key::Named(NamedKey::PageDown)   => { tp.grid.scroll_offset = tp.grid.scroll_offset.saturating_sub(tp.grid.rows); true }
-                                Key::Named(NamedKey::PageUp)     => { tp.grid.scroll_offset = (tp.grid.scroll_offset + tp.grid.rows).min(sb); true }
-                                Key::Named(NamedKey::End)        => { tp.grid.scroll_offset = 0; true }
-                                Key::Named(NamedKey::Home)       => { tp.grid.scroll_offset = sb; true }
-                                _ => false,
-                            };
-                            if scrolled { { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); } }
-                        }
                     }
                     return;
                 }
@@ -9079,7 +8983,7 @@ fn render(s: &mut State) {
     }
     let term_snaps: Vec<TermPaneSnap> = layout.iter().filter_map(|&(pid, rect)| {
         let pane = s.panes.get(&pid)?;
-        if pane.kind != PaneKind::Terminal && pane.kind != PaneKind::LspOutput { return None; }
+        if pane.kind != PaneKind::Terminal { return None; }
         let active_tid = pane.term_ids.get(pane.active).copied()?;
         let tp = s.term_panes.get(&active_tid)?;
         let tabs: Vec<String> = pane.term_ids.iter()

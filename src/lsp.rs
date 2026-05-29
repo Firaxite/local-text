@@ -211,12 +211,6 @@ pub fn start_server(
                 pane_id: opi,
                 data:    msg.as_bytes().to_vec(),
             });
-            // Display: show in terminal pane with a dim prefix so it's distinguishable
-            let display = format!("\x1b[36m[stdout]\x1b[0m {msg}\n");
-            let _ = proxy_out.send_event(UserEvent::TermOutput {
-                pane_id: opi,
-                data:    display.into_bytes().into_boxed_slice(),
-            });
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&msg) {
                 if v["id"].is_u64() && v.get("method").is_none() {
                     let id = v["id"].as_u64().unwrap();
