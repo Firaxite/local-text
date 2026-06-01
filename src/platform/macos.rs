@@ -189,7 +189,7 @@ impl CpuRenderer {
             layer.setContentsGravity(kCAGravityResize);
         }
 
-        let view_ptr = match window.window_handle().unwrap().as_raw() {
+        let view_ptr = match window.window_handle().expect("window handle unavailable during renderer init").as_raw() {
             RawWindowHandle::AppKit(h) => unsafe {
                 let view: &NSObject = h.ns_view.cast().as_ref();
                 let _: () = msg_send![view, setLayer: &*layer];
@@ -332,7 +332,7 @@ impl GpuRenderer {
             let _: () = msg_send![&*metal_layer, setMaximumDrawableCount: count];
         }
 
-        let view_ptr = match window.window_handle().unwrap().as_raw() {
+        let view_ptr = match window.window_handle().expect("window handle unavailable during renderer init").as_raw() {
             RawWindowHandle::AppKit(h) => unsafe {
                 let view: &NSObject = h.ns_view.cast().as_ref();
                 // Cast CAMetalLayer to CALayer for setLayer: (it's a subclass)

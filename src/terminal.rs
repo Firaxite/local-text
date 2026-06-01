@@ -93,6 +93,8 @@ pub struct TermGrid {
     /// Saved cursor position (\x1b7 / \x1b[s).
     pub saved_cur_col: usize,
     pub saved_cur_row: usize,
+    /// Last CWD reported via OSC 7 (file://hostname/path).
+    pub cwd: Option<std::path::PathBuf>,
 }
 
 impl TermGrid {
@@ -108,10 +110,24 @@ impl TermGrid {
             alt_cells: None, alt_cur_col: 0, alt_cur_row: 0,
             alt_scroll_top: 0, alt_scroll_bot: rows_m1,
             saved_cur_col: 0, saved_cur_row: 0,
+            cwd: None,
         }
     }
 
-    fn cell_mut(&mut self, row: usize, col: usize) -> &mut Cell { &mut self.cells[row * self.cols + col] }
+    fn cell_mut(&mut self, row: usize, col: usize) -> &mut Cell {
+        // Clamp defensively: the cursor can transiently sit one past the last column
+        // (deferred wrap), and a malformed resize could desync row/col from the grid.
+        let idx = (row * self.cols + col).min(self.cells.len().saturating_sub(1));
+        &mut self.cells[idx]
+    }
+
+    /// Flat cell index for (row, col), clamped to `[0, cells.len()]` so it is always a
+    /// valid *exclusive* range endpoint. Erase handlers build ranges from cursor
+    /// positions that may sit one past the last column, so they must clamp first.
+    #[inline]
+    fn flat(&self, row: usize, col: usize) -> usize {
+        (row * self.cols + col).min(self.cells.len())
+    }
 
     /// Scroll the scroll region up by one line. Only adds to scrollback when region is full-screen.
     fn scroll_up(&mut self) {
@@ -193,12 +209,13 @@ struct VteHandler<'a> {
 impl<'a> Perform for VteHandler<'a> {
     fn print(&mut self, c: char) {
         let g = &mut *self.grid;
+        if g.cells.is_empty() { return; } // degenerate 0×0 grid — nothing to draw into
         if g.cur_col >= g.cols {
             g.cur_col = 0;
             if g.cur_row == g.scroll_bot {
                 g.scroll_up();
             } else {
-                g.cur_row = (g.cur_row + 1).min(g.rows - 1);
+                g.cur_row = (g.cur_row + 1).min(g.rows.saturating_sub(1));
             }
         }
         let (r, co) = (g.cur_row, g.cur_col);
@@ -219,7 +236,7 @@ impl<'a> Perform for VteHandler<'a> {
                 if g.cur_row == g.scroll_bot {
                     g.scroll_up();
                 } else {
-                    g.cur_row = (g.cur_row + 1).min(g.rows - 1);
+                    g.cur_row = (g.cur_row + 1).min(g.rows.saturating_sub(1));
                 }
             }
             0x08 => { // backspace
@@ -227,7 +244,7 @@ impl<'a> Perform for VteHandler<'a> {
             }
             b'\t' => {
                 g.cur_col = ((g.cur_col / 8) + 1) * 8;
-                if g.cur_col >= g.cols { g.cur_col = g.cols - 1; }
+                if g.cur_col >= g.cols { g.cur_col = g.cols.saturating_sub(1); }
             }
             0x07 => {} // bell — ignore
             _ => {}
@@ -243,23 +260,23 @@ impl<'a> Perform for VteHandler<'a> {
         match action {
             // Cursor up/down/forward/back
             'A' => { let n = p0.max(1); g.cur_row = g.cur_row.saturating_sub(n); }
-            'B' => { let n = p0.max(1); g.cur_row = (g.cur_row + n).min(g.rows - 1); }
-            'C' => { let n = p0.max(1); g.cur_col = (g.cur_col + n).min(g.cols - 1); }
+            'B' => { let n = p0.max(1); g.cur_row = (g.cur_row + n).min(g.rows.saturating_sub(1)); }
+            'C' => { let n = p0.max(1); g.cur_col = (g.cur_col + n).min(g.cols.saturating_sub(1)); }
             'D' => { let n = p0.max(1); g.cur_col = g.cur_col.saturating_sub(n); }
             // Cursor position
             'H' | 'f' => {
-                g.cur_row = p0.saturating_sub(1).min(g.rows - 1);
-                g.cur_col = p1.saturating_sub(1).min(g.cols - 1);
+                g.cur_row = p0.saturating_sub(1).min(g.rows.saturating_sub(1));
+                g.cur_col = p1.saturating_sub(1).min(g.cols.saturating_sub(1));
             }
             // Erase display
             'J' => match p0 {
                 0 => { // clear from cursor to end of screen
-                    let start = g.cur_row * g.cols + g.cur_col;
+                    let start = g.flat(g.cur_row, g.cur_col);
                     for c in &mut g.cells[start..] { *c = Cell::default(); }
                 }
-                1 => { // clear from start to cursor
-                    let end = g.cur_row * g.cols + g.cur_col;
-                    for c in &mut g.cells[..=end] { *c = Cell::default(); }
+                1 => { // clear from start to cursor (inclusive)
+                    let end = g.flat(g.cur_row, g.cur_col + 1);
+                    for c in &mut g.cells[..end] { *c = Cell::default(); }
                 }
                 _ => { // 2 or 3: clear entire screen
                     for c in g.cells.iter_mut() { *c = Cell::default(); }
@@ -269,18 +286,18 @@ impl<'a> Perform for VteHandler<'a> {
             // Erase line
             'K' => match p0 {
                 0 => { // clear from cursor to end of line
-                    let start = g.cur_row * g.cols + g.cur_col;
-                    let end   = g.cur_row * g.cols + g.cols;
+                    let start = g.flat(g.cur_row, g.cur_col);
+                    let end   = g.flat(g.cur_row, g.cols);
                     for c in &mut g.cells[start..end] { *c = Cell::default(); }
                 }
-                1 => { // clear from start of line to cursor
-                    let start = g.cur_row * g.cols;
-                    let end   = g.cur_row * g.cols + g.cur_col;
-                    for c in &mut g.cells[start..=end] { *c = Cell::default(); }
+                1 => { // clear from start of line to cursor (inclusive)
+                    let start = g.flat(g.cur_row, 0);
+                    let end   = g.flat(g.cur_row, g.cur_col + 1);
+                    for c in &mut g.cells[start..end] { *c = Cell::default(); }
                 }
                 _ => { // 2: clear entire line
-                    let start = g.cur_row * g.cols;
-                    let end   = start + g.cols;
+                    let start = g.flat(g.cur_row, 0);
+                    let end   = g.flat(g.cur_row, g.cols);
                     for c in &mut g.cells[start..end] { *c = Cell::default(); }
                 }
             }
@@ -362,15 +379,15 @@ impl<'a> Perform for VteHandler<'a> {
                 }
             }
             // Column/line position
-            'G' => { g.cur_col = p0.saturating_sub(1).min(g.cols - 1); }
-            'd' => { g.cur_row = p0.saturating_sub(1).min(g.rows - 1); }
+            'G' => { g.cur_col = p0.saturating_sub(1).min(g.cols.saturating_sub(1)); }
+            'd' => { g.cur_row = p0.saturating_sub(1).min(g.rows.saturating_sub(1)); }
             // Scroll up / down N lines within scroll region
             'S' => { let n = p0.max(1); for _ in 0..n { g.scroll_up(); } }
             'T' => { let n = p0.max(1); for _ in 0..n { g.scroll_down(); } }
             // DECSTBM — set scrolling region
             'r' => {
-                let top = p0.saturating_sub(1).min(g.rows - 1);
-                let bot = if p1 == 0 { g.rows - 1 } else { (p1 - 1).min(g.rows - 1) };
+                let top = p0.saturating_sub(1).min(g.rows.saturating_sub(1));
+                let bot = if p1 == 0 { g.rows.saturating_sub(1) } else { (p1 - 1).min(g.rows.saturating_sub(1)) };
                 if top < bot {
                     g.scroll_top = top;
                     g.scroll_bot = bot;
@@ -444,7 +461,15 @@ impl<'a> Perform for VteHandler<'a> {
     }
 
     fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
-        let _ = params;
+        // OSC 7: shell reports CWD as file://hostname/path
+        if params.len() >= 2 && params[0] == b"7" {
+            if let Ok(url) = std::str::from_utf8(params[1]) {
+                if let Some(path) = parse_osc7_path(url) {
+                    self.grid.cwd = Some(path);
+                }
+            }
+        }
+        // OSC 0/2: window/tab title (ignored for now)
     }
 
     fn hook(&mut self, _params: &vte::Params, _intermediates: &[u8], _ignore: bool, _action: char) {}
@@ -468,6 +493,54 @@ impl<'a> Perform for VteHandler<'a> {
             }
             _ => {}
         }
+    }
+}
+
+// Parse OSC 7 "file://hostname/path" or "file:///path" → PathBuf
+fn parse_osc7_path(url: &str) -> Option<std::path::PathBuf> {
+    let rest = url.strip_prefix("file://")?;
+    // file:///path/to/dir — empty hostname
+    let path_str = if rest.starts_with('/') {
+        rest
+    } else {
+        // file://hostname/path — skip up to first '/'
+        { let i = rest.find('/')?; &rest[i..] }
+    };
+    // Percent-decode basic %XX sequences
+    let decoded = percent_decode(path_str);
+    // Reject control bytes (including NUL): any terminal output can emit OSC 7, and a
+    // smuggled `%00`/`%1b` would put a NUL or escape into the cwd PathBuf — invalid for
+    // any later FFI/display use.
+    if decoded.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    Some(std::path::PathBuf::from(decoded))
+}
+
+fn percent_decode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (from_hex(bytes[i+1]), from_hex(bytes[i+2])) {
+                out.push(char::from(h << 4 | l));
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+fn from_hex(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -521,6 +594,10 @@ impl Drop for TermPane {
             self.pty_fd = -1;
         }
     }
+}
+
+impl TermPane {
+    pub fn child_pid(&self) -> libc::pid_t { self.child_pid }
 }
 
 /// Parse raw PTY bytes and update the grid.
@@ -591,22 +668,27 @@ pub fn spawn_terminal_with_shell(pane_id: usize, cols: usize, rows: usize,
                 b"xterm-256color\0".as_ptr().cast(),
                 1,
             );
+            // NOTE: we are post-fork in the child. A panic here would unwind through the
+            // parent's atexit handlers, so on any error we must fall through to exit(1)
+            // rather than unwrap. An embedded NUL in `shell` makes CString::new fail.
             if is_override {
                 // The override is a full command string with arguments (e.g.
                 // "ssh -o ControlPath=... user@host"). execvp does NOT perform
                 // shell word-splitting — it would try to find a file literally
                 // named the whole string, which doesn't exist. Delegate to
                 // `sh -c <cmd>` so the shell parses the arguments correctly.
-                let sh_c   = CString::new("sh").unwrap();
-                let flag_c = CString::new("-c").unwrap();
-                let cmd_c  = CString::new(shell.as_str()).unwrap();
-                libc::execvp(
-                    sh_c.as_ptr(),
-                    [sh_c.as_ptr(), flag_c.as_ptr(), cmd_c.as_ptr(), ptr::null()].as_ptr(),
-                );
-            } else {
+                if let (Ok(sh_c), Ok(flag_c), Ok(cmd_c)) = (
+                    CString::new("sh"),
+                    CString::new("-c"),
+                    CString::new(shell.as_str()),
+                ) {
+                    libc::execvp(
+                        sh_c.as_ptr(),
+                        [sh_c.as_ptr(), flag_c.as_ptr(), cmd_c.as_ptr(), ptr::null()].as_ptr(),
+                    );
+                }
+            } else if let Ok(shell_c) = CString::new(shell.as_str()) {
                 // Plain shell path (e.g. "/bin/zsh") — exec directly with no extra args.
-                let shell_c = CString::new(shell.as_str()).unwrap();
                 libc::execvp(shell_c.as_ptr(), [shell_c.as_ptr(), ptr::null()].as_ptr());
             }
             libc::exit(1);
@@ -736,5 +818,51 @@ pub fn encode_mouse(col: usize, row: usize, cb: u8, press: bool, sgr: bool) -> V
         let b_cx = (cx + 32).min(255) as u8;
         let b_cy = (cy + 32).min(255) as u8;
         vec![0x1b, b'[', b'M', b_cb, b_cx, b_cy]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Drive raw bytes straight into a grid (no PTY) for parser-level tests.
+    fn drive(grid: &mut TermGrid, bytes: &[u8]) {
+        let mut parser = Parser::new();
+        let mut handler = VteHandler { grid };
+        for &b in bytes {
+            parser.advance(&mut handler, b);
+        }
+    }
+
+    #[test]
+    fn erase_at_deferred_wrap_does_not_panic() {
+        // Fill exactly cols*rows cells so the cursor parks one past the last column
+        // (deferred wrap), then issue every erase variant. CSI 1J / 1K used to build
+        // inclusive ranges that indexed cells[..=len] and panicked.
+        for seq in [
+            b"\x1b[J".as_ref(), b"\x1b[1J", b"\x1b[2J",
+            b"\x1b[K", b"\x1b[1K", b"\x1b[2K",
+        ] {
+            let mut g = TermGrid::new(4, 3);
+            drive(&mut g, b"abcdefghijkl"); // 12 chars == 4*3
+            drive(&mut g, seq);             // must not panic
+        }
+    }
+
+    #[test]
+    fn zero_sized_grid_survives_output() {
+        // A degenerate 0x0 grid must not panic on prints, cursor moves, erases, tabs.
+        let mut g = TermGrid::new(0, 0);
+        drive(&mut g, b"hello\x1b[2J\x1b[5;5H\x1b[1K\tworld\n\x1b[10A\x1b[10C");
+    }
+
+    #[test]
+    fn osc7_rejects_control_bytes() {
+        assert!(parse_osc7_path("file:///home/user/%00etc").is_none());
+        assert!(parse_osc7_path("file:///home/%1bevil").is_none());
+        assert_eq!(
+            parse_osc7_path("file:///home/user/proj"),
+            Some(std::path::PathBuf::from("/home/user/proj")),
+        );
     }
 }

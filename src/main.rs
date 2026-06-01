@@ -204,7 +204,7 @@ struct Cursor {
 }
 
 impl Cursor {
-    fn new(pos: usize) -> Self { Cursor { head: pos, tail: pos } }
+    const fn new(pos: usize) -> Self { Cursor { head: pos, tail: pos } }
     fn lo(&self) -> usize { self.head.min(self.tail) }
     fn hi(&self) -> usize { self.head.max(self.tail) }
     fn has_sel(&self) -> bool { self.head != self.tail }
@@ -318,6 +318,7 @@ enum CtxAction {
     FormatDocument,
     OrganizeImports,
     Copy, Cut, Paste,
+    CopyDiagnostic,
     TabCopyRelPath, TabCopyFullPath,
     TabOpenPreview,
     TabClose,
@@ -347,9 +348,15 @@ struct ContextMenu {
     git_entry:  Option<(bool, String)>,  // (staged, path)
     explorer_entry: Option<VPath>,
     explorer_entry_is_dir: bool,         // true when explorer_entry is a directory
+    diag_message: Option<String>,
 }
 
 // ── Quick file finder ─────────────────────────────────────────────────────────
+enum QfCommand {
+    Static(usize),                                // index into COMMANDS
+    LspOutput { pane_id: usize, title: String },  // one per running LSP server
+}
+
 struct QuickFinder {
     open:               bool,
     query:              String,
@@ -357,12 +364,21 @@ struct QuickFinder {
     sel_anchor:         Option<usize>,
     entries:            Vec<VPath>,
     filtered:           Vec<usize>,
-    filtered_commands:  Vec<usize>,
+    filtered_commands:  Vec<QfCommand>,
     selected:           usize,
     restore_tree_focus: bool,
     walk_token:         u64,   // incremented on each open; stale QuickFinderFiles events are dropped
     loading:            bool,  // true while background walk_files is in progress
     remote_directory_mode: bool,
+    // line/col parsed from "file:line:col" query suffix (0-indexed)
+    parsed_line:        Option<usize>,
+    parsed_col:         Option<usize>,
+    // synthetic entry for absolute/~ path queries
+    direct_path:        Option<VPath>,
+    // ':' goto-line mode: live-preview state for Escape restoration
+    preview_pane_id:    Option<usize>,
+    preview_tab_idx:    Option<usize>,
+    preview_saved_char: Option<usize>,
 }
 
 // ── Command palette ───────────────────────────────────────────────────────────
@@ -375,7 +391,6 @@ enum CommandAction {
     CursorBack, CursorForward,
     FormatDocument, OrganizeImports,
     OpenMarkdownPreview,
-    OpenLspOutput,
     OpenRemoteDirectory,
     StartCollab,
     JoinCollab,
@@ -405,7 +420,6 @@ const COMMANDS: &[CommandEntry] = &[
     CommandEntry { name: "Format Document",       shortcut: "Opt+Shift+F",   action: CommandAction::FormatDocument },
     CommandEntry { name: "Organize Imports",      shortcut: "Opt+Shift+O",   action: CommandAction::OrganizeImports },
     CommandEntry { name: "Open Markdown Preview", shortcut: "Cmd+Shift+M",   action: CommandAction::OpenMarkdownPreview },
-    CommandEntry { name: "Open LSP Output",       shortcut: "",              action: CommandAction::OpenLspOutput },
     CommandEntry { name: "Open Remote Directory…", shortcut: "",              action: CommandAction::OpenRemoteDirectory },
     CommandEntry { name: "Start Collab Session",   shortcut: "",              action: CommandAction::StartCollab },
     CommandEntry { name: "Join Collab Session…",   shortcut: "",              action: CommandAction::JoinCollab },
@@ -510,8 +524,10 @@ impl Tab {
     }
 
     fn primary(&self) -> &Cursor {
-        debug_assert!(!self.cursors.is_empty(), "cursors must never be empty");
-        self.cursors.last().unwrap()
+        // Invariant: cursors is never empty (primary_mut restores it). Fall back rather
+        // than unwrap so a violated invariant can't panic a release build mid-render.
+        const FALLBACK: Cursor = Cursor::new(0);
+        self.cursors.last().unwrap_or(&FALLBACK)
     }
     fn primary_mut(&mut self) -> &mut Cursor {
         if self.cursors.is_empty() { self.cursors.push(Cursor::new(0)); }
@@ -1086,30 +1102,6 @@ fn show_lsp_output_pane(s: &mut State, pane_id: usize) {
     s.active_pane = pane_id;
 }
 
-fn open_lsp_output_for_context(s: &mut State) {
-    let active_lsp_scope = s.panes.get(&s.active_pane)
-        .filter(|pane| pane.kind == PaneKind::Editor)
-        .and_then(|pane| pane.tabs.get(pane.active))
-        .and_then(|tab| tab.path.as_ref())
-        .map(|path| (Lang::from_path(path.as_path()), path.ssh_host().cloned()))
-        .filter(|(lang, _)| *lang != Lang::None);
-
-    let target = active_lsp_scope
-        .and_then(|(lang, host)| {
-            s.lsp.servers.iter()
-                .find(|(_, srv)| srv.lang == lang && srv.ssh_host == host)
-                .map(|(&id, _)| id)
-        })
-        .or_else(|| s.lsp.servers.keys().copied().max())
-        .or_else(|| s.panes.values().filter(|p| s.lsp.servers.contains_key(&p.id)).map(|p| p.id).max());
-
-    if let Some(pane_id) = target {
-        show_lsp_output_pane(s, pane_id);
-    } else {
-        s.status_msg = Some("No LSP output is available yet".to_owned());
-    }
-}
-
 fn hide_lsp_output_pane(s: &mut State, pane_id: usize) -> bool {
     remove_pane_from_layout(s, pane_id)
 }
@@ -1330,7 +1322,7 @@ fn active_editor_dir(s: &State) -> Option<VPath> {
 }
 
 fn open_terminal_pane(s: &mut State) {
-    let cwd = active_editor_dir(s);
+    let cwd = s.explorer.as_ref().map(|ex| ex.root.clone());
     open_terminal_pane_at(s, cwd);
 }
 
@@ -1768,6 +1760,17 @@ impl State {
     fn find(&self)         -> &FindBar  { &self.pane().find }
     fn find_mut(&mut self) -> &mut FindBar { let id = self.active_pane; &mut self.panes.get_mut(&id).unwrap().find }
 
+    /// Ensure `active_pane` refers to a live pane. Pane-removal paths keep this in sync, but
+    /// if one ever leaves it dangling, re-point to an existing pane so the many
+    /// `panes[&active_pane]` accessors above can't panic. `panes` always has ≥1 entry.
+    fn ensure_active_pane(&mut self) {
+        if !self.panes.contains_key(&self.active_pane) {
+            if let Some(&id) = self.panes.keys().next() {
+                self.active_pane = id;
+            }
+        }
+    }
+
     fn activity_bar_w(&self) -> i32 {
         if self.explorer.is_some() { self.glyphs.cw * 4 + 8 } else { 0 }
     }
@@ -1979,8 +1982,8 @@ impl State {
                 let c = &self.tab().cursors[i];
                 (c.lo(), c.hi())
             };
-            let lo = (orig_lo as isize + delta) as usize;
-            let hi = (orig_hi as isize + delta) as usize;
+            let lo = apply_delta(orig_lo, delta, self.tab().text.len_chars());
+            let hi = apply_delta(orig_hi, delta, self.tab().text.len_chars());
             if lo < hi {
                 self.tab_mut().text.remove(lo..hi);
                 delta -= (hi - lo) as isize;
@@ -2003,8 +2006,8 @@ impl State {
             let text = texts.get(k).map(|s| s.as_str()).unwrap_or("");
             let n_chars = text.chars().count();
             let (orig_lo, orig_hi) = { let c = &self.tab().cursors[i]; (c.lo(), c.hi()) };
-            let lo = (orig_lo as isize + delta) as usize;
-            let hi = (orig_hi as isize + delta) as usize;
+            let lo = apply_delta(orig_lo, delta, self.tab().text.len_chars());
+            let hi = apply_delta(orig_hi, delta, self.tab().text.len_chars());
             if lo < hi {
                 self.tab_mut().text.remove(lo..hi);
                 delta -= (hi - lo) as isize;
@@ -2028,9 +2031,9 @@ impl State {
                 let c = &self.tab().cursors[i];
                 (c.has_sel(), c.lo(), c.hi(), c.head)
             };
-            let lo   = (orig_lo   as isize + delta) as usize;
-            let hi   = (orig_hi   as isize + delta) as usize;
-            let head = (orig_head as isize + delta) as usize;
+            let lo   = apply_delta(orig_lo, delta, self.tab().text.len_chars());
+            let hi   = apply_delta(orig_hi, delta, self.tab().text.len_chars());
+            let head = apply_delta(orig_head, delta, self.tab().text.len_chars());
             if has_sel {
                 self.tab_mut().text.remove(lo..hi);
                 self.tab_mut().cursors[i] = Cursor::new(lo);
@@ -2057,9 +2060,9 @@ impl State {
                 let c = &self.tab().cursors[i];
                 (c.has_sel(), c.lo(), c.hi(), c.head)
             };
-            let lo   = (orig_lo   as isize + delta) as usize;
-            let hi   = (orig_hi   as isize + delta) as usize;
-            let head = (orig_head as isize + delta) as usize;
+            let lo   = apply_delta(orig_lo, delta, self.tab().text.len_chars());
+            let hi   = apply_delta(orig_hi, delta, self.tab().text.len_chars());
+            let head = apply_delta(orig_head, delta, self.tab().text.len_chars());
             if has_sel {
                 self.tab_mut().text.remove(lo..hi);
                 self.tab_mut().cursors[i] = Cursor::new(lo);
@@ -2087,9 +2090,9 @@ impl State {
                 let c = &self.tab().cursors[i];
                 (c.has_sel(), c.lo(), c.hi(), c.head)
             };
-            let lo   = (orig_lo   as isize + delta) as usize;
-            let hi   = (orig_hi   as isize + delta) as usize;
-            let head = (orig_head as isize + delta) as usize;
+            let lo   = apply_delta(orig_lo, delta, self.tab().text.len_chars());
+            let hi   = apply_delta(orig_hi, delta, self.tab().text.len_chars());
+            let head = apply_delta(orig_head, delta, self.tab().text.len_chars());
             if has_sel {
                 self.tab_mut().text.remove(lo..hi);
                 self.tab_mut().cursors[i] = Cursor::new(lo);
@@ -2121,9 +2124,9 @@ impl State {
                 let c = &self.tab().cursors[i];
                 (c.has_sel(), c.lo(), c.hi(), c.head)
             };
-            let lo   = (orig_lo   as isize + delta) as usize;
-            let hi   = (orig_hi   as isize + delta) as usize;
-            let head = (orig_head as isize + delta) as usize;
+            let lo   = apply_delta(orig_lo, delta, self.tab().text.len_chars());
+            let hi   = apply_delta(orig_hi, delta, self.tab().text.len_chars());
+            let head = apply_delta(orig_head, delta, self.tab().text.len_chars());
             if has_sel {
                 self.tab_mut().text.remove(lo..hi);
                 self.tab_mut().cursors[i] = Cursor::new(lo);
@@ -2159,9 +2162,9 @@ impl State {
                 let c = &self.tab().cursors[i];
                 (c.has_sel(), c.lo(), c.hi(), c.head)
             };
-            let lo   = (orig_lo   as isize + delta) as usize;
-            let hi   = (orig_hi   as isize + delta) as usize;
-            let head = (orig_head as isize + delta) as usize;
+            let lo   = apply_delta(orig_lo, delta, self.tab().text.len_chars());
+            let hi   = apply_delta(orig_hi, delta, self.tab().text.len_chars());
+            let head = apply_delta(orig_head, delta, self.tab().text.len_chars());
             if has_sel {
                 self.tab_mut().text.remove(lo..hi);
                 self.tab_mut().cursors[i] = Cursor::new(lo);
@@ -2193,9 +2196,9 @@ impl State {
                 let c = &self.tab().cursors[i];
                 (c.has_sel(), c.lo(), c.hi(), c.head)
             };
-            let lo   = (orig_lo   as isize + delta) as usize;
-            let hi   = (orig_hi   as isize + delta) as usize;
-            let head = (orig_head as isize + delta) as usize;
+            let lo   = apply_delta(orig_lo, delta, self.tab().text.len_chars());
+            let hi   = apply_delta(orig_hi, delta, self.tab().text.len_chars());
+            let head = apply_delta(orig_head, delta, self.tab().text.len_chars());
             if has_sel {
                 self.tab_mut().text.remove(lo..hi);
                 self.tab_mut().cursors[i] = Cursor::new(lo);
@@ -2529,6 +2532,15 @@ fn lsp_uri_to_vpath(uri: &str, ssh_host: Option<&vpath::SshHost>) -> Option<VPat
     })
 }
 
+fn lsp_root_for_path(s: &State, path: &VPath) -> Option<VPath> {
+    if let Some(ex) = &s.explorer {
+        if path.strip_prefix(&ex.root).is_some() {
+            return Some(ex.root.clone());
+        }
+    }
+    path.parent()
+}
+
 fn apply_goto_definition(s: &mut State, result: &serde_json::Value, ssh_host: Option<vpath::SshHost>) {
     let loc = if result.is_array() { result.get(0) } else { Some(result) };
     let Some(loc) = loc else { return };
@@ -2667,7 +2679,23 @@ fn term_token_bounds(row: &[terminal::Cell], col: usize) -> (usize, usize) {
     while lo > 0 && !row[lo - 1].ch.is_whitespace() { lo -= 1; }
     let mut hi = col;
     while hi + 1 < row.len() && !row[hi + 1].ch.is_whitespace() { hi += 1; }
+    // Extend hi to include :digits and :digits:digits suffixes (for file:line:col)
+    hi = extend_token_with_line_col(row, hi);
     (lo, hi)
+}
+
+fn extend_token_with_line_col(row: &[terminal::Cell], mut hi: usize) -> usize {
+    for _ in 0..2 {
+        if hi + 1 < row.len() && row[hi + 1].ch == ':' {
+            let colon_pos = hi + 1;
+            let mut end = colon_pos + 1;
+            while end < row.len() && row[end].ch.is_ascii_digit() { end += 1; }
+            if end > colon_pos + 1 { hi = end - 1; } else { break; }
+        } else {
+            break;
+        }
+    }
+    hi
 }
 
 fn term_word_bounds(row: &[terminal::Cell], col: usize) -> (usize, usize) {
@@ -2681,20 +2709,153 @@ fn term_word_bounds(row: &[terminal::Cell], col: usize) -> (usize, usize) {
     (lo, hi)
 }
 
-fn open_token(s: &mut State, token: &str) {
+// Get CWD of a running process by PID.
+fn term_cwd(pid: libc::pid_t) -> Option<std::path::PathBuf> {
+    if pid <= 0 { return None; }
+    #[cfg(target_os = "linux")]
+    { std::fs::read_link(format!("/proc/{}/cwd", pid)).ok() }
+    #[cfg(target_os = "macos")]
+    {
+        // Use proc_pidinfo(PROC_PIDVNODEPATHINFO) to get cwd
+        // PROC_PIDVNODEPATHINFO = 9, struct proc_vnodepathinfo is 2344 bytes
+        // cwd path is at offset of pvi_cdir.vip_path (1024 bytes at offset 152)
+        const PROC_PIDVNODEPATHINFO: libc::c_int = 9;
+        const STRUCT_SIZE: usize = 2344;
+        const CWD_PATH_OFFSET: usize = 152;
+        const PATH_MAX: usize = 1024;
+        let mut buf = vec![0u8; STRUCT_SIZE];
+        let ret = unsafe {
+            libc::proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0,
+                buf.as_mut_ptr() as *mut libc::c_void, STRUCT_SIZE as libc::c_int)
+        };
+        if ret <= 0 { return None; }
+        let path_bytes = &buf[CWD_PATH_OFFSET..CWD_PATH_OFFSET + PATH_MAX];
+        let nul = path_bytes.iter().position(|&b| b == 0).unwrap_or(PATH_MAX);
+        if nul == 0 { return None; }
+        std::str::from_utf8(&path_bytes[..nul]).ok()
+            .map(|s| std::path::PathBuf::from(s))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    { None }
+}
+
+fn open_token(s: &mut State, token: &str, child_pid: libc::pid_t, osc_cwd: Option<std::path::PathBuf>) {
     if token.is_empty() { return; }
     if token.starts_with("http://") || token.starts_with("https://") {
         let _ = std::process::Command::new("open").arg(token).spawn();
         return;
     }
-    let expanded = if let Some(rest) = token.strip_prefix("~/") {
-        std::env::var("HOME").map(|h| format!("{}/{}", h, rest)).unwrap_or_else(|_| token.to_owned())
+    // Parse optional :line:col suffix
+    let (path_part, line, col) = split_path_line_col(token);
+    let line = line.unwrap_or(0);
+    let col  = col.unwrap_or(0);
+    // Expand ~
+    let expanded = if let Some(rest) = path_part.strip_prefix("~/") {
+        std::env::var("HOME").map(|h| format!("{}/{}", h, rest)).unwrap_or_else(|_| path_part.to_owned())
     } else {
-        token.to_owned()
+        path_part.to_owned()
     };
-    let path = std::path::Path::new(&expanded);
-    if path.exists() {
-        open_or_reuse_tab(s, VPath::Local(path.to_path_buf()));
+    let pb = std::path::PathBuf::from(&expanded);
+    // Try as absolute path
+    if pb.is_absolute() {
+        if pb.exists() {
+            push_cursor_history(s);
+            jump_to_path_line_col(s, VPath::Local(pb), line, col);
+        }
+        return;
+    }
+    // Relative path: try osc_cwd first, then proc cwd fallback
+    let cwds: Vec<std::path::PathBuf> = [osc_cwd, term_cwd(child_pid)].into_iter().flatten().collect();
+    for cwd in cwds {
+        let candidate = cwd.join(&pb);
+        if candidate.exists() {
+            push_cursor_history(s);
+            jump_to_path_line_col(s, VPath::Local(candidate), line, col);
+            return;
+        }
+    }
+    // Fallback: check if it exists relative to current working dir
+    if pb.exists() {
+        push_cursor_history(s);
+        jump_to_path_line_col(s, VPath::Local(pb), line, col);
+    }
+}
+
+/// Start an LSP server for `lang`/`ssh_host` if one is not already running.
+/// `root` is the workspace root passed to the LSP initialize request.
+fn ensure_lsp_server_running(s: &mut State, lang: Lang, ssh_host: Option<vpath::SshHost>, root: Option<VPath>) {
+    if s.lsp.has_server_for_lang_host(lang, ssh_host.as_ref()) { return; }
+    let op_id = s.next_pane_id;
+    s.next_pane_id += 1;
+    let proxy = s.proxy.clone();
+    let remote_path_dirs = ssh_host.as_ref()
+        .map(|host| remote_lsp_path_dirs(&s.settings, host))
+        .unwrap_or_default();
+    if let Some(mut srv) = lsp::start_server(lang, op_id, proxy, ssh_host.clone(), remote_path_dirs, root.as_ref()) {
+        lsp::send_initialize(&mut srv, root.as_ref());
+        let bin = lsp_binary(lang).unwrap_or("lsp");
+        let invocation = lsp_invocation(lang).unwrap_or(bin);
+        let title = match &ssh_host {
+            Some(host) => format!("{} @ {}", bin, host.display()),
+            None       => bin.to_owned(),
+        };
+        let banner = match &ssh_host {
+            Some(host) => format!("[{}]$ {}\r\n", host.display(), invocation),
+            None       => format!("$ {}\r\n", invocation),
+        };
+        let mut tp = terminal::new_log_pane(op_id, 120, 40, title);
+        let mut banner = banner;
+        if let Some(r) = &root {
+            banner.push_str(&format!("[local-text] root: {}\r\n", r.display_short()));
+            banner.push_str(&format!("[local-text] rootUri: {}\r\n", r.to_lsp_uri()));
+        }
+        if ssh_host.is_some() {
+            banner.push_str("[local-text] remote processId: null\r\n");
+        }
+        terminal::feed_bytes(&mut tp, banner.as_bytes());
+        s.term_panes.insert(op_id, tp);
+        let shell_pane = Pane { id: op_id, kind: PaneKind::Terminal, tabs: vec![], term_ids: vec![op_id], active: 0, find: FindBar::new() };
+        s.panes.insert(op_id, shell_pane);
+        s.lsp.servers.insert(op_id, srv);
+        s.lsp_start_errors.remove(&(ssh_host.clone(), lang));
+    } else {
+        let scope = ssh_host.as_ref()
+            .map(|h| format!("remote {}", h.display()))
+            .unwrap_or_else(|| "local machine".to_owned());
+        let bin = lsp_binary(lang).unwrap_or("language server");
+        let msg = format!("Failed to start {bin} on {scope}");
+        s.status_msg = Some(msg.clone());
+        s.lsp_start_errors.insert((ssh_host, lang), msg);
+    }
+}
+
+/// Detect project type from indicator files in a local directory and start servers eagerly.
+fn start_lsp_for_project(s: &mut State, root: &VPath) {
+    let Some(local_root) = root.as_local_path() else { return };
+    let indicators: &[(&[&str], Lang)] = &[
+        (&["Cargo.toml"],                    Lang::Rust),
+        (&["package.json", "tsconfig.json"], Lang::TypeScript),
+        (&["pyproject.toml", "setup.py"],    Lang::Python),
+    ];
+    for &(files, lang) in indicators {
+        if files.iter().any(|f| local_root.join(f).exists()) {
+            ensure_lsp_server_running(s, lang, None, Some(root.clone()));
+        }
+    }
+}
+
+/// Detect project type from a remote directory listing and start servers eagerly.
+fn start_lsp_for_remote_project(s: &mut State, root: &VPath, entries: &[(String, bool)]) {
+    let ssh_host = root.ssh_host().cloned();
+    let indicators: &[(&[&str], Lang)] = &[
+        (&["Cargo.toml"],                    Lang::Rust),
+        (&["package.json", "tsconfig.json"], Lang::TypeScript),
+        (&["pyproject.toml", "setup.py"],    Lang::Python),
+    ];
+    for &(files, lang) in indicators {
+        if files.iter().any(|f| entries.iter().any(|(name, _)| name == f)) {
+            ensure_lsp_server_running(s, lang, ssh_host.clone(), Some(root.clone()));
+        }
     }
 }
 
@@ -2708,47 +2869,8 @@ fn notify_lsp_open(s: &mut State, path: &VPath) {
         .map(|t| t.text.to_string());
     let Some(text) = text else { return; };
     let ssh_host = path.ssh_host().cloned();
-    // Start server if not running
-    if !s.lsp.has_server_for_lang_host(lang, ssh_host.as_ref()) {
-        let op_id = s.next_pane_id;
-        s.next_pane_id += 1;
-        let proxy = s.proxy.clone();
-        let remote_path_dirs = ssh_host.as_ref()
-            .map(|host| remote_lsp_path_dirs(&s.settings, host))
-            .unwrap_or_default();
-        if let Some(mut srv) = lsp::start_server(lang, op_id, proxy, ssh_host.clone(), remote_path_dirs) {
-            // Send initialize request
-            let root = path.parent();
-            lsp::send_initialize(&mut srv, root.as_ref());
-            // Register LSP output pane backed by a display-only TermPane.
-            // Not shown in the layout tree until an error occurs or the user opens it.
-            let bin = lsp_binary(lang).unwrap_or("lsp");
-            let invocation = lsp_invocation(lang).unwrap_or(bin);
-            let title = match &ssh_host {
-                Some(host) => format!("{} @ {}", bin, host.display()),
-                None       => bin.to_owned(),
-            };
-            let banner = match &ssh_host {
-                Some(host) => format!("[{}]$ {}\r\n", host.display(), invocation),
-                None       => format!("$ {}\r\n", invocation),
-            };
-            let mut tp = terminal::new_log_pane(op_id, 120, 40, title);
-            terminal::feed_bytes(&mut tp, banner.as_bytes());
-            s.term_panes.insert(op_id, tp);
-            let shell_pane = Pane { id: op_id, kind: PaneKind::Terminal, tabs: vec![], term_ids: vec![op_id], active: 0, find: FindBar::new() };
-            s.panes.insert(op_id, shell_pane);
-            s.lsp.servers.insert(op_id, srv);
-            s.lsp_start_errors.remove(&(ssh_host.clone(), lang));
-        } else {
-            let scope = ssh_host.as_ref()
-                .map(|h| format!("remote {}", h.display()))
-                .unwrap_or_else(|| "local machine".to_owned());
-            let bin = lsp_binary(lang).unwrap_or("language server");
-            let msg = format!("Failed to start {bin} on {scope}");
-            s.status_msg = Some(msg.clone());
-            s.lsp_start_errors.insert((ssh_host, lang), msg);
-        }
-    }
+    let lsp_root = lsp_root_for_path(s, path);
+    ensure_lsp_server_running(s, lang, ssh_host.clone(), lsp_root);
     // Send didOpen to the server for this language
     if let Some(srv) = s.lsp.server_for_lang_host_mut(lang, path.ssh_host()) {
         if srv.doc_version.contains_key(path) {
@@ -3996,22 +4118,44 @@ fn fuzzy_score(query: &str, candidate: &str) -> Option<i32> {
     let mut qi = 0;
     let mut score: i32 = 0;
     let mut last_match: Option<usize> = None;
+    let mut consecutive_run: i32 = 0;
+    let mut max_run: i32 = 0;
     for (ci, &c) in cchars.iter().enumerate() {
         if qi < qchars.len() && c == qchars[qi] {
             if let Some(prev) = last_match {
-                if ci == prev + 1 { score += 5; } // consecutive bonus
+                if ci == prev + 1 {
+                    consecutive_run += 1;
+                    max_run = max_run.max(consecutive_run);
+                } else {
+                    consecutive_run = 0;
+                }
+            } else {
+                consecutive_run = 0;
             }
-            // word boundary bonus
-            if ci == 0 || matches!(cchars[ci - 1], '/' | '_' | '-' | '.') { score += 3; }
-            score -= ci as i32 / 4; // earlier match = better
+            if ci == 0 || matches!(cchars[ci - 1], '/' | '_' | '-' | '.') { score += 8; }
+            score -= ci as i32 / 4;
             last_match = Some(ci);
             qi += 1;
         }
     }
-    if qi < qchars.len() { None } else { Some(score) }
+    if qi < qchars.len() { None } else { Some(score + max_run * 8) }
 }
 
 fn fuzzy_score_path(query: &str, path_str: &str) -> Option<i32> {
+    let depth = path_str.chars().filter(|&c| c == '/').count() as i32;
+
+    // Absolute or home-relative queries: match against full path string
+    let abs_query = if query.starts_with('/') {
+        Some(query.to_owned())
+    } else if let Some(rest) = query.strip_prefix("~/") {
+        std::env::var("HOME").ok().map(|h| format!("{}/{}", h, rest))
+    } else {
+        None
+    };
+    if let Some(ref abs_q) = abs_query {
+        return fuzzy_score(abs_q, path_str).map(|sc| sc - depth * 2);
+    }
+
     if query.contains('/') {
         let qsegs: Vec<&str> = query.split('/').filter(|s| !s.is_empty()).collect();
         let psegs: Vec<&str> = path_str.split('/').filter(|s| !s.is_empty()).collect();
@@ -4033,13 +4177,21 @@ fn fuzzy_score_path(query: &str, path_str: &str) -> Option<i32> {
             }
             if !matched { return None; }
         }
-        Some(total)
+        Some(total - depth * 2)
     } else {
         let filename = path_str.rsplit('/').next().unwrap_or(path_str);
+        let ql = query.to_lowercase();
+        let fl = filename.to_lowercase();
+        if fl == ql {
+            return Some(100 + fuzzy_score(query, filename).unwrap_or(0) - depth * 2);
+        }
+        if fl.starts_with(ql.as_str()) {
+            return Some(50 + fuzzy_score(query, filename).unwrap_or(0) - depth * 2);
+        }
         if let Some(sc) = fuzzy_score(query, filename) {
-            Some(sc + 20)
+            Some(sc + 20 - depth * 2)
         } else {
-            fuzzy_score(query, path_str)
+            fuzzy_score(query, path_str).map(|sc| sc - depth * 2)
         }
     }
 }
@@ -4272,25 +4424,164 @@ fn open_quick_finder(s: &mut State, proxy: EventLoopProxy<UserEvent>) {
     }
 }
 
+// Split "path/file.rs:42:5" into ("path/file.rs", Some(41), Some(4)) (0-indexed).
+// Only strips trailing colon-delimited segments that are purely numeric.
+fn split_path_line_col(q: &str) -> (&str, Option<usize>, Option<usize>) {
+    let bytes = q.as_bytes();
+    // Find last ':' where everything after is digits
+    let find_numeric_suffix = |s: &str| -> Option<usize> {
+        let idx = s.rfind(':')?;
+        if s[idx + 1..].bytes().all(|b| b.is_ascii_digit()) && !s[idx + 1..].is_empty() {
+            Some(idx)
+        } else {
+            None
+        }
+    };
+    let _ = bytes; // suppress unused warning
+    let col_sep = find_numeric_suffix(q);
+    let (path_and_line, col) = if let Some(ci) = col_sep {
+        let col_num: usize = q[ci + 1..].parse().unwrap_or(1);
+        (&q[..ci], Some(col_num.saturating_sub(1)))
+    } else {
+        (q, None)
+    };
+    let line_sep = find_numeric_suffix(path_and_line);
+    let (path, line) = if let Some(li) = line_sep {
+        let line_num: usize = path_and_line[li + 1..].parse().unwrap_or(1);
+        (&path_and_line[..li], Some(line_num.saturating_sub(1)))
+    } else {
+        (path_and_line, None)
+    };
+    // If we only found one numeric suffix treat it as line (not col)
+    if col.is_some() && line.is_none() {
+        // col_sep actually held the line number; path_and_line == path_full minus that
+        return (path_and_line, col, None);
+    }
+    (path, line, col)
+}
+
+fn parse_goto_line_query(q: &str) -> Option<(usize, Option<usize>)> {
+    let rest = q.strip_prefix(':')?;
+    let mut parts = rest.splitn(2, ':');
+    let line_str = parts.next()?;
+    if line_str.is_empty() { return None; }
+    let line: usize = line_str.parse().ok()?;
+    let col: Option<usize> = parts.next().and_then(|s| s.parse().ok());
+    Some((line.saturating_sub(1), col.map(|c| c.saturating_sub(1))))
+}
+
+// Move cursor in active editor tab for ':' go-to-line live preview (no file open).
+fn goto_line_preview(s: &mut State, line: usize, col: usize) {
+    let Some(pane_id) = s.quick_finder.preview_pane_id else { return };
+    let Some(tab_idx) = s.quick_finder.preview_tab_idx else { return };
+    let Some(pane) = s.panes.get_mut(&pane_id) else { return };
+    let Some(tab) = pane.tabs.get_mut(tab_idx) else { return };
+    let target_line = line.min(State::last_line(&tab.text));
+    let target_col  = col.min(State::line_len(&tab.text, target_line));
+    let pos = tab.text.line_to_char(target_line) + target_col;
+    tab.cursors = vec![Cursor::new(pos)];
+}
+
 fn refilter_quick_finder(s: &mut State) {
     let q = s.quick_finder.query.clone();
     if q.starts_with('>') {
         let cq = q[1..].trim().to_owned();
-        if cq.is_empty() {
-            s.quick_finder.filtered_commands = (0..COMMANDS.len()).collect();
+        // Build static command entries
+        let static_cmds: Vec<QfCommand> = if cq.is_empty() {
+            (0..COMMANDS.len()).map(QfCommand::Static).collect()
         } else {
             let mut scored: Vec<(usize, i32)> = COMMANDS.iter().enumerate()
                 .filter_map(|(i, cmd)| fuzzy_score(&cq, cmd.name).map(|sc| (i, sc)))
                 .collect();
             scored.sort_by(|a, b| b.1.cmp(&a.1));
-            s.quick_finder.filtered_commands = scored.into_iter().map(|(i, _)| i).collect();
-        }
+            scored.into_iter().map(|(i, _)| QfCommand::Static(i)).collect()
+        };
+        // Build dynamic LSP output entries, one per running server
+        let lsp_cmds: Vec<QfCommand> = s.lsp.servers.values()
+            .filter_map(|srv| {
+                let title = s.term_panes.get(&srv.output_pane_id)?.title.clone();
+                let name = format!("Open LSP Output: {}", title);
+                if cq.is_empty() || fuzzy_score(&cq, &name).is_some() {
+                    Some(QfCommand::LspOutput { pane_id: srv.output_pane_id, title })
+                } else { None }
+            })
+            .collect();
+        s.quick_finder.filtered_commands = static_cmds.into_iter().chain(lsp_cmds).collect();
         s.quick_finder.filtered = vec![];
+        s.quick_finder.parsed_line = None;
+        s.quick_finder.parsed_col  = None;
+        s.quick_finder.direct_path = None;
+    } else if q.starts_with(':') {
+        // Go-to-line mode: live preview
+        s.quick_finder.filtered = vec![];
+        s.quick_finder.filtered_commands = vec![];
+        s.quick_finder.parsed_line = None;
+        s.quick_finder.parsed_col  = None;
+        s.quick_finder.direct_path = None;
+        if let Some((line, col)) = parse_goto_line_query(&q) {
+            goto_line_preview(s, line, col.unwrap_or(0));
+        }
     } else if q.is_empty() {
         s.quick_finder.filtered = (0..s.quick_finder.entries.len()).collect();
         s.quick_finder.filtered_commands = vec![];
+        s.quick_finder.parsed_line = None;
+        s.quick_finder.parsed_col  = None;
+        s.quick_finder.direct_path = None;
     } else {
         let remote_directory_mode = s.quick_finder.remote_directory_mode;
+        // When in a remote workspace (not the host-selection mode), get the SSH host so we
+        // can expand ~/path using the remote user's home instead of the local $HOME.
+        let remote_host: Option<vpath::SshHost> = if !remote_directory_mode {
+            s.explorer.as_ref().and_then(|ex| ex.root.ssh_host().cloned())
+        } else {
+            None
+        };
+        // Strip :line:col suffix before matching
+        let (path_part, parsed_line, parsed_col) = split_path_line_col(&q);
+        s.quick_finder.parsed_line = parsed_line;
+        s.quick_finder.parsed_col  = parsed_col;
+        // For remote workspaces, expand ~/path using the remote user's home directory so
+        // that queries like "~/.bashrc" match remote entries like "/home/user/.bashrc".
+        let remote_expanded = remote_host.as_ref()
+            .and_then(|host| path_part.strip_prefix("~/").map(|rest| {
+                let home = host.user.as_deref()
+                    .map(|u| format!("/home/{u}"))
+                    .unwrap_or_else(|| String::from("~"));
+                format!("{home}/{rest}")
+            }));
+        let effective_path_part: &str = remote_expanded.as_deref().unwrap_or(path_part);
+        // Absolute/home path: build a direct_path entry.
+        // In remote workspaces we create a VPath::Remote without checking local FS.
+        // In local workspaces we only show it if the path actually exists.
+        let direct_path: Option<VPath> = if let Some(ref host) = remote_host {
+            let expanded = if let Some(rest) = path_part.strip_prefix("~/") {
+                let home = host.user.as_deref()
+                    .map(|u| format!("/home/{u}"))
+                    .unwrap_or_else(|| String::from("~"));
+                Some(format!("{home}/{rest}"))
+            } else if path_part.starts_with('/') {
+                Some(path_part.to_owned())
+            } else {
+                None
+            };
+            expanded.map(|p| VPath::Remote {
+                host: host.clone(),
+                path: std::path::PathBuf::from(p),
+            })
+        } else {
+            let expanded = if let Some(rest) = path_part.strip_prefix("~/") {
+                std::env::var("HOME").ok().map(|h| format!("{}/{}", h, rest))
+            } else if path_part.starts_with('/') {
+                Some(path_part.to_owned())
+            } else {
+                None
+            };
+            expanded.and_then(|p| {
+                let pb = std::path::PathBuf::from(&p);
+                if pb.exists() { Some(VPath::Local(pb)) } else { None }
+            })
+        };
+        s.quick_finder.direct_path = direct_path;
         let mut scored: Vec<(usize, i32)> = s.quick_finder.entries.iter().enumerate()
             .filter_map(|(i, p)| {
                 let path_str = if remote_directory_mode {
@@ -4298,7 +4589,7 @@ fn refilter_quick_finder(s: &mut State) {
                 } else {
                     p.as_path().to_string_lossy().into_owned()
                 };
-                fuzzy_score_path(&q, &path_str).map(|sc| (i, sc))
+                fuzzy_score_path(effective_path_part, &path_str).map(|sc| (i, sc))
             })
             .collect();
         scored.sort_by(|a, b| b.1.cmp(&a.1));
@@ -4534,7 +4825,10 @@ fn handle_collab_msg(s: &mut State, from_site_id: u64, msg: collab::CollabMsg) {
 
             let content = in_memory.or_else(|| {
                 root.as_ref().and_then(|root| {
-                    let full_path = root.join(&path);
+                    // Sandbox: only serve files that resolve inside the workspace root.
+                    // Guests send workspace-relative paths; an absolute or `..` path would
+                    // otherwise let `join` escape the root and read arbitrary host files.
+                    let full_path = collab::resolve_under_root(root, &path)?;
                     std::fs::read_to_string(&full_path).ok()
                 })
             });
@@ -4657,11 +4951,7 @@ fn execute_command(s: &mut State, action: CommandAction) {
                             let path_clone = p.clone();
                             let local_str = local.to_string_lossy().into_owned();
                             let proxy = s.proxy.clone();
-                            let cmd_str = if fmt_cmd.contains("{file}") {
-                                fmt_cmd.replace("{file}", &local_str)
-                            } else {
-                                format!("{} {}", fmt_cmd, local_str)
-                            };
+                            let cmd_str = build_format_command(&fmt_cmd, &local_str);
                             std::thread::spawn(move || {
                                 let _ = std::process::Command::new("sh").arg("-c").arg(&cmd_str).status();
                                 let _ = proxy.send_event(UserEvent::FormatterDone { path: path_clone });
@@ -4735,7 +5025,9 @@ fn execute_command(s: &mut State, action: CommandAction) {
         CommandAction::ToggleExplorer => {
             if s.explorer.is_none() {
                 let root = std::env::current_dir().unwrap_or_default();
-                s.explorer = Some(FileExplorer::new(VPath::Local(root)));
+                let root_vpath = VPath::Local(root);
+                s.explorer = Some(FileExplorer::new(root_vpath.clone()));
+                start_lsp_for_project(s, &root_vpath);
             } else {
                 s.explorer = None;
             }
@@ -4807,8 +5099,8 @@ fn execute_command(s: &mut State, action: CommandAction) {
                 let mut delta: isize = 0;
                 for &i in &order {
                     if s.tab().cursors[i].has_sel() {
-                        let lo = (s.tab().cursors[i].lo() as isize + delta) as usize;
-                        let hi = (s.tab().cursors[i].hi() as isize + delta) as usize;
+                        let lo = apply_delta(s.tab().cursors[i].lo(), delta, s.tab().text.len_chars());
+                        let hi = apply_delta(s.tab().cursors[i].hi(), delta, s.tab().text.len_chars());
                         s.tab_mut().text.remove(lo..hi);
                         s.tab_mut().cursors[i] = Cursor::new(lo);
                         delta -= (hi - lo) as isize;
@@ -4854,7 +5146,6 @@ fn execute_command(s: &mut State, action: CommandAction) {
             }
         }
         CommandAction::OpenMarkdownPreview => open_markdown_preview(s),
-        CommandAction::OpenLspOutput => open_lsp_output_for_context(s),
         CommandAction::OpenRemoteDirectory => {
             let query = s.quick_finder.query.trim().to_owned();
             if query.starts_with("ssh://") {
@@ -4934,6 +5225,27 @@ fn execute_command(s: &mut State, action: CommandAction) {
 }
 
 // ── Global find/replace ───────────────────────────────────────────────────────
+
+/// Apply a signed `delta` to a character index, saturating at 0 and clamping to `len`.
+/// Multi-cursor edit batches accumulate `delta` across cursors; without this a negative
+/// running sum would wrap through `as usize` into a huge index and panic the rope op.
+#[inline]
+fn apply_delta(pos: usize, delta: isize, len: usize) -> usize {
+    (pos as isize + delta).clamp(0, len as isize) as usize
+}
+
+/// Build the shell command line for the external formatter. `format_command` is the user's
+/// own setting, but the file path is interpolated into `sh -c`, so it MUST be shell-quoted:
+/// otherwise a maliciously-named file (e.g. `$(...).rs` from a cloned repo) would inject
+/// commands. `{file}` is substituted if present, otherwise the quoted path is appended.
+fn build_format_command(fmt_cmd: &str, file: &str) -> String {
+    let quoted = ssh::shell_quote(file);
+    if fmt_cmd.contains("{file}") {
+        fmt_cmd.replace("{file}", &quoted)
+    } else {
+        format!("{fmt_cmd} {quoted}")
+    }
+}
 
 fn glob_match(pattern: &str, path_str: &str) -> bool {
     if pattern.is_empty() { return true; }
@@ -5475,6 +5787,8 @@ impl ApplicationHandler<UserEvent> for App {
                 entries: vec![], filtered: vec![], filtered_commands: vec![], selected: 0,
                 restore_tree_focus: false, walk_token: 0, loading: false,
                 remote_directory_mode: false,
+                parsed_line: None, parsed_col: None, direct_path: None,
+                preview_pane_id: None, preview_tab_idx: None, preview_saved_char: None,
             },
             global_find: GlobalFind {
                 query: String::new(), replace: String::new(),
@@ -5505,6 +5819,9 @@ impl ApplicationHandler<UserEvent> for App {
         if let Some(path) = initial_lsp_path {
             notify_lsp_open(&mut s, &path);
         }
+        if let Some(root) = s.explorer.as_ref().map(|ex| ex.root.clone()) {
+            start_lsp_for_project(&mut s, &root);
+        }
         s.win.request_redraw();
         self.state = Some(s);
         self.apply_vsync_setting();
@@ -5513,6 +5830,7 @@ impl ApplicationHandler<UserEvent> for App {
     fn window_event(&mut self, el: &ActiveEventLoop, _id: winit::window::WindowId, event: WindowEvent) {
         let Some(s) = self.state.as_mut() else { return };
         if s.panes.is_empty() { return; }
+        s.ensure_active_pane(); // re-point active_pane if a prior handler left it dangling
 
         match event {
             WindowEvent::CloseRequested => { s.panes.clear(); el.exit(); }
@@ -5637,10 +5955,12 @@ impl ApplicationHandler<UserEvent> for App {
                     s.win.set_cursor(CursorIcon::EwResize);
                 } else {
                     let area = s.pane_area();
-                    let on_border = mx >= area.x && my >= area.y && my < area.y + area.h
-                        && find_border_at(&s.pane_tree, area, mx, my).is_some();
-                    if on_border {
-                        let axis = find_border_at(&s.pane_tree, area, mx, my).unwrap().1;
+                    let border = if mx >= area.x && my >= area.y && my < area.y + area.h {
+                        find_border_at(&s.pane_tree, area, mx, my)
+                    } else {
+                        None
+                    };
+                    if let Some((_, axis, _)) = border {
                         s.win.set_cursor(if axis == Axis::H { CursorIcon::EwResize } else { CursorIcon::NsResize });
                     } else {
                         let r     = s.active_pane_rect();
@@ -5843,6 +6163,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 tab_source: None, git_entry: None,
                                 explorer_entry: Some(entry),
                                 explorer_entry_is_dir: is_dir,
+                                diag_message: None,
                                 items,
                             });
                             { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
@@ -5881,6 +6202,7 @@ impl ApplicationHandler<UserEvent> for App {
                             x: mx, y: my, hovered: 0, tab_source: None,
                             git_entry: Some((is_staged, entry_path)),
                             explorer_entry: None, explorer_entry_is_dir: false,
+                            diag_message: None,
                             items: vec![
                                 ContextMenuItem { label: "Open File", shortcut: "", action: CtxAction::GitOpenFile, enabled: true },
                                 ContextMenuItem { label: "View Diff", shortcut: "", action: CtxAction::GitViewDiff, enabled: true },
@@ -5938,7 +6260,7 @@ impl ApplicationHandler<UserEvent> for App {
                     items.push(ContextMenuItem { label: "",            shortcut: "", action: CtxAction::Separator,     enabled: true });
                     items.push(ContextMenuItem { label: "Close",       shortcut: "Cmd+W", action: CtxAction::TabClose, enabled: true });
                     s.context_menu = Some(ContextMenu {
-                        x: mx, y: my, hovered: 0, tab_source: Some((hit.pid, hit.ti)), git_entry: None, explorer_entry: None, explorer_entry_is_dir: false, items,
+                        x: mx, y: my, hovered: 0, tab_source: Some((hit.pid, hit.ti)), git_entry: None, explorer_entry: None, explorer_entry_is_dir: false, diag_message: None, items,
                     });
                 } else {
                     // Editor text-area context menu
@@ -5952,20 +6274,52 @@ impl ApplicationHandler<UserEvent> for App {
                                     s.lsp.server_for_lang_host(lang, p.ssh_host()).map(|srv| srv.initialized)
                                 }).unwrap_or(false);
                             let has_sel = s.tab().cursors.iter().any(|c| c.has_sel());
+
+                            // Detect if right-click is over a diagnostic squiggle
+                            let diag_message: Option<String> = {
+                                let pane_rect = layout_tree(&s.pane_tree, area).into_iter()
+                                    .find(|(id, _)| *id == pid)
+                                    .map(|(_, r)| r);
+                                pane_rect.and_then(|rect| {
+                                    let lh = s.glyphs.lh;
+                                    let cw = s.glyphs.cw;
+                                    let tab_h = s.tab_h();
+                                    let total_lines = s.panes[&pid].tab().text.len_lines();
+                                    let gutter_w = State::gutter_w(total_lines, cw);
+                                    let ed_x = rect.x + gutter_w;
+                                    let scroll = s.panes[&pid].tab().scroll;
+                                    let hscroll = s.panes[&pid].tab().hscroll;
+                                    let line = scroll + ((my - rect.y - tab_h).max(0) / lh) as usize;
+                                    let col = ((mx - ed_x).max(0) / cw) as usize + hscroll;
+                                    active_path.as_ref()
+                                        .and_then(|p| s.diagnostics.get(p))
+                                        .and_then(|diags| diags.iter().find(|d| {
+                                            d.line == line && col >= d.col_start && col < d.col_end.max(d.col_start + 1)
+                                        }))
+                                        .map(|d| d.message.clone())
+                                })
+                            };
+
+                            let mut items = vec![
+                                ContextMenuItem { label: "Go to Definition",    shortcut: "Cmd+Click / F12", action: CtxAction::GotoDefinition,  enabled: lsp_avail },
+                                ContextMenuItem { label: "Find All References", shortcut: "Cmd+Shift+F12",   action: CtxAction::FindReferences,  enabled: lsp_avail },
+                                ContextMenuItem { label: "Format Document",     shortcut: "Opt+Shift+F",     action: CtxAction::FormatDocument,  enabled: lsp_avail },
+                                ContextMenuItem { label: "Organize Imports",    shortcut: "Opt+Shift+O",     action: CtxAction::OrganizeImports, enabled: lsp_avail },
+                                ContextMenuItem { label: "",                    shortcut: "",                action: CtxAction::Separator,       enabled: true },
+                                ContextMenuItem { label: "Copy",                shortcut: "Cmd+C",           action: CtxAction::Copy,            enabled: has_sel },
+                                ContextMenuItem { label: "Cut",                 shortcut: "Cmd+X",           action: CtxAction::Cut,             enabled: has_sel },
+                                ContextMenuItem { label: "Paste",               shortcut: "Cmd+V",           action: CtxAction::Paste,           enabled: true },
+                            ];
+                            if diag_message.is_some() {
+                                items.push(ContextMenuItem { label: "", shortcut: "", action: CtxAction::Separator, enabled: true });
+                                items.push(ContextMenuItem { label: "Copy Diagnostic", shortcut: "", action: CtxAction::CopyDiagnostic, enabled: true });
+                            }
                             s.context_menu = Some(ContextMenu {
                                 x: mx, y: my,
                                 hovered: 0,
                                 tab_source: None, git_entry: None, explorer_entry: None, explorer_entry_is_dir: false,
-                                items: vec![
-                                    ContextMenuItem { label: "Go to Definition",   shortcut: "Cmd+Click / F12",   action: CtxAction::GotoDefinition,  enabled: lsp_avail },
-                                    ContextMenuItem { label: "Find All References", shortcut: "Cmd+Shift+F12",    action: CtxAction::FindReferences,   enabled: lsp_avail },
-                                    ContextMenuItem { label: "Format Document",    shortcut: "Opt+Shift+F",       action: CtxAction::FormatDocument,  enabled: lsp_avail },
-                                    ContextMenuItem { label: "Organize Imports",   shortcut: "Opt+Shift+O",       action: CtxAction::OrganizeImports, enabled: lsp_avail },
-                                    ContextMenuItem { label: "",                   shortcut: "",                  action: CtxAction::Separator,       enabled: true },
-                                    ContextMenuItem { label: "Copy",               shortcut: "Cmd+C",             action: CtxAction::Copy,            enabled: has_sel },
-                                    ContextMenuItem { label: "Cut",                shortcut: "Cmd+X",             action: CtxAction::Cut,             enabled: has_sel },
-                                    ContextMenuItem { label: "Paste",              shortcut: "Cmd+V",             action: CtxAction::Paste,           enabled: true },
-                                ],
+                                diag_message,
+                                items,
                             });
                         }
                     }
@@ -6041,6 +6395,7 @@ impl ApplicationHandler<UserEvent> for App {
                         let git_entry  = cm.git_entry.clone();
                         let explorer_entry = cm.explorer_entry.clone();
                         let explorer_entry_is_dir = cm.explorer_entry_is_dir;
+                        let diag_message = cm.diag_message.clone();
                         s.context_menu = None;
                         if let Some(action) = action_taken {
                             let root_ga = s.explorer.as_ref()
@@ -6086,6 +6441,9 @@ impl ApplicationHandler<UserEvent> for App {
                                 CtxAction::Copy  => { execute_command(s, CommandAction::Copy); }
                                 CtxAction::Cut   => { execute_command(s, CommandAction::Cut); notify_collab_change(s); }
                                 CtxAction::Paste => { execute_command(s, CommandAction::Paste); notify_collab_change(s); }
+                                CtxAction::CopyDiagnostic => {
+                                    if let Some(msg) = diag_message { clipboard_set(&msg); }
+                                }
                                 CtxAction::ExplorerOpenAsRoot => {
                                     if let Some(path) = explorer_entry {
                                         if let Some(uri) = remote_uri(&path) {
@@ -6219,7 +6577,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 x: act_w, y: gear_y,
                                 items: vec![ContextMenuItem { label: "Open Settings", shortcut: "", action: CtxAction::OpenSettings, enabled: true }],
                                 hovered: 0,
-                                tab_source: None, git_entry: None, explorer_entry: None, explorer_entry_is_dir: false,
+                                tab_source: None, git_entry: None, explorer_entry: None, explorer_entry_is_dir: false, diag_message: None,
                             });
                         }
                     }
@@ -6637,8 +6995,10 @@ impl ApplicationHandler<UserEvent> for App {
                                         if term_row < rows.len() {
                                             let (lo, hi) = term_token_bounds(&rows[term_row], term_col);
                                             let token: String = rows[term_row][lo..=hi].iter().map(|c| c.ch).collect();
+                                            let child_pid = tp.child_pid();
+                                            let osc_cwd   = tp.grid.cwd.clone();
                                             drop(rows);
-                                            open_token(s, &token);
+                                            open_token(s, &token, child_pid, osc_cwd);
                                         }
                                     } else if s.term_click_count == 2 {
                                         // Double-click: select word on this row
@@ -7052,7 +7412,7 @@ impl ApplicationHandler<UserEvent> for App {
                             let mut hi = pos + 1;
                             while hi < len && !s.tab().text.char(hi).is_whitespace() { hi += 1; }
                             let token: String = s.tab().text.slice(lo..hi).chars().collect();
-                            open_token(s, &token);
+                            open_token(s, &token, 0, None);
                         }
                     }
                 } else if alt {
@@ -7288,6 +7648,30 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
 
+                // Cmd+G — go to line in current file
+                if cmd && !shift && matches!(&event.logical_key, Key::Character(c) if matches!(c.as_str(), "g" | "G")) {
+                    let pane_id = s.active_pane;
+                    let (preview_pane_id, preview_tab_idx, preview_saved_char) =
+                        if let Some(pane) = s.panes.get(&pane_id) {
+                            if pane.kind == PaneKind::Editor {
+                                let tidx = pane.active;
+                                let saved = pane.tabs.get(tidx)
+                                    .and_then(|t| t.cursors.first())
+                                    .map(|c| c.head);
+                                (Some(pane_id), Some(tidx), saved)
+                            } else { (None, None, None) }
+                        } else { (None, None, None) };
+                    open_quick_finder(s, self.proxy.clone());
+                    s.quick_finder.query               = ":".to_string();
+                    s.quick_finder.cursor              = 1;
+                    s.quick_finder.preview_pane_id     = preview_pane_id;
+                    s.quick_finder.preview_tab_idx     = preview_tab_idx;
+                    s.quick_finder.preview_saved_char  = preview_saved_char;
+                    refilter_quick_finder(s);
+                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                    return;
+                }
+
                 // Cmd+B — toggle left panel visibility
                 if cmd && !shift && matches!(&event.logical_key, Key::Character(c) if matches!(c.as_str(), "b" | "B")) {
                     if s.explorer.is_some() {
@@ -7308,8 +7692,10 @@ impl ApplicationHandler<UserEvent> for App {
                 if cmd && shift && matches!(&event.logical_key, Key::Character(c) if matches!(c.as_str(), "f" | "F")) {
                     if s.explorer.is_none() {
                         let root = std::env::current_dir().unwrap_or_default();
-                        s.explorer = Some(FileExplorer::new(VPath::Local(root)));
+                        let root_vpath = VPath::Local(root);
+                        s.explorer = Some(FileExplorer::new(root_vpath.clone()));
                         s.explorer_w = ((200.0 * s.font_size / FONT_PX).round() as i32).clamp(80, 600);
+                        start_lsp_for_project(s, &root_vpath);
                     }
                     s.left_view = LeftView::GlobalSearch;
                     s.global_find.focus = GlobalFindFocus::Query;
@@ -7368,9 +7754,27 @@ impl ApplicationHandler<UserEvent> for App {
 
                 // Quick finder / command palette input routing (unified)
                 if s.quick_finder.open {
-                    let is_cmd_mode = s.quick_finder.query.starts_with('>');
+                    let is_cmd_mode  = s.quick_finder.query.starts_with('>');
+                    let is_goto_mode = s.quick_finder.query.starts_with(':');
                     match &event.logical_key {
                         Key::Named(NamedKey::Escape) => {
+                            // Restore cursor if we were in ':' goto live-preview mode
+                            if is_goto_mode {
+                                if let Some(saved) = s.quick_finder.preview_saved_char {
+                                    let pid = s.quick_finder.preview_pane_id;
+                                    let tidx = s.quick_finder.preview_tab_idx;
+                                    if let (Some(pid), Some(tidx)) = (pid, tidx) {
+                                        if let Some(pane) = s.panes.get_mut(&pid) {
+                                            if let Some(tab) = pane.tabs.get_mut(tidx) {
+                                                tab.cursors = vec![Cursor::new(saved)];
+                                            }
+                                        }
+                                    }
+                                }
+                                s.quick_finder.preview_pane_id    = None;
+                                s.quick_finder.preview_tab_idx    = None;
+                                s.quick_finder.preview_saved_char = None;
+                            }
                             s.quick_finder.open = false;
                             s.quick_finder.remote_directory_mode = false;
                             if s.quick_finder.restore_tree_focus {
@@ -7392,14 +7796,41 @@ impl ApplicationHandler<UserEvent> for App {
                         Key::Named(NamedKey::Enter) => {
                             let idx = s.quick_finder.selected;
                             if is_cmd_mode {
-                                if let Some(&fi) = s.quick_finder.filtered_commands.get(idx) {
-                                    let action = COMMANDS[fi].action;
+                                match s.quick_finder.filtered_commands.get(idx) {
+                                    Some(QfCommand::Static(fi)) => {
+                                        let action = COMMANDS[*fi].action;
+                                        s.quick_finder.open = false;
+                                        if s.quick_finder.restore_tree_focus {
+                                            s.quick_finder.restore_tree_focus = false;
+                                            if let Some(ex) = s.explorer.as_mut() { ex.tree_search_focused = true; }
+                                        }
+                                        execute_command(s, action);
+                                    }
+                                    Some(QfCommand::LspOutput { pane_id, .. }) => {
+                                        let pid = *pane_id;
+                                        s.quick_finder.open = false;
+                                        if s.quick_finder.restore_tree_focus {
+                                            s.quick_finder.restore_tree_focus = false;
+                                            if let Some(ex) = s.explorer.as_mut() { ex.tree_search_focused = true; }
+                                        }
+                                        show_lsp_output_pane(s, pid);
+                                    }
+                                    None => {}
+                                }
+                            } else if is_goto_mode {
+                                // ':' go-to-line mode: cursor already moved by live preview
+                                if let Some((line, col)) = parse_goto_line_query(&s.quick_finder.query.clone()) {
+                                    s.quick_finder.preview_saved_char = None; // keep position on Enter
                                     s.quick_finder.open = false;
+                                    s.quick_finder.preview_pane_id    = None;
+                                    s.quick_finder.preview_tab_idx    = None;
                                     if s.quick_finder.restore_tree_focus {
                                         s.quick_finder.restore_tree_focus = false;
                                         if let Some(ex) = s.explorer.as_mut() { ex.tree_search_focused = true; }
                                     }
-                                    execute_command(s, action);
+                                    // Re-apply jump in case preview_pane_id was unset
+                                    goto_line_preview(s, line, col.unwrap_or(0));
+                                    s.ensure_visible();
                                 }
                             } else {
                                 let query = s.quick_finder.query.trim().to_owned();
@@ -7408,6 +7839,15 @@ impl ApplicationHandler<UserEvent> for App {
                                 } else {
                                     None
                                 };
+                                // Helper: after opening a file, jump to parsed line:col if present
+                                macro_rules! maybe_jump {
+                                    ($path:expr) => {
+                                        if let Some(line) = s.quick_finder.parsed_line {
+                                            let col = s.quick_finder.parsed_col.unwrap_or(0);
+                                            jump_to_path_line_col(s, $path, line, col);
+                                        }
+                                    };
+                                }
                                 if s.quick_finder.remote_directory_mode {
                                     s.quick_finder.open = false;
                                     s.quick_finder.remote_directory_mode = false;
@@ -7438,6 +7878,16 @@ impl ApplicationHandler<UserEvent> for App {
                                         Ok((vpath, uri)) => open_remote_directory(s, vpath, uri),
                                         Err(msg) => s.status_msg = Some(msg),
                                     }
+                                } else if let Some(direct) = s.quick_finder.direct_path.clone().filter(|_| idx == 0 && s.quick_finder.filtered.is_empty()) {
+                                    // Direct absolute/~ path with no fuzzy results
+                                    s.quick_finder.open = false;
+                                    if s.quick_finder.restore_tree_focus {
+                                        s.quick_finder.restore_tree_focus = false;
+                                        if let Some(ex) = s.explorer.as_mut() { ex.tree_search_focused = true; }
+                                    }
+                                    push_cursor_history(s);
+                                    open_or_reuse_tab(s, direct.clone());
+                                    maybe_jump!(direct);
                                 } else if let Some(&fi) = s.quick_finder.filtered.get(idx) {
                                     let path = s.quick_finder.entries[fi].clone();
                                     s.quick_finder.open = false;
@@ -7455,7 +7905,8 @@ impl ApplicationHandler<UserEvent> for App {
                                         }
                                     } else {
                                         push_cursor_history(s);
-                                        open_or_reuse_tab(s, path);
+                                        open_or_reuse_tab(s, path.clone());
+                                        maybe_jump!(path);
                                     }
                                 }
                             }
@@ -7469,6 +7920,40 @@ impl ApplicationHandler<UserEvent> for App {
                                 let qf = &mut s.quick_finder;
                                 input_field_edit(&mut qf.query, &mut qf.cursor, &mut qf.sel_anchor,
                                                  key, cmd, alt, ctrl, shift);
+                            }
+                            // If the query just transitioned to ':' mode, save preview cursor state
+                            if !prev.starts_with(':') && s.quick_finder.query.starts_with(':')
+                                && s.quick_finder.preview_saved_char.is_none()
+                            {
+                                let pane_id = s.active_pane;
+                                if let Some(pane) = s.panes.get(&pane_id) {
+                                    if pane.kind == PaneKind::Editor {
+                                        let tidx = pane.active;
+                                        let saved = pane.tabs.get(tidx)
+                                            .and_then(|t| t.cursors.first())
+                                            .map(|c| c.head);
+                                        s.quick_finder.preview_pane_id    = Some(pane_id);
+                                        s.quick_finder.preview_tab_idx    = Some(tidx);
+                                        s.quick_finder.preview_saved_char = saved;
+                                    }
+                                }
+                            }
+                            // If the query just left ':' mode (user backspaced), restore cursor
+                            if prev.starts_with(':') && !s.quick_finder.query.starts_with(':') {
+                                if let Some(saved) = s.quick_finder.preview_saved_char {
+                                    let pid  = s.quick_finder.preview_pane_id;
+                                    let tidx = s.quick_finder.preview_tab_idx;
+                                    if let (Some(pid), Some(tidx)) = (pid, tidx) {
+                                        if let Some(pane) = s.panes.get_mut(&pid) {
+                                            if let Some(tab) = pane.tabs.get_mut(tidx) {
+                                                tab.cursors = vec![Cursor::new(saved)];
+                                            }
+                                        }
+                                    }
+                                }
+                                s.quick_finder.preview_pane_id    = None;
+                                s.quick_finder.preview_tab_idx    = None;
+                                s.quick_finder.preview_saved_char = None;
                             }
                             if s.quick_finder.query != prev { refilter_quick_finder(s); }
                         }
@@ -7979,8 +8464,8 @@ impl ApplicationHandler<UserEvent> for App {
                                     let mut delta: isize = 0;
                                     for &i in &order {
                                         if s.tab().cursors[i].has_sel() {
-                                            let lo = (s.tab().cursors[i].lo() as isize + delta) as usize;
-                                            let hi = (s.tab().cursors[i].hi() as isize + delta) as usize;
+                                            let lo = apply_delta(s.tab().cursors[i].lo(), delta, s.tab().text.len_chars());
+                                            let hi = apply_delta(s.tab().cursors[i].hi(), delta, s.tab().text.len_chars());
                                             s.tab_mut().text.remove(lo..hi);
                                             s.tab_mut().cursors[i] = Cursor::new(lo);
                                             delta -= (hi - lo) as isize;
@@ -8627,6 +9112,11 @@ impl ApplicationHandler<UserEvent> for App {
                 self.dirty.store(true, Ordering::Release);
             }
             UserEvent::RemoteDirListing { path, entries } => {
+                // Start LSP servers for recognised project types on first root listing.
+                // Check before consuming `entries` in the explorer update below.
+                if s.explorer.as_ref().map_or(false, |ex| ex.root == path) {
+                    start_lsp_for_remote_project(s, &path, &entries);
+                }
                 if let Some(ex) = s.explorer.as_mut() {
                     if ex.root == path {
                         let root_path = path.as_path().to_path_buf();
@@ -9439,9 +9929,10 @@ fn render(s: &mut State) {
     let qf_sel_anchor_chars: Option<usize> = s.quick_finder.sel_anchor.map(|a|
         s.quick_finder.query[..a].chars().count());
     let qf_is_cmd_mode  = qf_query.starts_with('>');
+    let qf_is_goto_mode = qf_query.starts_with(':');
     let qf_remote_directory_mode = s.quick_finder.remote_directory_mode;
     let qf_selected     = s.quick_finder.selected;
-    let qf_items: Vec<(String, String)> = if qf_open && !qf_is_cmd_mode {
+    let qf_items: Vec<(String, String)> = if qf_open && !qf_is_cmd_mode && !qf_is_goto_mode {
         let n = s.quick_finder.filtered.len();
         let view_start = qf_selected.saturating_sub(4).min(n.saturating_sub(10));
         let view_end   = (view_start + 10).min(n);
@@ -9457,17 +9948,30 @@ fn render(s: &mut State) {
             (name, dir)
         }).collect()
     } else { vec![] };
-    let qf_sel_in_view = if qf_open && !qf_is_cmd_mode {
+    let qf_sel_in_view = if qf_open && !qf_is_cmd_mode && !qf_is_goto_mode {
         let n = s.quick_finder.filtered.len();
         let view_start = qf_selected.saturating_sub(4).min(n.saturating_sub(10));
         qf_selected.saturating_sub(view_start)
     } else { 0 };
+    // Direct path entry (for absolute/~ queries with no fuzzy results)
+    let qf_direct_item: Option<(String, String)> = if qf_open && !qf_is_cmd_mode && !qf_is_goto_mode
+        && qf_items.is_empty() && !qf_loading
+    {
+        s.quick_finder.direct_path.as_ref().map(|p| {
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_owned();
+            let dir  = p.parent_str();
+            (name, dir)
+        })
+    } else { None };
     let qf_cmd_items: Vec<(String, String)> = if qf_open && qf_is_cmd_mode {
         let n = s.quick_finder.filtered_commands.len();
         let view_start = qf_selected.saturating_sub(4).min(n.saturating_sub(10));
         let view_end   = (view_start + 10).min(n);
-        s.quick_finder.filtered_commands[view_start..view_end].iter().map(|&idx| {
-            (COMMANDS[idx].name.to_owned(), COMMANDS[idx].shortcut.to_owned())
+        s.quick_finder.filtered_commands[view_start..view_end].iter().map(|cmd| {
+            match cmd {
+                QfCommand::Static(i) => (COMMANDS[*i].name.to_owned(), COMMANDS[*i].shortcut.to_owned()),
+                QfCommand::LspOutput { title, .. } => (format!("Open LSP Output: {}", title), String::new()),
+            }
         }).collect()
     } else { vec![] };
     let qf_cmd_sel_in_view = if qf_open && qf_is_cmd_mode {
@@ -10913,7 +11417,13 @@ fn render(s: &mut State) {
         // ── Quick finder / command palette overlay (unified) ─────────────
         if qf_open {
             darken_buffer(buf, w, h);
-            let item_count = if qf_is_cmd_mode { qf_cmd_items.len() } else { qf_items.len().max(if qf_loading { 1 } else { 0 }) };
+            let item_count = if qf_is_cmd_mode {
+                qf_cmd_items.len()
+            } else if qf_is_goto_mode {
+                1  // one placeholder row
+            } else {
+                qf_items.len().max(if qf_direct_item.is_some() { 1 } else { 0 }).max(if qf_loading { 1 } else { 0 })
+            };
             let ow = (w as i32 * 2 / 3).min(w as i32 - 40).max(360);
             let oh = lh * (item_count as i32 + 2) + 8;
             let ox = (w as i32 - ow) / 2;
@@ -10937,6 +11447,24 @@ fn render(s: &mut State) {
                 }
                 // Leading '>' in accent, rest of query in FG
                 draw_str(buf, w, h, g, ">", ox + 4, oy + 4 + asc, ACCENT, ox + 4 + cw);
+                if qf_query.len() > 1 {
+                    draw_str(buf, w, h, g, &qf_query[1..], ox + 4 + cw, oy + 4 + asc, FG, ox + ow - 4);
+                }
+                let cur_x = ox + 4 + qf_cursor_chars as i32 * cw;
+                fill(buf, w, h, cur_x.min(ox + ow - 4), oy + 4, 1, lh, ACCENT);
+            } else if qf_is_goto_mode {
+                // Selection highlight
+                if let Some(anc) = qf_sel_anchor_chars {
+                    let mn = anc.min(qf_cursor_chars);
+                    let mx = anc.max(qf_cursor_chars);
+                    if mn < mx {
+                        let x0 = ox + 4 + mn as i32 * cw;
+                        let x1 = (ox + 4 + mx as i32 * cw).min(ox + ow - 4);
+                        fill(buf, w, h, x0, oy + 4, (x1 - x0).max(0), lh, HL_MATCH);
+                    }
+                }
+                // Leading ':' in accent, rest of query in FG
+                draw_str(buf, w, h, g, ":", ox + 4, oy + 4 + asc, ACCENT, ox + 4 + cw);
                 if qf_query.len() > 1 {
                     draw_str(buf, w, h, g, &qf_query[1..], ox + 4 + cw, oy + 4 + asc, FG, ox + ow - 4);
                 }
@@ -10969,14 +11497,18 @@ fn render(s: &mut State) {
                         draw_str(buf, w, h, g, shortcut, ox + ow - 4 - sw, ry + asc, FG_DIM, ox + ow - 2);
                     }
                 }
+            } else if qf_is_goto_mode {
+                let ry = oy + 4 + lh + 4;
+                draw_str(buf, w, h, g, "Go to line number [:col number]", ox + 6, ry + asc, FG_DIM, ox + ow - 4);
             } else if qf_loading {
                 let ry = oy + 4 + lh + 4;
                 draw_str(buf, w, h, g, "Searching files...", ox + 6, ry + asc, FG_DIM, ox + ow - 4);
             } else {
                 let avail_chars = ((ow - 10) / cw).max(4) as usize;
-                for (i, (name, dir)) in qf_items.iter().enumerate() {
-                    let ry = oy + 4 + lh + 4 + i as i32 * lh;
-                    if i == qf_sel_in_view { fill(buf, w, h, ox + 1, ry, ow - 2, lh, SEL_BG); }
+                if let Some((ref name, ref dir)) = qf_direct_item {
+                    // Show direct absolute/~ path match when no fuzzy results
+                    let ry = oy + 4 + lh + 4;
+                    fill(buf, w, h, ox + 1, ry, ow - 2, lh, SEL_BG);
                     let dir_max = (avail_chars / 3).max(1);
                     let dir_disp = fit_str(dir, dir_max);
                     let name_max = avail_chars.saturating_sub(dir_disp.chars().count() + 2);
@@ -10984,6 +11516,18 @@ fn render(s: &mut State) {
                     let dir_w = dir_disp.chars().count() as i32 * cw;
                     draw_str(buf, w, h, g, &name_disp, ox + 6, ry + asc, FG, ox + ow - 4 - dir_w - cw);
                     draw_str(buf, w, h, g, &dir_disp, ox + ow - 4 - dir_w, ry + asc, FG_DIM, ox + ow - 2);
+                } else {
+                    for (i, (name, dir)) in qf_items.iter().enumerate() {
+                        let ry = oy + 4 + lh + 4 + i as i32 * lh;
+                        if i == qf_sel_in_view { fill(buf, w, h, ox + 1, ry, ow - 2, lh, SEL_BG); }
+                        let dir_max = (avail_chars / 3).max(1);
+                        let dir_disp = fit_str(dir, dir_max);
+                        let name_max = avail_chars.saturating_sub(dir_disp.chars().count() + 2);
+                        let name_disp = fit_str(name, name_max);
+                        let dir_w = dir_disp.chars().count() as i32 * cw;
+                        draw_str(buf, w, h, g, &name_disp, ox + 6, ry + asc, FG, ox + ow - 4 - dir_w - cw);
+                        draw_str(buf, w, h, g, &dir_disp, ox + ow - 4 - dir_w, ry + asc, FG_DIM, ox + ow - 2);
+                    }
                 }
             }
         }
@@ -11030,5 +11574,40 @@ fn main() {
     let el = EventLoop::<UserEvent>::with_user_event().build().unwrap();
     let proxy = el.create_proxy();
     let mut app = App::new(file_arg, dir_arg, proxy);
-    el.run_app(&mut app).unwrap();
+    if let Err(e) = el.run_app(&mut app) {
+        eprintln!("local-text: event loop exited with error: {e}");
+        std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_delta_saturates_and_clamps() {
+        assert_eq!(apply_delta(5, 3, 100), 8);
+        assert_eq!(apply_delta(5, -10, 100), 0);    // negative sum would wrap to huge usize before
+        assert_eq!(apply_delta(5, 1000, 100), 100); // clamped to len, never out of bounds
+        assert_eq!(apply_delta(0, -1, 0), 0);
+    }
+
+    #[test]
+    fn format_command_shell_quotes_filename() {
+        // A maliciously-named file must be quoted, not interpolated raw into `sh -c`.
+        assert_eq!(
+            build_format_command("prettier --write {file}", "a b;$(rm -rf ~).ts"),
+            "prettier --write 'a b;$(rm -rf ~).ts'",
+        );
+        // No {file} placeholder → quoted path appended.
+        assert_eq!(
+            build_format_command("rustfmt", "/tmp/x.rs"),
+            "rustfmt '/tmp/x.rs'",
+        );
+        // Embedded single quote is escaped correctly (POSIX '\'' idiom).
+        assert_eq!(
+            build_format_command("fmt", "/tmp/x'y.rs"),
+            "fmt '/tmp/x'\\''y.rs'",
+        );
+    }
 }

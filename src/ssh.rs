@@ -199,15 +199,26 @@ pub fn ssh_check_lsp_binaries(
 
 /// Build a `Command` that runs `cmd args` on the remote host, reusing the
 /// ControlMaster socket.  Useful for spawning LSP servers via stdio.
-pub fn ssh_lsp_command(host: &SshHost, bin: &str, args: &[&str], path_dirs: &[String]) -> Command {
+pub fn ssh_lsp_command(
+    host: &SshHost,
+    bin: &str,
+    args: &[&str],
+    path_dirs: &[String],
+    cwd: Option<&Path>,
+) -> Command {
     let mut cmd = Command::new("ssh");
-    let remote_command = if path_dirs.is_empty() {
+    let remote_command = if path_dirs.is_empty() && cwd.is_none() {
         let mut remote_argv = Vec::with_capacity(args.len() + 1);
         remote_argv.push(bin);
         remote_argv.extend(args.iter().copied());
         remote_command(&remote_argv)
     } else {
-        let mut script = lsp_path_setup(path_dirs);
+        let mut script = if path_dirs.is_empty() { String::new() } else { lsp_path_setup(path_dirs) };
+        if let Some(cwd) = cwd {
+            script.push_str("cd ");
+            script.push_str(&remote_path_expr(cwd));
+            script.push_str(" || exit $?\n");
+        }
         script.push_str("exec ");
         script.push_str(&shell_quote(bin));
         for arg in args {
@@ -380,7 +391,7 @@ fn write_remote_file(host: &SshHost, remote_path: &Path, content: &str) -> Resul
 }
 
 /// Single-quote a shell argument, escaping any embedded single quotes.
-fn shell_quote(s: &str) -> String {
+pub(crate) fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
@@ -497,5 +508,25 @@ mod tests {
         assert_eq!(remote_path_expr(Path::new("~")), "~");
         assert_eq!(remote_path_expr(Path::new("~/dir with spaces")), "~/'dir with spaces'");
         assert_eq!(remote_path_expr(Path::new("/tmp/dir with spaces")), "'/tmp/dir with spaces'");
+    }
+
+    #[test]
+    fn lsp_command_cds_before_exec_when_cwd_is_set() {
+        let host = SshHost { user: Some("me".to_owned()), host: "example.com".to_owned(), port: Some(2222) };
+        let cmd = ssh_lsp_command(
+            &host,
+            "typescript-language-server",
+            &["--stdio"],
+            &[],
+            Some(Path::new("/srv/app with spaces")),
+        );
+        let remote = cmd.get_args().last().unwrap().to_string_lossy();
+        assert!(remote.contains("'sh' '-c'"));
+        assert!(remote.contains("cd "));
+        assert!(remote.contains("/srv/app with spaces"));
+        assert!(remote.contains("|| exit $?"));
+        assert!(remote.contains("exec "));
+        assert!(remote.contains("typescript-language-server"));
+        assert!(remote.contains("--stdio"));
     }
 }

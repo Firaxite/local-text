@@ -23,8 +23,52 @@ pub struct SshHost {
     pub port: Option<u16>,
 }
 
+/// A per-user directory for SSH ControlMaster sockets, created 0700 on demand. Prefers
+/// `$XDG_RUNTIME_DIR` (already private on Linux); otherwise a uid-scoped directory under
+/// the system temp dir (macOS's `$TMPDIR` is itself per-user and private). Kept short to
+/// respect the ~104-byte `sun_path` limit for Unix-domain sockets.
+fn control_socket_dir() -> PathBuf {
+    if let Some(rt) = std::env::var_os("XDG_RUNTIME_DIR") {
+        let dir = PathBuf::from(rt).join("local-text");
+        if ensure_private_dir(&dir).is_ok() {
+            return dir;
+        }
+    }
+    let uid = unsafe { libc::getuid() };
+    let dir = std::env::temp_dir().join(format!("local-text-{uid}"));
+    let _ = ensure_private_dir(&dir);
+    dir
+}
+
+/// Ensure `dir` exists as a 0700 directory owned by the current user. Refuses (Err) if it
+/// already exists as a symlink or is owned by someone else, so a pre-created path can't
+/// redirect our sockets. Best-effort hardening against a local same-host attacker.
+fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    match std::fs::symlink_metadata(dir) {
+        Ok(md) => {
+            let uid = unsafe { libc::getuid() };
+            if !md.is_dir() || md.uid() != uid {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "control socket dir not owned by current user",
+                ));
+            }
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+        Err(_) => {
+            std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+        }
+    }
+    Ok(())
+}
+
 impl SshHost {
     /// The ControlMaster socket path used to multiplex connections.
+    ///
+    /// Lives in a per-user 0700 directory (see `control_socket_dir`) rather than directly
+    /// in world-writable `/tmp` under a predictable name, so another local user can't squat
+    /// it. The directory is created on demand.
     pub fn control_path(&self) -> PathBuf {
         let tag = format!(
             "{}-{}-{}",
@@ -32,7 +76,7 @@ impl SshHost {
             self.host,
             self.port.unwrap_or(22),
         );
-        PathBuf::from(format!("/tmp/local-text-ssh-{tag}"))
+        control_socket_dir().join(format!("ssh-{tag}"))
     }
 
     /// The `[user@]host` argument passed to the `ssh` command.

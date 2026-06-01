@@ -20,6 +20,12 @@ use crate::ssh;
 use crate::vpath::{SshHost, VPath};
 use crate::{Diagnostic, DiagSeverity, Lang, UserEvent};
 
+/// Hard cap on a single LSP message body. A legitimate JSON-RPC message is never
+/// remotely this large; without it a buggy or hostile server can force an unbounded
+/// `vec![0u8; n]` allocation via the Content-Length header (OOM/abort). Mirrors the
+/// 64 MiB frame cap in `collab::read_frame`.
+const MAX_LSP_FRAME: usize = 64 << 20; // 64 MiB
+
 // ── PendingKind ───────────────────────────────────────────────────────────────
 pub enum PendingKind {
     Definition,
@@ -86,6 +92,7 @@ pub fn read_message<R: BufRead>(reader: &mut R) -> Option<String> {
         }
     }
     let n = content_length?;
+    if n > MAX_LSP_FRAME { return None; }
     let mut buf = vec![0u8; n];
     reader.read_exact(&mut buf).ok()?;
     String::from_utf8(buf).ok()
@@ -170,8 +177,9 @@ pub fn start_server(
     proxy: EventLoopProxy<UserEvent>,
     ssh_host: Option<SshHost>,
     remote_path_dirs: Vec<String>,
+    cwd: Option<&VPath>,
 ) -> Option<LspServer> {
-    let (cmd, args): (&str, &[&str]) = match lang {
+    let (bin, args): (&str, &[&str]) = match lang {
         Lang::Rust       => ("rust-analyzer", &["--stdio"]),
         Lang::TypeScript => ("typescript-language-server", &["--stdio"]),
         Lang::Python     => ("pylsp", &[]),
@@ -179,15 +187,23 @@ pub fn start_server(
     };
 
     let mut child = if let Some(ref host) = ssh_host {
-        let mut ssh_cmd = ssh::ssh_lsp_command(host, cmd, args, &remote_path_dirs);
+        let remote_cwd = cwd.and_then(|p| match p {
+            VPath::Remote { host: cwd_host, path } if cwd_host == host => Some(path.as_path()),
+            _ => None,
+        });
+        let mut ssh_cmd = ssh::ssh_lsp_command(host, bin, args, &remote_path_dirs, remote_cwd);
         ssh_cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         ssh_cmd.spawn().ok()?
     } else {
-        Command::new(cmd)
-            .args(args)
+        let mut local_cmd = Command::new(bin);
+        local_cmd.args(args);
+        if let Some(VPath::Local(path)) = cwd {
+            local_cmd.current_dir(path);
+        }
+        local_cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -216,6 +232,17 @@ pub fn start_server(
             if let Some(rest) = trimmed.strip_prefix("Content-Length: ") {
                 // Framed JSON-RPC message: parse for protocol, do not display
                 let Ok(n) = rest.trim().parse::<usize>() else { continue };
+                if n > MAX_LSP_FRAME {
+                    // Never allocate an absurd frame; the stream is desynced/hostile.
+                    let _ = proxy_out.send_event(UserEvent::TermOutput {
+                        pane_id: opi,
+                        data: format!(
+                            "[lsp] Content-Length {n} exceeds {} MiB cap; closing reader\n",
+                            MAX_LSP_FRAME >> 20,
+                        ).into_bytes().into_boxed_slice(),
+                    });
+                    break;
+                }
                 // Consume remaining headers (up to the blank separator line)
                 loop {
                     let mut hdr = String::new();
@@ -230,6 +257,12 @@ pub fn start_server(
                     data:    msg.as_bytes().to_vec(),
                 });
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&msg) {
+                    if let Some(line) = server_log_line(&v) {
+                        let _ = proxy_out.send_event(UserEvent::TermOutput {
+                            pane_id: opi,
+                            data:    line.into_bytes().into_boxed_slice(),
+                        });
+                    }
                     if v["id"].is_u64() && v.get("method").is_none() {
                         let id = v["id"].as_u64().unwrap();
                         let result = v["result"].clone();
@@ -304,8 +337,14 @@ pub fn did_change_params(path: &VPath, text: &str, version: u64) -> serde_json::
 /// Send LSP initialize + initialized handshake.
 pub fn send_initialize(server: &mut LspServer, root_path: Option<&VPath>) {
     let root_uri = root_path.map(VPath::to_lsp_uri);
-    let params = serde_json::json!({
-        "processId": std::process::id(),
+    let process_id = if server.ssh_host.is_some() { None } else { Some(std::process::id()) };
+    let params = initialize_params(process_id, root_uri);
+    send_request(server, "initialize", params);
+}
+
+fn initialize_params(process_id: Option<u32>, root_uri: Option<String>) -> serde_json::Value {
+    serde_json::json!({
+        "processId": process_id,
         "rootUri":   root_uri,
         "capabilities": {
             "textDocument": {
@@ -321,8 +360,29 @@ pub fn send_initialize(server: &mut LspServer, root_path: Option<&VPath>) {
                 }
             }
         }
-    });
-    send_request(server, "initialize", params);
+    })
+}
+
+fn server_log_line(v: &serde_json::Value) -> Option<String> {
+    match v["method"].as_str()? {
+        "window/logMessage" | "window/showMessage" => {
+            let message = v["params"]["message"].as_str()?.trim();
+            if message.is_empty() { return None; }
+            let level = match v["params"]["type"].as_u64().unwrap_or(3) {
+                1 => "error",
+                2 => "warning",
+                4 => "log",
+                _ => "info",
+            };
+            Some(format!("[lsp:{level}] {message}\n"))
+        }
+        "$/typescriptVersion" => {
+            let version = v["params"]["version"].as_str()?;
+            let source = v["params"]["source"].as_str().unwrap_or("unknown");
+            Some(format!("[lsp:info] TypeScript {version} ({source})\n"))
+        }
+        _ => None,
+    }
 }
 
 /// Send textDocument/didOpen.
@@ -422,6 +482,15 @@ mod tests {
     }
 
     #[test]
+    fn read_message_rejects_oversized_content_length() {
+        // A hostile/buggy server advertising a huge body must not trigger a giant
+        // allocation — read_message returns None instead of allocating `n` bytes.
+        let raw = format!("Content-Length: {}\r\n\r\n", MAX_LSP_FRAME + 1);
+        let mut cur = Cursor::new(raw.into_bytes());
+        assert_eq!(read_message(&mut cur), None);
+    }
+
+    #[test]
     fn read_message_returns_none_for_unframed() {
         // Simulates what happens when the server writes an error to stdout without framing
         let raw = "Error: Cannot find module 'typescript'\n";
@@ -498,5 +567,39 @@ mod tests {
         }
         assert_eq!(framed, vec![body]);
         assert_eq!(unframed, vec!["node crashed\n"]);
+    }
+
+    #[test]
+    fn initialize_params_can_disable_process_monitoring() {
+        let params = initialize_params(None, Some("file:///srv/app".to_owned()));
+        assert!(params["processId"].is_null());
+        assert_eq!(params["rootUri"].as_str(), Some("file:///srv/app"));
+
+        let params = initialize_params(Some(123), None);
+        assert_eq!(params["processId"].as_u64(), Some(123));
+        assert!(params["rootUri"].is_null());
+    }
+
+    #[test]
+    fn server_log_line_surfaces_lsp_messages() {
+        let msg = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "window/logMessage",
+            "params": { "type": 2, "message": "using fallback tsserver" }
+        });
+        assert_eq!(
+            server_log_line(&msg).as_deref(),
+            Some("[lsp:warning] using fallback tsserver\n"),
+        );
+
+        let version = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "$/typescriptVersion",
+            "params": { "version": "6.0.3", "source": "bundled" }
+        });
+        assert_eq!(
+            server_log_line(&version).as_deref(),
+            Some("[lsp:info] TypeScript 6.0.3 (bundled)\n"),
+        );
     }
 }

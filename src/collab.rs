@@ -20,6 +20,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -322,7 +323,7 @@ impl CollabSession {
         if let Ok(frame) = encrypt_msg(&self.session_key, msg) {
             match &self.role {
                 CollabRole::Host { guest_txs, .. } => {
-                    if let Some(tx) = guest_txs.lock().unwrap().get(&site_id) {
+                    if let Some(tx) = lock_recover(guest_txs).get(&site_id) {
                         let _ = tx.send(frame);
                     }
                 }
@@ -362,12 +363,21 @@ impl CollabSession {
 
 // ── Host: fan-out broadcast ───────────────────────────────────────────────────
 
+/// Lock a mutex, recovering from poisoning instead of cascading the panic. If one collab
+/// thread panics while holding `guest_txs`, the lock is poisoned and every other thread
+/// would otherwise panic on its next `.lock().unwrap()`, taking down the whole session.
+/// The protected value is just a registry of channel senders, so it stays consistent
+/// across a panic — recovering the guard is safe.
+fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn broadcast_to_guests(
     guest_txs: &Arc<Mutex<HashMap<u64, mpsc::Sender<Vec<u8>>>>>,
     except_site_id: Option<u64>,
     frame: Vec<u8>,
 ) {
-    let map = guest_txs.lock().unwrap();
+    let map = lock_recover(guest_txs);
     for (&sid, tx) in map.iter() {
         if except_site_id == Some(sid) { continue; }
         let _ = tx.send(frame.clone());
@@ -667,6 +677,22 @@ pub fn guest_can_view(
     true
 }
 
+/// Resolve a guest-supplied **relative** path against the workspace `root`, returning the
+/// on-disk path only if it stays inside `root`. Guests are handed workspace-relative paths
+/// (see the file-list builder), so anything that isn't a sequence of normal components is
+/// rejected: absolute paths (`/etc/passwd` — which `Path::join` would let escape the root
+/// entirely) and `.`/`..` traversal. The path is then canonicalized and re-checked for
+/// containment so a symlink inside the workspace can't redirect outside it either. Returns
+/// None on escape or if the path can't be resolved (e.g. missing file).
+pub fn resolve_under_root(root: &Path, rel: &str) -> Option<PathBuf> {
+    if Path::new(rel).components().any(|c| !matches!(c, Component::Normal(_))) {
+        return None;
+    }
+    let canon_root = root.canonicalize().ok()?;
+    let canon = canon_root.join(rel).canonicalize().ok()?;
+    canon.starts_with(&canon_root).then_some(canon)
+}
+
 /// Returns true if `path` is writable for the given role.
 pub fn guest_can_write(path: &str, role: PeerRole, role_perms: &RolePermissions) -> bool {
     let bits = role_perms.for_role(role);
@@ -765,7 +791,7 @@ pub fn start_host(
             let color     = PEER_COLORS[sid as usize % PEER_COLORS.len()];
 
             let (guest_tx, guest_rx) = mpsc::channel::<Vec<u8>>();
-            guest_txs_accept.lock().unwrap().insert(sid, guest_tx);
+            lock_recover(&guest_txs_accept).insert(sid, guest_tx);
 
             let proxy2     = proxy_accept.clone();
             let guest_txs2 = Arc::clone(&guest_txs_accept);
@@ -837,7 +863,7 @@ fn handle_guest(
             Ok(f) => f,
             Err(_) => {
                 // Disconnect: remove from guest map, notify main thread
-                guest_txs.lock().unwrap().remove(&site_id);
+                lock_recover(&guest_txs).remove(&site_id);
                 let _ = proxy.send_event(UserEvent::CollabGuestLeft { site_id });
                 return;
             }
@@ -1011,4 +1037,36 @@ fn local_ip_str() -> String {
         .and_then(|s| { s.connect("8.8.8.8:80")?; s.local_addr() })
         .map(|a| a.ip().to_string())
         .unwrap_or_else(|_| "127.0.0.1".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_under_root_rejects_traversal() {
+        // These are rejected purely on path shape, before touching the filesystem.
+        let root = Path::new("/some/workspace");
+        assert!(resolve_under_root(root, "/etc/passwd").is_none());      // absolute
+        assert!(resolve_under_root(root, "../../etc/passwd").is_none()); // parent escape
+        assert!(resolve_under_root(root, "a/../../b").is_none());        // mid-path ..
+        assert!(resolve_under_root(root, "./x").is_none());              // explicit `.`
+    }
+
+    #[test]
+    fn resolve_under_root_accepts_contained_file() {
+        let dir = std::env::temp_dir().join(format!("lt-collab-test-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let file = dir.join("sub").join("a.txt");
+        std::fs::write(&file, b"hi").unwrap();
+
+        assert_eq!(
+            resolve_under_root(&dir, "sub/a.txt"),
+            Some(file.canonicalize().unwrap()),
+        );
+        // A relative path that escapes after joining is still rejected.
+        assert!(resolve_under_root(&dir, "sub/../../escape").is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
