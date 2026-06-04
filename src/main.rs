@@ -1518,7 +1518,7 @@ fn lsp_binary(lang: Lang) -> Option<&'static str> {
 fn lsp_invocation(lang: Lang) -> Option<&'static str> {
     match lang {
         Lang::TypeScript => Some("typescript-language-server --stdio"),
-        Lang::Rust       => Some("rust-analyzer --stdio"),
+        Lang::Rust       => Some("rust-analyzer"),
         Lang::Python     => Some("pylsp"),
         Lang::None | Lang::Json | Lang::Jsonc | Lang::Markdown | Lang::Css | Lang::Html => None,
     }
@@ -11887,7 +11887,13 @@ fn main() {
             let vp = VPath::parse(&s);
             // For local paths: check if it's a directory. For remote: always treat as dir arg.
             match &vp {
-                VPath::Local(p) if p.is_dir() => (None, Some(vp)),
+                VPath::Local(p) if p.is_dir() => {
+                    // Canonicalize to an absolute path so the LSP workspace root is a
+                    // valid `file:///abs/path` URI. A relative arg like `.` would otherwise
+                    // be sent as `rootUri: file://.`, which servers reject.
+                    let dir = std::fs::canonicalize(p).map(VPath::Local).unwrap_or(vp);
+                    (None, Some(dir))
+                }
                 VPath::Remote { .. }           => (None, Some(vp)),
                 _                             => (Some(vp), None),
             }

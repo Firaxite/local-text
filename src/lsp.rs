@@ -195,7 +195,10 @@ pub fn start_server(
     overrides: &LspLaunchOverrides,
 ) -> Option<LspServer> {
     let (default_bin, default_args): (&str, &[&str]) = match lang {
-        Lang::Rust       => ("rust-analyzer", &["--stdio"]),
+        // rust-analyzer speaks LSP over stdin/stdout by default and *rejects* an
+        // unknown `--stdio` flag ("unexpected flag: `--stdio`"), unlike the
+        // Node-based servers below which require it.
+        Lang::Rust       => ("rust-analyzer", &[]),
         Lang::TypeScript => ("typescript-language-server", &["--stdio"]),
         Lang::Python     => ("pylsp", &[]),
         Lang::None | Lang::Json | Lang::Jsonc | Lang::Markdown | Lang::Css | Lang::Html => return None,
