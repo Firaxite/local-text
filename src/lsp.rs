@@ -34,6 +34,20 @@ pub enum PendingKind {
     OrganizeImports { path: VPath },
 }
 
+// ── LspLaunchOverrides ────────────────────────────────────────────────────────
+/// Per-project launch overrides loaded from `.vscode/local-text.json`. Empty by
+/// default (no override → the hardcoded binary/args/inherited env are used).
+#[derive(Default, Clone)]
+pub struct LspLaunchOverrides {
+    /// Override the server binary (path or name). `None` = use the default.
+    pub command: Option<String>,
+    /// Override the launch arguments. `None` = use the default.
+    pub args:    Option<Vec<String>>,
+    /// Extra environment variables to set on the server process (merged over the
+    /// inherited environment).
+    pub env:     Vec<(String, String)>,
+}
+
 // ── LspServer ─────────────────────────────────────────────────────────────────
 pub struct LspServer {
     pub lang:           Lang,
@@ -178,12 +192,19 @@ pub fn start_server(
     ssh_host: Option<SshHost>,
     remote_path_dirs: Vec<String>,
     cwd: Option<&VPath>,
+    overrides: &LspLaunchOverrides,
 ) -> Option<LspServer> {
-    let (bin, args): (&str, &[&str]) = match lang {
+    let (default_bin, default_args): (&str, &[&str]) = match lang {
         Lang::Rust       => ("rust-analyzer", &["--stdio"]),
         Lang::TypeScript => ("typescript-language-server", &["--stdio"]),
         Lang::Python     => ("pylsp", &[]),
         Lang::None | Lang::Json | Lang::Jsonc | Lang::Markdown | Lang::Css | Lang::Html => return None,
+    };
+    // Apply per-project overrides (`.vscode/local-text.json`); fall back to defaults.
+    let bin: String = overrides.command.clone().unwrap_or_else(|| default_bin.to_owned());
+    let args: Vec<String> = match &overrides.args {
+        Some(a) => a.clone(),
+        None    => default_args.iter().map(|s| (*s).to_owned()).collect(),
     };
 
     let mut child = if let Some(ref host) = ssh_host {
@@ -191,15 +212,18 @@ pub fn start_server(
             VPath::Remote { host: cwd_host, path } if cwd_host == host => Some(path.as_path()),
             _ => None,
         });
-        let mut ssh_cmd = ssh::ssh_lsp_command(host, bin, args, &remote_path_dirs, remote_cwd);
+        let mut ssh_cmd = ssh::ssh_lsp_command(host, &bin, &args, &remote_path_dirs, remote_cwd, &overrides.env);
         ssh_cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         ssh_cmd.spawn().ok()?
     } else {
-        let mut local_cmd = Command::new(bin);
-        local_cmd.args(args);
+        let mut local_cmd = Command::new(&bin);
+        local_cmd.args(&args);
+        for (k, v) in &overrides.env {
+            local_cmd.env(k, v);
+        }
         if let Some(VPath::Local(path)) = cwd {
             local_cmd.current_dir(path);
         }

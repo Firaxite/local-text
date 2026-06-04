@@ -95,6 +95,12 @@ pub struct Settings {
     /// Key = host string (e.g. "user@host" or "host"), value = list of directories.
     #[serde(default)]
     pub remote_lsp_search_paths: std::collections::HashMap<String, Vec<String>>,
+    /// Machine-wide cap on how many local-text processes may run a given LSP
+    /// server concurrently. Key = stable language id ("rust"/"typescript"/"python").
+    /// A language **absent** from the map is **unlimited**; `n` = at most `n`
+    /// instances; **`0` = none allowed (disabled)**. Counted per (lang, ssh host).
+    #[serde(default)]
+    pub lsp_server_limits: std::collections::HashMap<String, usize>,
     /// TCP port the host listens on for collab sessions (default 7777).
     #[serde(default = "Settings::default_collab_port")]
     pub collab_port: u16,
@@ -129,6 +135,7 @@ impl Default for Settings {
             gpu_drawable_count:       Self::default_gpu_drawable_count(),
             recent_remote_hosts:      Vec::new(),
             remote_lsp_search_paths:  std::collections::HashMap::new(),
+            lsp_server_limits:        std::collections::HashMap::new(),
             collab_port:              Self::default_collab_port(),
             collab_role_perms:        crate::collab::RolePermissions::default(),
             collab_include_globs:     Vec::new(),

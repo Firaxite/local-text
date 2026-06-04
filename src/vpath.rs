@@ -26,24 +26,50 @@ pub struct SshHost {
 /// A per-user directory for SSH ControlMaster sockets, created 0700 on demand. Prefers
 /// `$XDG_RUNTIME_DIR` (already private on Linux); otherwise a uid-scoped directory under
 /// the system temp dir (macOS's `$TMPDIR` is itself per-user and private). Kept short to
-/// respect the ~104-byte `sun_path` limit for Unix-domain sockets.
-fn control_socket_dir() -> PathBuf {
+/// respect the ~104-byte `sun_path` limit for Unix-domain sockets: macOS's `$TMPDIR`
+/// (`/var/folders/…/T/`) is ~49 bytes and can be longer still under an app sandbox, so if a
+/// preferred location would leave too little room for the socket filename we fall back to a
+/// short `/tmp/lt-<uid>` directory (still created 0700 and ownership-checked).
+pub(crate) fn control_socket_dir() -> PathBuf {
+    let uid = unsafe { libc::getuid() };
+    // The socket filename is a fixed "ssh-" + 16 hex digits = 21 bytes (incl. separator),
+    // so cap the directory length to keep the full path well under the sun_path limit.
+    const MAX_DIR_LEN: usize = 80;
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(rt) = std::env::var_os("XDG_RUNTIME_DIR") {
-        let dir = PathBuf::from(rt).join("local-text");
-        if ensure_private_dir(&dir).is_ok() {
-            return dir;
+        candidates.push(PathBuf::from(rt).join("local-text"));
+    }
+    candidates.push(std::env::temp_dir().join(format!("local-text-{uid}")));
+
+    for dir in &candidates {
+        if dir.as_os_str().len() <= MAX_DIR_LEN && ensure_private_dir(dir).is_ok() {
+            return dir.clone();
         }
     }
-    let uid = unsafe { libc::getuid() };
-    let dir = std::env::temp_dir().join(format!("local-text-{uid}"));
+
+    // Guaranteed-short fallback.
+    let dir = PathBuf::from(format!("/tmp/lt-{uid}"));
     let _ = ensure_private_dir(&dir);
     dir
+}
+
+/// FNV-1a 64-bit hash — deterministic across runs (so a reconnect reuses the same
+/// ControlMaster socket) and dependency-free. Used only to derive a short, fixed-length
+/// socket filename from the (user, host, port) tag; not for security.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
 }
 
 /// Ensure `dir` exists as a 0700 directory owned by the current user. Refuses (Err) if it
 /// already exists as a symlink or is owned by someone else, so a pre-created path can't
 /// redirect our sockets. Best-effort hardening against a local same-host attacker.
-fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
+pub(crate) fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
     match std::fs::symlink_metadata(dir) {
         Ok(md) => {
@@ -68,7 +94,9 @@ impl SshHost {
     ///
     /// Lives in a per-user 0700 directory (see `control_socket_dir`) rather than directly
     /// in world-writable `/tmp` under a predictable name, so another local user can't squat
-    /// it. The directory is created on demand.
+    /// it. The directory is created on demand. The filename is a short hash of the
+    /// `user-host-port` tag rather than the raw tag, so an arbitrarily long hostname can't
+    /// push the socket path past the ~104-byte `sun_path` limit.
     pub fn control_path(&self) -> PathBuf {
         let tag = format!(
             "{}-{}-{}",
@@ -76,7 +104,7 @@ impl SshHost {
             self.host,
             self.port.unwrap_or(22),
         );
-        control_socket_dir().join(format!("ssh-{tag}"))
+        control_socket_dir().join(format!("ssh-{:016x}", fnv1a(tag.as_bytes())))
     }
 
     /// The `[user@]host` argument passed to the `ssh` command.
@@ -430,5 +458,29 @@ mod tests {
     fn expands_remote_tilde_for_lsp_uri_when_user_is_known() {
         let path = VPath::parse("ssh://me@example.com:~/src/app/main.ts");
         assert_eq!(path.to_lsp_uri(), "file:///home/me/src/app/main.ts");
+    }
+}
+
+#[cfg(test)]
+mod control_path_len_tests {
+    use super::*;
+    fn h(user: &str, host: &str) -> SshHost {
+        SshHost { user: Some(user.into()), host: host.into(), port: None }
+    }
+    // A control socket path that exceeds the Unix-domain `sun_path` limit (104 bytes on
+    // macOS) makes ssh fail with "ControlPath too long". The filename is a fixed-length
+    // hash, so even an arbitrarily long hostname must not push us over the limit.
+    #[test]
+    fn socket_path_stays_under_sun_path_limit() {
+        let cases = [
+            h("clauder", "localhost"),
+            h("clauder", "a-very-long-fully-qualified-domain-name.engineering.example.com"),
+            h("some-long-username-here", "another.really.long.host.name.internal.corp.example.org"),
+        ];
+        for host in &cases {
+            let p = host.control_path();
+            let len = p.as_os_str().len();
+            assert!(len < 104, "socket path too long ({len}): {}", p.display());
+        }
     }
 }

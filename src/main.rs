@@ -2,6 +2,8 @@ mod platform;
 mod settings;
 mod terminal;
 mod lsp;
+mod lsp_registry;
+mod proj_config;
 mod vpath;
 mod ssh;
 mod collab;
@@ -72,7 +74,7 @@ const RAINBOW: [u32; 6] = [0xFF79C6, 0xFFB86C, 0xF1FA8C, 0x50FA7B, 0x8BE9FD, 0xB
 
 // ── Language detection ────────────────────────────────────────────────────────
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-enum Lang { None, Rust, Python, TypeScript, Json, Jsonc, Markdown, Css, Html }
+pub enum Lang { None, Rust, Python, TypeScript, Json, Jsonc, Markdown, Css, Html }
 
 impl Lang {
     fn from_path(path: &std::path::Path) -> Self {
@@ -86,6 +88,27 @@ impl Lang {
             Some("css" | "less" | "scss")           => Lang::Css,
             Some("html" | "htm" | "svg" | "xml")    => Lang::Html,
             _                                       => Lang::None,
+        }
+    }
+
+    /// Stable lowercase identifier used as a cross-process / on-disk key
+    /// (registry entries, `lsp_server_limits` settings keys). Independent of the
+    /// enum's declaration order so reordering can't corrupt persisted data.
+    fn as_registry_str(self) -> Option<&'static str> {
+        match self {
+            Lang::Rust       => Some("rust"),
+            Lang::TypeScript => Some("typescript"),
+            Lang::Python     => Some("python"),
+            Lang::None | Lang::Json | Lang::Jsonc | Lang::Markdown | Lang::Css | Lang::Html => None,
+        }
+    }
+
+    fn from_registry_str(s: &str) -> Option<Lang> {
+        match s {
+            "rust"       => Some(Lang::Rust),
+            "typescript" => Some(Lang::TypeScript),
+            "python"     => Some(Lang::Python),
+            _            => None,
         }
     }
 }
@@ -381,6 +404,15 @@ struct QuickFinder {
     preview_saved_char: Option<usize>,
 }
 
+// ── LSP manager panel ─────────────────────────────────────────────────────────
+/// Modal overlay listing every LSP server running across all local-text
+/// processes (from the cross-process registry), with actions to navigate to the
+/// owning window, move a server to this window's project, or stop it.
+struct LspManagerPanel {
+    entries:  Vec<lsp_registry::LspRegistryEntry>,
+    selected: usize,
+}
+
 // ── Command palette ───────────────────────────────────────────────────────────
 #[derive(Clone, Copy)]
 enum CommandAction {
@@ -394,6 +426,8 @@ enum CommandAction {
     OpenRemoteDirectory,
     StartCollab,
     JoinCollab,
+    ManageLspServers,
+    EditProjectLspConfig,
 }
 
 struct CommandEntry { name: &'static str, shortcut: &'static str, action: CommandAction }
@@ -423,6 +457,8 @@ const COMMANDS: &[CommandEntry] = &[
     CommandEntry { name: "Open Remote Directory…", shortcut: "",              action: CommandAction::OpenRemoteDirectory },
     CommandEntry { name: "Start Collab Session",   shortcut: "",              action: CommandAction::StartCollab },
     CommandEntry { name: "Join Collab Session…",   shortcut: "",              action: CommandAction::JoinCollab },
+    CommandEntry { name: "LSP: Manage Servers",    shortcut: "",              action: CommandAction::ManageLspServers },
+    CommandEntry { name: "LSP: Edit Project Settings", shortcut: "",          action: CommandAction::EditProjectLspConfig },
 ];
 
 // ── Global find/replace ───────────────────────────────────────────────────────
@@ -988,6 +1024,39 @@ fn first_visible_pane_id(s: &State) -> Option<usize> {
         .into_iter()
         .map(|(id, _)| id)
         .find(|id| s.panes.contains_key(id))
+}
+
+/// Return an Editor pane suitable for hosting a new tab: the active pane if it's
+/// an editor, otherwise the first editor pane in the layout. If no editor pane
+/// exists — e.g. every editor tab was closed, leaving only a terminal pane (or
+/// nothing) — create one, splitting beside an existing pane or as the sole pane.
+/// `active_pane` is pointed at the result. The returned pane always has at least
+/// one tab, preserving the "an editor pane is never tab-empty" invariant.
+fn ensure_editor_pane(s: &mut State) -> usize {
+    if s.panes.get(&s.active_pane).map_or(false, |p| p.kind == PaneKind::Editor) {
+        return s.active_pane;
+    }
+    let area = s.pane_area();
+    if let Some(id) = layout_tree(&s.pane_tree, area).into_iter()
+        .find(|(id, _)| s.panes.get(id).map_or(false, |p| p.kind == PaneKind::Editor))
+        .map(|(id, _)| id)
+    {
+        s.active_pane = id;
+        return id;
+    }
+    let pane_id = s.next_pane_id;
+    s.next_pane_id += 1;
+    let buf_id = s.next_buf_id;
+    s.next_buf_id += 1;
+    s.panes.insert(pane_id, Pane::new(pane_id, buf_id));
+    let target = first_visible_pane_id(s);
+    let old_tree = std::mem::replace(&mut s.pane_tree, PaneTree::Leaf(0));
+    s.pane_tree = match target {
+        Some(root) => insert_pane(old_tree, root, pane_id, DropZone::Right),
+        None        => PaneTree::Leaf(pane_id),
+    };
+    s.active_pane = pane_id;
+    pane_id
 }
 
 fn remove_pane_from_layout(s: &mut State, pane_id: usize) -> bool {
@@ -1591,6 +1660,14 @@ pub enum UserEvent {
     LspDiagnostics { path: VPath, diagnostics: Vec<Diagnostic> },
     LspResponse    { server_id: usize, id: u64, result: serde_json::Value },
     LspServerStopped { server_id: usize },
+    /// Another local-text process asked us (over the control socket) to stop the
+    /// server with this `op_id`; reply with the outcome so it can free the slot.
+    LspStopRequested { op_id: usize, reply: std::sync::mpsc::Sender<lsp_registry::StopResult> },
+    /// A server slot freed up (after we evicted another process's instance) —
+    /// start the server we wanted for `root`.
+    LspSlotFreed { lang: Lang, ssh_host: Option<vpath::SshHost>, root: Option<VPath> },
+    /// Another process asked us to bring our window to the front.
+    RaiseWindowRequested,
     LspBinaryCheckResult { host: Option<vpath::SshHost>, statuses: Vec<(Lang, Option<bool>)>, error: Option<String> },
     FormatterDone  { path: VPath },
     GitStatusResult { staged: Vec<GitEntry>, unstaged: Vec<GitEntry>, is_git_repo: bool, error: Option<String> },
@@ -1680,6 +1757,7 @@ struct State {
     left_panel_visible: bool,
     diag_panel_sel: usize,
     context_menu: Option<ContextMenu>,
+    lsp_panel:    Option<LspManagerPanel>,
     quick_finder: QuickFinder,
     global_find:  GlobalFind,
     git_panel:    GitPanel,
@@ -2466,18 +2544,8 @@ fn begin_remote_tab_read(s: &mut State, pane_id: usize, tab_idx: usize, path: VP
 
 fn open_or_reuse_tab(s: &mut State, path: VPath) {
     // Find the nearest editor pane to open the file in (active if it's an editor,
-    // otherwise find the first editor pane in the layout).
-    let ap = if s.panes.get(&s.active_pane).map_or(false, |p| p.kind == PaneKind::Editor) {
-        s.active_pane
-    } else {
-        let area = s.pane_area();
-        let Some(id) = layout_tree(&s.pane_tree, area).into_iter()
-            .find(|(id, _)| s.panes.get(id).map_or(false, |p| p.kind == PaneKind::Editor))
-            .map(|(id, _)| id)
-        else { return; };
-        s.active_pane = id;
-        id
-    };
+    // otherwise the first editor pane in the layout), creating one if none exist.
+    let ap = ensure_editor_pane(s);
     let mut reused_existing = false;
     let (loaded, target_tab_idx) = {
         let pane = s.panes.get_mut(&ap).unwrap();
@@ -2785,13 +2853,39 @@ fn open_token(s: &mut State, token: &str, child_pid: libc::pid_t, osc_cwd: Optio
 /// `root` is the workspace root passed to the LSP initialize request.
 fn ensure_lsp_server_running(s: &mut State, lang: Lang, ssh_host: Option<vpath::SshHost>, root: Option<VPath>) {
     if s.lsp.has_server_for_lang_host(lang, ssh_host.as_ref()) { return; }
+
+    // Cross-process limit (off by default). Counted per (lang, ssh host) since RAM
+    // lives on whichever machine actually runs the server. Absent = unlimited,
+    // Some(0) = disabled, Some(n) = at most n.
+    let host_tag = ssh_host.as_ref().map(|h| h.display());
+    if let Some(lang_key) = lang.as_registry_str() {
+        if let Some(&max) = s.settings.lsp_server_limits.get(lang_key) {
+            let bin = lsp_binary(lang).unwrap_or("language server");
+            if max == 0 {
+                s.status_msg = Some(format!("{bin} is disabled (limit 0)."));
+                return;
+            }
+            let active = lsp_registry::count_live(lang_key, host_tag.as_deref());
+            if active >= max {
+                s.status_msg = Some(format!(
+                    "{bin} limit reached ({active}/{max}). Run 'LSP: Manage Servers' to switch."));
+                return;
+            }
+        }
+    }
+
     let op_id = s.next_pane_id;
     s.next_pane_id += 1;
     let proxy = s.proxy.clone();
     let remote_path_dirs = ssh_host.as_ref()
         .map(|host| remote_lsp_path_dirs(&s.settings, host))
         .unwrap_or_default();
-    if let Some(mut srv) = lsp::start_server(lang, op_id, proxy, ssh_host.clone(), remote_path_dirs, root.as_ref()) {
+    // Per-project launch overrides from `<root>/.vscode/local-text.json`.
+    let overrides = match &root {
+        Some(r) => proj_config::load_project_lsp_config(r, lsp_binary(lang).unwrap_or("")),
+        None    => lsp::LspLaunchOverrides::default(),
+    };
+    if let Some(mut srv) = lsp::start_server(lang, op_id, proxy, ssh_host.clone(), remote_path_dirs, root.as_ref(), &overrides) {
         lsp::send_initialize(&mut srv, root.as_ref());
         let bin = lsp_binary(lang).unwrap_or("lsp");
         let invocation = lsp_invocation(lang).unwrap_or(bin);
@@ -2818,6 +2912,10 @@ fn ensure_lsp_server_running(s: &mut State, lang: Lang, ssh_host: Option<vpath::
         s.panes.insert(op_id, shell_pane);
         s.lsp.servers.insert(op_id, srv);
         s.lsp_start_errors.remove(&(ssh_host.clone(), lang));
+        // Announce to other local-text processes (limit accounting + manage panel).
+        if let Some(lang_key) = lang.as_registry_str() {
+            lsp_registry::register(op_id, lang_key, host_tag.clone(), root.as_ref().map(|r| r.to_string()));
+        }
     } else {
         let scope = ssh_host.as_ref()
             .map(|h| format!("remote {}", h.display()))
@@ -5221,7 +5319,125 @@ fn execute_command(s: &mut State, action: CommandAction) {
                 s.quick_finder.loading = false;
             }
         }
+        CommandAction::ManageLspServers => {
+            open_lsp_manager(s);
+        }
+        CommandAction::EditProjectLspConfig => {
+            open_project_lsp_config(s);
+        }
     }
+}
+
+// ── LSP manager panel ─────────────────────────────────────────────────────────
+
+fn open_lsp_manager(s: &mut State) {
+    s.quick_finder.open = false;
+    let entries = lsp_registry::list_live();
+    s.lsp_panel = Some(LspManagerPanel { entries, selected: 0 });
+}
+
+/// The project root + host this window would run a server for ("move here" target,
+/// and the location of the editable `.vscode/local-text.json`).
+fn current_project_target(s: &State) -> (Option<VPath>, Option<vpath::SshHost>) {
+    let root = if let Some(ex) = s.explorer.as_ref() {
+        Some(ex.root.clone())
+    } else {
+        let pid = s.active_pane;
+        s.panes.get(&pid)
+            .filter(|p| p.kind == PaneKind::Editor)
+            .and_then(|p| p.tabs.get(p.active))
+            .and_then(|t| t.path.clone())
+            .and_then(|p| lsp_root_for_path(s, &p))
+    };
+    let host = root.as_ref().and_then(|r| r.ssh_host().cloned());
+    (root, host)
+}
+
+fn lsp_panel_selected(s: &State) -> Option<lsp_registry::LspRegistryEntry> {
+    s.lsp_panel.as_ref().and_then(|p| p.entries.get(p.selected).cloned())
+}
+
+fn lsp_panel_go_to_window(s: &mut State) {
+    let Some(entry) = lsp_panel_selected(s) else { s.lsp_panel = None; return; };
+    s.lsp_panel = None;
+    if entry.pid == std::process::id() {
+        s.status_msg = Some("That server is in this window.".to_owned());
+        return;
+    }
+    let pid = entry.pid;
+    let label = entry.root.clone().unwrap_or_else(|| entry.lang.clone());
+    std::thread::spawn(move || { let _ = lsp_registry::request_raise(pid); });
+    s.status_msg = Some(format!("Raising window for {label}…"));
+}
+
+fn lsp_panel_stop(s: &mut State) {
+    let Some(entry) = lsp_panel_selected(s) else { s.lsp_panel = None; return; };
+    let bin = lsp_binary(Lang::from_registry_str(&entry.lang).unwrap_or(Lang::None))
+        .unwrap_or("server").to_owned();
+    if entry.pid == std::process::id() {
+        // Our own server: stop synchronously and refresh the list in place.
+        if let Some(mut srv) = s.lsp.servers.remove(&entry.op_id) {
+            let _ = srv.process.kill();
+        }
+        lsp_registry::unregister(entry.op_id);
+        s.status_msg = Some(format!("Stopped {bin}."));
+        if let Some(p) = s.lsp_panel.as_mut() {
+            p.entries = lsp_registry::list_live();
+            if p.selected >= p.entries.len() { p.selected = p.entries.len().saturating_sub(1); }
+        }
+    } else {
+        let pid = entry.pid;
+        let op_id = entry.op_id;
+        std::thread::spawn(move || { let _ = lsp_registry::request_stop(pid, op_id); });
+        s.status_msg = Some(format!("Stopping {bin} (pid {pid})…"));
+        s.lsp_panel = None;
+    }
+}
+
+fn lsp_panel_move_here(s: &mut State) {
+    let Some(entry) = lsp_panel_selected(s) else { s.lsp_panel = None; return; };
+    s.lsp_panel = None;
+    if entry.pid == std::process::id() {
+        s.status_msg = Some("That server is already in this window.".to_owned());
+        return;
+    }
+    let Some(lang) = Lang::from_registry_str(&entry.lang) else { return; };
+    let (root, host) = current_project_target(s);
+    if root.is_none() {
+        s.status_msg = Some("No project open in this window to move the server to.".to_owned());
+        return;
+    }
+    let bin = lsp_binary(lang).unwrap_or("server").to_owned();
+    let proxy = s.proxy.clone();
+    let pid = entry.pid;
+    let op_id = entry.op_id;
+    s.status_msg = Some(format!("Moving {bin} here…"));
+    std::thread::spawn(move || {
+        // Evict the other instance, then ask our main loop to start ours in the
+        // freed slot (the start must run on the UI thread, hence the event).
+        let _ = lsp_registry::request_stop(pid, op_id);
+        let _ = proxy.send_event(UserEvent::LspSlotFreed { lang, ssh_host: host, root });
+    });
+}
+
+/// Open (creating a template if absent) `<root>/.vscode/local-text.json` for the
+/// current local project so the user can edit per-project LSP env/command/args.
+fn open_project_lsp_config(s: &mut State) {
+    let (root, _) = current_project_target(s);
+    let Some(VPath::Local(root)) = root else {
+        s.status_msg = Some("Open a local project to edit its LSP settings.".to_owned());
+        return;
+    };
+    let cfg_path = root.join(proj_config::CONFIG_REL_PATH);
+    if !cfg_path.exists() {
+        if let Some(parent) = cfg_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let template = "{\n  \"rust-analyzer\": {\n    \"env\": {},\n    \"command\": null,\n    \"args\": null\n  }\n}\n";
+        let _ = std::fs::write(&cfg_path, template);
+    }
+    push_cursor_history(s);
+    open_or_reuse_tab(s, VPath::Local(cfg_path));
 }
 
 // ── Global find/replace ───────────────────────────────────────────────────────
@@ -5474,18 +5690,8 @@ fn compute_line_nums_at(lines: &[DiffLine], skip: usize) -> (usize, usize) {
 }
 
 fn open_diff_tab(s: &mut State, path: String, staged: bool) {
-    // Find target editor pane
-    let ap = if s.panes.get(&s.active_pane).map_or(false, |p| p.kind == PaneKind::Editor) {
-        s.active_pane
-    } else {
-        let area = s.pane_area();
-        let Some(id) = layout_tree(&s.pane_tree, area).into_iter()
-            .find(|(id, _)| s.panes.get(id).map_or(false, |p| p.kind == PaneKind::Editor))
-            .map(|(id, _)| id)
-        else { return; };
-        s.active_pane = id;
-        id
-    };
+    // Find target editor pane, creating one if every editor tab has been closed.
+    let ap = ensure_editor_pane(s);
     // Check if a GitDiff tab for this path already exists in the pane
     {
         let pane = s.panes.get(&ap).unwrap();
@@ -5507,8 +5713,15 @@ fn open_diff_tab(s: &mut State, path: String, staged: bool) {
     tab.path = Some(VPath::Local(PathBuf::from(&path)));
     s.git_diff_tabs.insert(buf_id, GitDiffTabData { path: path.clone(), staged, lines: vec![], loading: true });
     let pane = s.panes.get_mut(&ap).unwrap();
-    pane.tabs.push(tab);
-    pane.active = pane.tabs.len() - 1;
+    // Reuse a blank untitled tab (e.g. the one in a freshly-created pane) instead
+    // of leaving it stranded beside the diff.
+    if pane.tab().is_empty_untitled() {
+        let active = pane.active;
+        pane.tabs[active] = tab;
+    } else {
+        pane.tabs.push(tab);
+        pane.active = pane.tabs.len() - 1;
+    }
     // Fetch diff in background (local only — remote git deferred)
     let root = s.explorer.as_ref()
         .and_then(|e| e.root.as_local_path().map(|p| p.to_path_buf()))
@@ -5623,11 +5836,14 @@ struct App {
     proxy:        EventLoopProxy<UserEvent>,
     dirty:        Arc<AtomicBool>,
     display_link: Option<platform::DisplayLink>,
+    /// Control socket for cross-process LSP coordination; Drop unlinks it.
+    ctl_listener: Option<lsp_registry::ControlListener>,
 }
 
 impl App {
     fn new(file_arg: Option<VPath>, dir_arg: Option<VPath>, proxy: EventLoopProxy<UserEvent>) -> Self {
-        Self { state: None, file_arg, dir_arg, proxy, dirty: Arc::new(AtomicBool::new(false)), display_link: None }
+        Self { state: None, file_arg, dir_arg, proxy, dirty: Arc::new(AtomicBool::new(false)), display_link: None,
+               ctl_listener: None }
     }
 
     fn apply_vsync_setting(&mut self) {
@@ -5782,6 +5998,7 @@ impl ApplicationHandler<UserEvent> for App {
             left_panel_visible: true,
             diag_panel_sel: 0,
             context_menu: None,
+            lsp_panel:    None,
             quick_finder: QuickFinder {
                 open: false, query: String::new(), cursor: 0, sel_anchor: None,
                 entries: vec![], filtered: vec![], filtered_commands: vec![], selected: 0,
@@ -5825,6 +6042,19 @@ impl ApplicationHandler<UserEvent> for App {
         s.win.request_redraw();
         self.state = Some(s);
         self.apply_vsync_setting();
+
+        // Cross-process LSP coordination: bind our control socket so other
+        // local-text windows can query/stop our servers and raise our window.
+        if self.ctl_listener.is_none() {
+            self.ctl_listener = lsp_registry::start_control_listener(self.proxy.clone());
+        }
+    }
+
+    fn exiting(&mut self, _el: &ActiveEventLoop) {
+        // Best-effort: remove our registry entries + control socket. The liveness
+        // GC in lsp_registry is the backstop for unclean exits (SIGKILL/panic).
+        lsp_registry::cleanup_self();
+        self.ctl_listener = None;
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: winit::window::WindowId, event: WindowEvent) {
@@ -7612,6 +7842,30 @@ impl ApplicationHandler<UserEvent> for App {
                 let alt   = s.mods.alt_key();
                 let shift = s.mods.shift_key();
 
+                // LSP manager panel captures all keys while open.
+                if s.lsp_panel.is_some() {
+                    let n = s.lsp_panel.as_ref().map_or(0, |p| p.entries.len());
+                    match &event.logical_key {
+                        Key::Named(NamedKey::Escape) => { s.lsp_panel = None; }
+                        Key::Named(NamedKey::ArrowUp) => {
+                            if let Some(p) = s.lsp_panel.as_mut() { p.selected = p.selected.saturating_sub(1); }
+                        }
+                        Key::Named(NamedKey::ArrowDown) => {
+                            if let Some(p) = s.lsp_panel.as_mut() {
+                                if n > 0 { p.selected = (p.selected + 1).min(n - 1); }
+                            }
+                        }
+                        Key::Named(NamedKey::Enter) => lsp_panel_go_to_window(s),
+                        Key::Named(NamedKey::Delete) | Key::Named(NamedKey::Backspace) => lsp_panel_stop(s),
+                        Key::Character(c) if c.as_str() == "g" => lsp_panel_go_to_window(s),
+                        Key::Character(c) if c.as_str() == "m" => lsp_panel_move_here(s),
+                        Key::Character(c) if c.as_str() == "x" => lsp_panel_stop(s),
+                        _ => {}
+                    }
+                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                    return;
+                }
+
                 // Cmd+, / Cmd+. — cursor history navigation (use physical_key to avoid macOS ≤/≥ chars)
                 if cmd && !alt && event.physical_key == PhysicalKey::Code(KeyCode::Comma) {
                     cursor_go_back(s);
@@ -8859,7 +9113,35 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 s.needs_redraw = true;
             }
+            UserEvent::LspStopRequested { op_id, reply } => {
+                // Another local-text process asked us to stop this server so it can
+                // claim the slot. Kill it now and ack; the stdout-EOF LspServerStopped
+                // that follows just does UI cleanup (the server is already gone).
+                let result = if let Some(mut srv) = s.lsp.servers.remove(&op_id) {
+                    let _ = srv.process.kill();
+                    lsp_registry::unregister(op_id);
+                    lsp_registry::StopResult::Stopped
+                } else {
+                    lsp_registry::StopResult::NotFound
+                };
+                let _ = reply.send(result);
+                s.needs_redraw = true;
+                self.dirty.store(true, Ordering::Release);
+            }
+            UserEvent::LspSlotFreed { lang, ssh_host, root } => {
+                ensure_lsp_server_running(s, lang, ssh_host, root);
+                s.needs_redraw = true;
+                self.dirty.store(true, Ordering::Release);
+            }
+            UserEvent::RaiseWindowRequested => {
+                s.win.focus_window();
+                s.win.set_minimized(false);
+                s.win.request_redraw();
+                s.needs_redraw = true;
+                self.dirty.store(true, Ordering::Release);
+            }
             UserEvent::LspServerStopped { server_id } => {
+                lsp_registry::unregister(server_id);
                 if let Some(srv) = s.lsp.servers.remove(&server_id) {
                     let scope = srv.ssh_host.as_ref()
                         .map(|h| format!("remote {}", h.display()))
@@ -10140,6 +10422,18 @@ fn render(s: &mut State) {
             Some((x1, py_top, x2, py_top + lh))
         })
     } else { None };
+
+    // LSP manager panel snapshot: (rows, selected). Built before the move closure.
+    let lsp_panel_snap: Option<(Vec<String>, usize)> = s.lsp_panel.as_ref().map(|p| {
+        let self_pid = std::process::id();
+        let rows: Vec<String> = p.entries.iter().map(|e| {
+            let scope = e.ssh_host.clone().unwrap_or_else(|| "local".to_owned());
+            let root  = e.root.clone().unwrap_or_else(|| "(no root)".to_owned());
+            let mine  = if e.pid == self_pid { "  (this window)" } else { "" };
+            format!("{} · {} · {} · pid {}{}", e.lang, root, scope, e.pid, mine)
+        }).collect();
+        (rows, p.selected)
+    });
 
     // SAFETY: render_frame takes FnOnce and calls it synchronously before returning.
     // s.glyphs is alive for the entire duration, and renderer does not alias glyphs.
@@ -11528,6 +11822,35 @@ fn render(s: &mut State) {
                         draw_str(buf, w, h, g, &name_disp, ox + 6, ry + asc, FG, ox + ow - 4 - dir_w - cw);
                         draw_str(buf, w, h, g, &dir_disp, ox + ow - 4 - dir_w, ry + asc, FG_DIM, ox + ow - 2);
                     }
+                }
+            }
+        }
+
+        // ── LSP manager panel overlay ────────────────────────────────────
+        if let Some((rows, sel)) = &lsp_panel_snap {
+            darken_buffer(buf, w, h);
+            let header = "LSP Servers   ↵/g go to window   m move here   x stop   esc close";
+            let item_count = (rows.len().max(1)) as i32;
+            let ow = (w as i32 * 3 / 4).min(w as i32 - 40).max(420);
+            let oh = lh * (item_count + 2) + 8;
+            let ox = (w as i32 - ow) / 2;
+            let oy = h as i32 / 4;
+            fill(buf, w, h, ox, oy, ow, oh, BG2);
+            fill(buf, w, h, ox, oy, ow, 1, BORDER);
+            fill(buf, w, h, ox, oy + oh - 1, ow, 1, BORDER);
+            fill(buf, w, h, ox, oy, 1, oh, BORDER);
+            fill(buf, w, h, ox + ow - 1, oy, 1, oh, BORDER);
+            draw_str(buf, w, h, g, header, ox + 6, oy + 4 + asc, FG_DIM, ox + ow - 4);
+            if rows.is_empty() {
+                let ry = oy + 4 + lh + 4;
+                draw_str(buf, w, h, g, "No language servers running.", ox + 6, ry + asc, FG_DIM, ox + ow - 4);
+            } else {
+                let avail = ((ow - 12) / cw).max(8) as usize;
+                for (i, row) in rows.iter().enumerate() {
+                    let ry = oy + 4 + lh + 4 + i as i32 * lh;
+                    if i == *sel { fill(buf, w, h, ox + 1, ry, ow - 2, lh, SEL_BG); }
+                    let disp = fit_str(row, avail);
+                    draw_str(buf, w, h, g, &disp, ox + 6, ry + asc, FG, ox + ow - 4);
                 }
             }
         }

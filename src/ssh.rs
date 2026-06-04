@@ -202,18 +202,24 @@ pub fn ssh_check_lsp_binaries(
 pub fn ssh_lsp_command(
     host: &SshHost,
     bin: &str,
-    args: &[&str],
+    args: &[String],
     path_dirs: &[String],
     cwd: Option<&Path>,
+    env: &[(String, String)],
 ) -> Command {
     let mut cmd = Command::new("ssh");
-    let remote_command = if path_dirs.is_empty() && cwd.is_none() {
+    let remote_command = if path_dirs.is_empty() && cwd.is_none() && env.is_empty() {
         let mut remote_argv = Vec::with_capacity(args.len() + 1);
         remote_argv.push(bin);
-        remote_argv.extend(args.iter().copied());
+        remote_argv.extend(args.iter().map(|s| s.as_str()));
         remote_command(&remote_argv)
     } else {
         let mut script = if path_dirs.is_empty() { String::new() } else { lsp_path_setup(path_dirs) };
+        // Per-project env vars from `.vscode/local-text.json` (value shell-quoted;
+        // the name is assumed to be a valid shell identifier).
+        for (k, v) in env {
+            script.push_str(&format!("export {}={}\n", k, shell_quote(v)));
+        }
         if let Some(cwd) = cwd {
             script.push_str("cd ");
             script.push_str(&remote_path_expr(cwd));
@@ -223,7 +229,7 @@ pub fn ssh_lsp_command(
         script.push_str(&shell_quote(bin));
         for arg in args {
             script.push(' ');
-            script.push_str(&shell_quote(arg));
+            script.push_str(&shell_quote(arg.as_str()));
         }
         remote_command(&["sh", "-c", &script])
     };
@@ -237,6 +243,32 @@ pub fn ssh_lsp_command(
        .arg("--")
        .arg(remote_command);
     cmd
+}
+
+/// Read a small remote file synchronously over the warm ControlMaster, bounded
+/// by a short timeout so a stalled connection can't wedge the UI thread. Returns
+/// None on any error, non-zero exit, or timeout. Used to load a remote project's
+/// `.vscode/local-text.json` just before launching an LSP server.
+pub fn read_remote_file_sync(host: &SshHost, remote_path: &str) -> Option<String> {
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-o").arg(format!("ControlPath={}", host.control_path().display()))
+       .arg("-o").arg("ControlMaster=no")  // reuse existing master only; fails fast if none
+       .arg("-o").arg("BatchMode=yes");
+    if let Some(port) = host.port {
+        cmd.arg("-p").arg(port.to_string());
+    }
+    cmd.arg(host.host_arg())
+       .arg("--")
+       .arg(format!("cat {}", shell_quote(remote_path)))
+       .stdin(Stdio::null())
+       .stdout(Stdio::piped())
+       .stderr(Stdio::null());
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || { let _ = tx.send(cmd.output()); });
+    match rx.recv_timeout(Duration::from_millis(1200)) {
+        Ok(Ok(output)) if output.status.success() => String::from_utf8(output.stdout).ok(),
+        _ => None,
+    }
 }
 
 // ── Setup versioning ──────────────────────────────────────────────────────────
@@ -516,9 +548,10 @@ mod tests {
         let cmd = ssh_lsp_command(
             &host,
             "typescript-language-server",
-            &["--stdio"],
+            &["--stdio".to_owned()],
             &[],
             Some(Path::new("/srv/app with spaces")),
+            &[],
         );
         let remote = cmd.get_args().last().unwrap().to_string_lossy();
         assert!(remote.contains("'sh' '-c'"));
@@ -527,6 +560,26 @@ mod tests {
         assert!(remote.contains("|| exit $?"));
         assert!(remote.contains("exec "));
         assert!(remote.contains("typescript-language-server"));
+        assert!(remote.contains("--stdio"));
+    }
+
+    #[test]
+    fn lsp_command_exports_per_project_env() {
+        let host = SshHost { user: None, host: "h".to_owned(), port: None };
+        let cmd = ssh_lsp_command(
+            &host,
+            "rust-analyzer",
+            &["--stdio".to_owned()],
+            &[],
+            None,
+            &[("CARGO_TARGET_DIR".to_owned(), "/tmp/ra target".to_owned())],
+        );
+        // The whole script is single-quoted again by `sh -c`, so check substrings
+        // that survive the outer quoting rather than exact quote sequences.
+        let remote = cmd.get_args().last().unwrap().to_string_lossy();
+        assert!(remote.contains("export CARGO_TARGET_DIR="));
+        assert!(remote.contains("/tmp/ra target"));
+        assert!(remote.contains("rust-analyzer"));
         assert!(remote.contains("--stdio"));
     }
 }
