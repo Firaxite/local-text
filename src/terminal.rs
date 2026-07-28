@@ -79,6 +79,9 @@ pub struct TermGrid {
     pub cur_bg: u32,
     pub cur_bold: bool,
     pub cur_visible: bool,
+    /// DEC application cursor-key mode (?1h). Programs such as interactive
+    /// Python/readline expect SS3 arrow sequences while this is enabled.
+    pub application_cursor: bool,
     pub mouse_report: MouseReportMode,
     pub mouse_sgr:    bool,
     /// DECSTBM scrolling region (0-based, inclusive).
@@ -105,6 +108,7 @@ impl TermGrid {
             cols, rows, cells, cur_col: 0, cur_row: 0,
             scrollback: VecDeque::new(), scroll_offset: 0,
             cur_fg: DEFAULT_FG, cur_bg: DEFAULT_BG, cur_bold: false, cur_visible: true,
+            application_cursor: false,
             mouse_report: MouseReportMode::None, mouse_sgr: false,
             scroll_top: 0, scroll_bot: rows_m1,
             alt_cells: None, alt_cur_col: 0, alt_cur_row: 0,
@@ -161,22 +165,44 @@ impl TermGrid {
 
     pub fn resize(&mut self, new_cols: usize, new_rows: usize) {
         if new_cols == self.cols && new_rows == self.rows { return; }
-        let mut new_cells = vec![Cell::default(); new_cols * new_rows];
-        let copy_rows = self.rows.min(new_rows);
-        let copy_cols = self.cols.min(new_cols);
-        for r in 0..copy_rows {
-            for c in 0..copy_cols {
-                new_cells[r * new_cols + c] = self.cells[r * self.cols + c];
+        let (cells, cur_col, cur_row, overflow) = resize_screen(
+            &self.cells, self.cols, self.rows, self.cur_col, self.cur_row, new_cols, new_rows,
+        );
+        self.cells = cells;
+        self.cur_col = cur_col;
+        self.cur_row = cur_row;
+
+        // Rows displaced by a smaller terminal remain available in scrollback.
+        // This is deliberately bounded by the same cap used during normal output.
+        if self.alt_cells.is_none() {
+            for row in overflow {
+                if self.scrollback.len() >= 1000 { self.scrollback.pop_front(); }
+                self.scrollback.push_back(row);
             }
         }
-        self.cells = new_cells;
+
+        // While the alternate screen is active, alt_cells stores the primary
+        // screen. Resize it too instead of dropping it and erasing the session.
+        if let Some(saved) = self.alt_cells.take() {
+            let (saved, saved_col, saved_row, saved_overflow) = resize_screen(
+                &saved, self.cols, self.rows, self.alt_cur_col, self.alt_cur_row,
+                new_cols, new_rows,
+            );
+            for row in saved_overflow {
+                if self.scrollback.len() >= 1000 { self.scrollback.pop_front(); }
+                self.scrollback.push_back(row);
+            }
+            self.alt_cells = Some(saved);
+            self.alt_cur_col = saved_col;
+            self.alt_cur_row = saved_row;
+            self.alt_scroll_top = 0;
+            self.alt_scroll_bot = new_rows.saturating_sub(1);
+        }
+
         self.cols = new_cols;
         self.rows = new_rows;
-        self.cur_row = self.cur_row.min(new_rows.saturating_sub(1));
-        self.cur_col = self.cur_col.min(new_cols.saturating_sub(1));
         self.scroll_top = 0;
         self.scroll_bot = new_rows.saturating_sub(1);
-        self.alt_cells = None; // discard alt screen on resize
     }
 
     /// Return the visible rows accounting for scroll_offset.
@@ -199,6 +225,70 @@ impl TermGrid {
             result
         }
     }
+}
+
+/// Rewrap a screen without losing rows that no longer fit. Each physical source
+/// row remains a hard line; only non-blank content beyond the new width wraps.
+fn resize_screen(
+    cells: &[Cell],
+    old_cols: usize,
+    old_rows: usize,
+    cur_col: usize,
+    cur_row: usize,
+    new_cols: usize,
+    new_rows: usize,
+) -> (Vec<Cell>, usize, usize, Vec<Vec<Cell>>) {
+    if new_cols == 0 || new_rows == 0 {
+        return (vec![], 0, 0, vec![]);
+    }
+
+    let mut logical_rows: Vec<Vec<Cell>> = Vec::new();
+    let mut mapped_cursor = (0usize, 0usize);
+    let last_content_row = (0..old_rows).rev().find(|&row| {
+        let start = row.saturating_mul(old_cols).min(cells.len());
+        let end = start.saturating_add(old_cols).min(cells.len());
+        cells[start..end].iter().any(|cell| cell.ch != ' ')
+    }).unwrap_or(0);
+    let meaningful_rows = last_content_row.max(cur_row).saturating_add(1).min(old_rows);
+    for row in 0..meaningful_rows {
+        let start = row.saturating_mul(old_cols).min(cells.len());
+        let end = start.saturating_add(old_cols).min(cells.len());
+        let source = &cells[start..end];
+        let last_nonblank = source.iter().rposition(|c| c.ch != ' ').map_or(0, |i| i + 1);
+        let used = if row == cur_row {
+            last_nonblank.max(cur_col.saturating_add(1).min(old_cols))
+        } else {
+            last_nonblank
+        };
+        let chunks = used.max(1).div_ceil(new_cols);
+        let base = logical_rows.len();
+        for chunk in 0..chunks {
+            let mut out = vec![Cell::default(); new_cols];
+            let from = chunk * new_cols;
+            let to = (from + new_cols).min(source.len()).min(used);
+            if to > from {
+                out[..to - from].copy_from_slice(&source[from..to]);
+            }
+            logical_rows.push(out);
+        }
+        if row == cur_row {
+            mapped_cursor = (base + cur_col / new_cols, cur_col % new_cols);
+        }
+    }
+
+    if logical_rows.is_empty() {
+        logical_rows.push(vec![Cell::default(); new_cols]);
+    }
+    let screen_start = logical_rows.len().saturating_sub(new_rows);
+    let overflow = logical_rows[..screen_start].to_vec();
+    let visible = &logical_rows[screen_start..];
+    let mut new_cells = vec![Cell::default(); new_cols * new_rows];
+    for (row, source) in visible.iter().enumerate() {
+        new_cells[row * new_cols..(row + 1) * new_cols].copy_from_slice(source);
+    }
+    let new_cur_row = mapped_cursor.0.saturating_sub(screen_start).min(new_rows - 1);
+    let new_cur_col = mapped_cursor.1.min(new_cols - 1);
+    (new_cells, new_cur_col, new_cur_row, overflow)
 }
 
 // ── VteHandler ────────────────────────────────────────────────────────────────
@@ -345,6 +435,7 @@ impl<'a> Perform for VteHandler<'a> {
                 if intermediates.first() == Some(&0x3F) {
                     for &p in ps.iter() {
                         match p {
+                            1    => g.application_cursor = enable,
                             25   => g.cur_visible = enable,
                             1000 => g.mouse_report = if enable { MouseReportMode::X10 } else { MouseReportMode::None },
                             1002 => g.mouse_report = if enable { MouseReportMode::ButtonEvent } else { MouseReportMode::None },
@@ -770,8 +861,16 @@ pub fn new_log_pane(id: usize, cols: usize, rows: usize, title: String) -> TermP
 
 /// Encode a winit keyboard event into bytes to write to the PTY master fd.
 /// Returns None for events that should not be forwarded.
-pub fn encode_key(key: &Key, mods: ModifiersState, text: Option<&str>) -> Option<Vec<u8>> {
+pub fn encode_key(
+    key: &Key,
+    mods: ModifiersState,
+    text: Option<&str>,
+    application_cursor: bool,
+) -> Option<Vec<u8>> {
     let ctrl = mods.control_key();
+    let cursor_key = |suffix| {
+        vec![0x1b, if application_cursor { b'O' } else { b'[' }, suffix]
+    };
     match key {
         Key::Named(NamedKey::Enter)      => Some(b"\r".to_vec()),
         Key::Named(NamedKey::Backspace)  => Some(b"\x7f".to_vec()),
@@ -779,12 +878,12 @@ pub fn encode_key(key: &Key, mods: ModifiersState, text: Option<&str>) -> Option
         Key::Named(NamedKey::Tab)        => {
             if mods.shift_key() { Some(b"\x1b[Z".to_vec()) } else { Some(b"\t".to_vec()) }
         }
-        Key::Named(NamedKey::ArrowUp)    => Some(b"\x1b[A".to_vec()),
-        Key::Named(NamedKey::ArrowDown)  => Some(b"\x1b[B".to_vec()),
-        Key::Named(NamedKey::ArrowRight) => Some(b"\x1b[C".to_vec()),
-        Key::Named(NamedKey::ArrowLeft)  => Some(b"\x1b[D".to_vec()),
-        Key::Named(NamedKey::Home)       => Some(b"\x1b[H".to_vec()),
-        Key::Named(NamedKey::End)        => Some(b"\x1b[F".to_vec()),
+        Key::Named(NamedKey::ArrowUp)    => Some(cursor_key(b'A')),
+        Key::Named(NamedKey::ArrowDown)  => Some(cursor_key(b'B')),
+        Key::Named(NamedKey::ArrowRight) => Some(cursor_key(b'C')),
+        Key::Named(NamedKey::ArrowLeft)  => Some(cursor_key(b'D')),
+        Key::Named(NamedKey::Home)       => Some(cursor_key(b'H')),
+        Key::Named(NamedKey::End)        => Some(cursor_key(b'F')),
         Key::Named(NamedKey::Delete)     => Some(b"\x1b[3~".to_vec()),
         Key::Named(NamedKey::PageUp)     => Some(b"\x1b[5~".to_vec()),
         Key::Named(NamedKey::PageDown)   => Some(b"\x1b[6~".to_vec()),
@@ -864,5 +963,56 @@ mod tests {
             parse_osc7_path("file:///home/user/proj"),
             Some(std::path::PathBuf::from("/home/user/proj")),
         );
+    }
+
+    #[test]
+    fn application_cursor_mode_changes_arrow_sequences() {
+        let mut g = TermGrid::new(8, 2);
+        drive(&mut g, b"\x1b[?1h");
+        assert!(g.application_cursor);
+        assert_eq!(
+            encode_key(
+                &Key::Named(NamedKey::ArrowUp),
+                ModifiersState::empty(),
+                None,
+                g.application_cursor,
+            ),
+            Some(b"\x1bOA".to_vec()),
+        );
+        drive(&mut g, b"\x1b[?1l");
+        assert!(!g.application_cursor);
+        assert_eq!(
+            encode_key(
+                &Key::Named(NamedKey::ArrowLeft),
+                ModifiersState::empty(),
+                None,
+                g.application_cursor,
+            ),
+            Some(b"\x1b[D".to_vec()),
+        );
+    }
+
+    #[test]
+    fn resize_keeps_displaced_rows_in_scrollback() {
+        let mut g = TermGrid::new(4, 3);
+        drive(&mut g, b"one\r\ntwo\r\ntri");
+        g.resize(4, 2);
+
+        let row_text = |row: &[Cell]| row.iter().map(|cell| cell.ch).collect::<String>();
+        assert_eq!(row_text(g.scrollback.back().unwrap()).trim_end(), "one");
+        assert_eq!(row_text(&g.cells[..4]).trim_end(), "two");
+        assert_eq!(row_text(&g.cells[4..8]).trim_end(), "tri");
+    }
+
+    #[test]
+    fn resize_preserves_saved_primary_screen_during_alt_screen() {
+        let mut g = TermGrid::new(6, 2);
+        drive(&mut g, b"shell");
+        drive(&mut g, b"\x1b[?1049hfull");
+        g.resize(4, 2);
+        assert!(g.alt_cells.is_some());
+        drive(&mut g, b"\x1b[?1049l");
+        let restored: String = g.cells.iter().map(|cell| cell.ch).collect();
+        assert!(restored.contains("shel"));
     }
 }

@@ -88,8 +88,8 @@ pub fn ssh_write_file(host: SshHost, path: PathBuf, content: String, proxy: Even
     });
 }
 
-/// List a remote directory.  Sends `RemoteDirListing` on success or `SshError`
-/// on failure.  Each entry is `(name, is_dir)`.
+/// List a remote directory. Sends a listing-specific result so a transient
+/// polling failure does not mark the whole SSH connection as failed.
 pub fn ssh_list_dir(host: SshHost, path: PathBuf, proxy: EventLoopProxy<UserEvent>) {
     thread::spawn(move || {
         let vpath = VPath::Remote { host: host.clone(), path: path.clone() };
@@ -123,10 +123,93 @@ done"#,
                 let _ = proxy.send_event(UserEvent::RemoteDirListing { path: vpath, entries });
             }
             Err(msg) => {
-                let _ = proxy.send_event(UserEvent::SshError { host, msg });
+                let _ = proxy.send_event(UserEvent::RemoteDirListingError {
+                    path: vpath,
+                    msg,
+                });
             }
         }
     });
+}
+
+pub fn ssh_create_file(
+    host: SshHost,
+    path: PathBuf,
+    refresh_dir: PathBuf,
+    proxy: EventLoopProxy<UserEvent>,
+) {
+    let target = remote_path_expr(&path);
+    let script = format!(
+        "if [ -e {target} ] || [ -L {target} ]; then\n\
+         \tprintf '%s\\n' 'file already exists' >&2\n\
+         \texit 1\n\
+         fi\n\
+         : > {target}",
+    );
+    spawn_remote_fs_op(
+        host,
+        script,
+        refresh_dir,
+        None,
+        Some(path.clone()),
+        path,
+        proxy,
+    );
+}
+
+pub fn ssh_create_dir(
+    host: SshHost,
+    path: PathBuf,
+    refresh_dir: PathBuf,
+    proxy: EventLoopProxy<UserEvent>,
+) {
+    let script = format!("mkdir -- {}", remote_path_expr(&path));
+    spawn_remote_fs_op(host, script, refresh_dir, None, None, path, proxy);
+}
+
+pub fn ssh_copy_path(
+    host: SshHost,
+    source: PathBuf,
+    destination_parent: PathBuf,
+    proxy: EventLoopProxy<UserEvent>,
+) {
+    let script = remote_copy_script(&source, &destination_parent);
+    spawn_remote_fs_op(
+        host,
+        script,
+        destination_parent.clone(),
+        None,
+        None,
+        destination_parent,
+        proxy,
+    );
+}
+
+pub fn ssh_rename_path(
+    host: SshHost,
+    old_path: PathBuf,
+    new_path: PathBuf,
+    refresh_dir: PathBuf,
+    proxy: EventLoopProxy<UserEvent>,
+) {
+    let old = remote_path_expr(&old_path);
+    let new = remote_path_expr(&new_path);
+    let script = format!(
+        "if [ -e {new} ] || [ -L {new} ]; then\n\
+         \tprintf '%s\\n' 'destination already exists' >&2\n\
+         \texit 1\n\
+         fi\n\
+         mv -- {old} {new}",
+    );
+    spawn_remote_fs_op(
+        host,
+        script,
+        refresh_dir,
+        Some((old_path.clone(), new_path.clone())),
+        None,
+        new_path,
+        proxy,
+    );
 }
 
 /// Walk all files under a remote directory (up to 50 000) for Cmd+P.
@@ -503,6 +586,76 @@ fn remote_path_expr(path: &Path) -> String {
     }
 }
 
+fn remote_copy_script(source: &Path, destination_parent: &Path) -> String {
+    format!(
+        r#"source={}
+parent={}
+case "$parent/" in
+    "$source/"*) printf '%s\n' 'cannot copy a folder inside itself' >&2; exit 1 ;;
+esac
+name=${{source##*/}}
+destination="$parent/$name"
+if [ -e "$destination" ] || [ -L "$destination" ]; then
+    if [ -f "$source" ]; then
+        case "$name" in
+            .*|*.) stem=$name; extension= ;;
+            *.*) stem=${{name%.*}}; extension=.${{name##*.}} ;;
+            *) stem=$name; extension= ;;
+        esac
+    else
+        stem=$name
+        extension=
+    fi
+    index=1
+    while :; do
+        if [ "$index" -eq 1 ]; then
+            destination="$parent/$stem copy$extension"
+        else
+            destination="$parent/$stem copy $index$extension"
+        fi
+        if [ ! -e "$destination" ] && [ ! -L "$destination" ]; then
+            break
+        fi
+        index=$((index + 1))
+    done
+fi
+cp -R -- "$source" "$destination""#,
+        remote_path_expr(source),
+        remote_path_expr(destination_parent),
+    )
+}
+
+fn spawn_remote_fs_op(
+    host: SshHost,
+    script: String,
+    refresh_dir: PathBuf,
+    renamed: Option<(PathBuf, PathBuf)>,
+    open_path: Option<PathBuf>,
+    error_path: PathBuf,
+    proxy: EventLoopProxy<UserEvent>,
+) {
+    thread::spawn(move || {
+        match run_ssh_capture(&host, &["sh", "-c", &script]) {
+            Ok(_) => {
+                let to_vpath = |path| VPath::Remote { host: host.clone(), path };
+                let renamed = renamed.map(|(old, new)| (to_vpath(old), to_vpath(new)));
+                let open_path = open_path.map(to_vpath);
+                let _ = proxy.send_event(UserEvent::RemoteFsOpDone {
+                    refresh_dir: VPath::Remote { host, path: refresh_dir },
+                    renamed,
+                    open_path,
+                });
+            }
+            Err(msg) => {
+                let _ = proxy.send_event(UserEvent::RemoteFsOpError {
+                    path: VPath::Remote { host, path: error_path },
+                    msg,
+                });
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -540,6 +693,53 @@ mod tests {
         assert_eq!(remote_path_expr(Path::new("~")), "~");
         assert_eq!(remote_path_expr(Path::new("~/dir with spaces")), "~/'dir with spaces'");
         assert_eq!(remote_path_expr(Path::new("/tmp/dir with spaces")), "'/tmp/dir with spaces'");
+    }
+
+    #[test]
+    fn remote_copy_script_quotes_paths_and_chooses_copy_names() {
+        let script = remote_copy_script(
+            Path::new("/srv/source file.py"),
+            Path::new("/srv/destination dir"),
+        );
+        assert!(script.contains("source='/srv/source file.py'"));
+        assert!(script.contains("parent='/srv/destination dir'"));
+        assert!(script.contains("destination=\"$parent/$stem copy$extension\""));
+        assert!(script.contains("destination=\"$parent/$stem copy $index$extension\""));
+        assert!(script.contains("cp -R -- \"$source\" \"$destination\""));
+    }
+
+    #[test]
+    fn remote_copy_script_runs_and_avoids_existing_names() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "local-text-ssh-copy-{}-{nonce}",
+            std::process::id(),
+        ));
+        let source = root.join("source file.py");
+        let destination = root.join("destination dir");
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::write(&source, "print('ok')\n").unwrap();
+
+        for _ in 0..2 {
+            let status = Command::new("sh")
+                .args(["-c", &remote_copy_script(&source, &destination)])
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        assert_eq!(
+            std::fs::read_to_string(destination.join("source file.py")).unwrap(),
+            "print('ok')\n",
+        );
+        assert_eq!(
+            std::fs::read_to_string(destination.join("source file copy.py")).unwrap(),
+            "print('ok')\n",
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

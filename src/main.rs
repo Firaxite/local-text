@@ -8,7 +8,7 @@ mod vpath;
 mod ssh;
 mod collab;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use vpath::VPath;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -111,6 +111,51 @@ impl Lang {
             _            => None,
         }
     }
+
+    fn from_path_and_first_line(path: Option<&std::path::Path>, first_line: &str) -> Self {
+        if let Some(path_lang) = path.map(Self::from_path).filter(|lang| *lang != Lang::None) {
+            return path_lang;
+        }
+        let Some(shebang) = first_line.trim_end_matches(['\r', '\n']).strip_prefix("#!") else {
+            return Lang::None;
+        };
+        let is_python = shebang
+            .split(|c: char| c == '/' || c.is_ascii_whitespace())
+            .filter(|part| !part.is_empty())
+            .any(|part| {
+                let part = part.to_ascii_lowercase();
+                let Some(suffix) = part.strip_prefix("python") else { return false };
+                suffix.is_empty() || suffix.starts_with(|c: char| c.is_ascii_digit())
+            });
+        if is_python { Lang::Python } else { Lang::None }
+    }
+}
+
+fn python_line_opens_block(line_before_cursor: &str) -> bool {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut code_end = line_before_cursor.len();
+    for (idx, ch) in line_before_cursor.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && quote.is_some() {
+            escaped = true;
+            continue;
+        }
+        match quote {
+            Some(q) if ch == q => quote = None,
+            Some(_) => {}
+            None if matches!(ch, '\'' | '"') => quote = Some(ch),
+            None if ch == '#' => {
+                code_end = idx;
+                break;
+            }
+            None => {}
+        }
+    }
+    line_before_cursor[..code_end].trim_end().ends_with(':')
 }
 
 // ── Multi-line tokenizer state ────────────────────────────────────────────────
@@ -249,6 +294,7 @@ enum FindFocus { Query, Replace }
 
 struct FindBar {
     open:           bool,
+    input_focused:  bool,
     replace_open:   bool,
     query:          String,
     replace:        String,
@@ -268,7 +314,7 @@ struct FindBar {
 impl FindBar {
     fn new() -> Self {
         FindBar {
-            open: false, replace_open: false,
+            open: false, input_focused: false, replace_open: false,
             query: String::new(), replace: String::new(),
             case_sensitive: false, whole_word: false,
             focus: FindFocus::Query,
@@ -346,7 +392,8 @@ enum CtxAction {
     TabOpenPreview,
     TabClose,
     TabSplitRight, TabSplitLeft, TabSplitDown, TabSplitUp,
-    ExplorerOpenAsRoot,
+    ExplorerOpenAsRoot, ExplorerNewFile, ExplorerNewFolder,
+    ExplorerCopy, ExplorerPaste, ExplorerDuplicate, ExplorerRename,
     OpenTerminalHere,
     GitOpenFile, GitViewDiff, GitStage, GitUnstage,
 }
@@ -576,6 +623,16 @@ impl Tab {
         self.sel().map(|(lo, hi)| self.text.slice(lo..hi).chars().collect())
     }
 
+    fn lang(&self) -> Lang {
+        let first_line = self.text.get_line(0)
+            .map(|line| line.chars().collect::<String>())
+            .unwrap_or_default();
+        Lang::from_path_and_first_line(
+            self.path.as_ref().map(|path| path.as_path()),
+            &first_line,
+        )
+    }
+
     fn load_file(&mut self, path: VPath) -> bool {
         // Remote files are loaded asynchronously (Phase 3); for now only local works.
         let Some(local_path) = path.as_local_path() else {
@@ -646,6 +703,7 @@ impl Tab {
 }
 
 // ── File explorer ─────────────────────────────────────────────────────────────
+#[derive(Clone, PartialEq, Eq)]
 struct FileEntry {
     name:     String,
     path:     PathBuf,
@@ -668,6 +726,8 @@ struct FileExplorer {
     tree_search_entries:     Vec<std::path::PathBuf>,
     tree_search_results:     Vec<std::path::PathBuf>,
     tree_search_sel:         usize,
+    last_refresh:            Instant,
+    pending_remote_listings: HashSet<PathBuf>,
 }
 
 impl FileExplorer {
@@ -681,6 +741,8 @@ impl FileExplorer {
             tree_search: String::new(), tree_search_cursor: 0, tree_search_sel_anchor: None,
             tree_search_focused: false, tree_search_fuzzy: true,
             tree_search_entries: vec![], tree_search_results: vec![], tree_search_sel: 0,
+            last_refresh: Instant::now(),
+            pending_remote_listings: HashSet::new(),
         }
     }
 
@@ -716,6 +778,63 @@ impl FileExplorer {
         }
         self.selected = self.selected.min(self.entries.len().saturating_sub(1));
         None
+    }
+
+    fn refresh_local(&mut self) -> bool {
+        let Some(root) = self.root.as_local_path().map(|path| path.to_path_buf()) else {
+            return false;
+        };
+        let expanded: HashSet<PathBuf> = self.entries.iter()
+            .filter(|entry| entry.is_dir && entry.expanded)
+            .map(|entry| entry.path.clone())
+            .collect();
+        let selected_path = self.entries.get(self.selected).map(|entry| entry.path.clone());
+        let mut refreshed = Vec::new();
+        append_refreshed_entries(
+            &root,
+            0,
+            self.show_hidden,
+            &expanded,
+            &mut refreshed,
+        );
+        if refreshed == self.entries {
+            return false;
+        }
+        self.entries = refreshed;
+        self.selected = selected_path
+            .and_then(|path| self.entries.iter().position(|entry| entry.path == path))
+            .unwrap_or_else(|| self.selected.min(self.entries.len().saturating_sub(1)));
+        self.tree_scroll = self.tree_scroll.min(self.entries.len().saturating_sub(1));
+        self.tree_search_entries.clear();
+        if !self.tree_search.is_empty() {
+            walk_files(&root, &mut self.tree_search_entries, 0);
+            refilter_tree_search(self);
+        }
+        true
+    }
+}
+
+fn append_refreshed_entries(
+    dir: &std::path::Path,
+    depth: usize,
+    show_hidden: bool,
+    expanded: &HashSet<PathBuf>,
+    out: &mut Vec<FileEntry>,
+) {
+    for mut entry in load_dir_entries(dir, depth, show_hidden) {
+        let should_expand = entry.is_dir && expanded.contains(&entry.path);
+        entry.expanded = should_expand;
+        let child_dir = entry.path.clone();
+        out.push(entry);
+        if should_expand {
+            append_refreshed_entries(
+                &child_dir,
+                depth + 1,
+                show_hidden,
+                expanded,
+                out,
+            );
+        }
     }
 }
 
@@ -806,6 +925,75 @@ fn remote_listing_to_file_entries(
         b.is_dir.cmp(&a.is_dir).then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
     out
+}
+
+fn merge_remote_children(
+    old: &[FileEntry],
+    new_children: Vec<FileEntry>,
+    child_depth: usize,
+) -> Vec<FileEntry> {
+    let mut merged = Vec::new();
+    for mut child in new_children {
+        if let Some(old_idx) = old.iter().position(|entry| {
+            entry.depth == child_depth && entry.path == child.path
+        }) {
+            child.expanded = child.is_dir && old[old_idx].expanded;
+            merged.push(child.clone());
+            if child.expanded {
+                for descendant in old.iter().skip(old_idx + 1)
+                    .take_while(|entry| entry.depth > child_depth)
+                {
+                    merged.push(descendant.clone());
+                }
+            }
+        } else {
+            merged.push(child);
+        }
+    }
+    merged
+}
+
+fn apply_remote_dir_listing(
+    explorer: &mut FileExplorer,
+    listing_path: &std::path::Path,
+    entries: Vec<(String, bool)>,
+) {
+    let selected_path = explorer.entries.get(explorer.selected)
+        .map(|entry| entry.path.clone());
+    if explorer.root.as_path() == listing_path {
+        let new_children = remote_listing_to_file_entries(
+            listing_path,
+            entries,
+            0,
+            explorer.show_hidden,
+        );
+        let old = std::mem::take(&mut explorer.entries);
+        explorer.entries = merge_remote_children(&old, new_children, 0);
+    } else if let Some(parent_idx) = explorer.entries.iter()
+        .position(|entry| entry.path == listing_path)
+    {
+        let parent_depth = explorer.entries[parent_idx].depth;
+        let child_depth = parent_depth + 1;
+        let mut end = parent_idx + 1;
+        while end < explorer.entries.len() && explorer.entries[end].depth > parent_depth {
+            end += 1;
+        }
+        if explorer.entries[parent_idx].expanded {
+            let old_children = explorer.entries[parent_idx + 1..end].to_vec();
+            let new_children = remote_listing_to_file_entries(
+                listing_path,
+                entries,
+                child_depth,
+                explorer.show_hidden,
+            );
+            let merged = merge_remote_children(&old_children, new_children, child_depth);
+            explorer.entries.splice(parent_idx + 1..end, merged);
+        }
+    }
+    explorer.selected = selected_path
+        .and_then(|path| explorer.entries.iter().position(|entry| entry.path == path))
+        .unwrap_or_else(|| explorer.selected.min(explorer.entries.len().saturating_sub(1)));
+    explorer.tree_scroll = explorer.tree_scroll.min(explorer.entries.len().saturating_sub(1));
 }
 
 fn explorer_entry_vpath(ex: &FileExplorer, path: PathBuf) -> VPath {
@@ -1093,28 +1281,28 @@ fn remove_pane_from_layout(s: &mut State, pane_id: usize) -> bool {
     }
 }
 
-fn notify_lsp_tab_closed(s: &mut State, path: Option<VPath>) {
+fn notify_lsp_tab_closed(s: &mut State, path: Option<VPath>, lang: Lang) {
     let Some(path) = path else { return };
-    let lang = Lang::from_path(path.as_path());
     if let Some(srv) = s.lsp.server_for_lang_host_mut(lang, path.ssh_host()) {
         lsp::notify_did_close(srv, &path);
     }
 }
 
 fn close_editor_tab(s: &mut State, pane_id: usize, tab_idx: usize) -> bool {
-    let closed_path = {
+    let (closed_path, closed_lang) = {
         let Some(pane) = s.panes.get_mut(&pane_id) else { return false };
         if pane.kind != PaneKind::Editor || tab_idx >= pane.tabs.len() {
             return false;
         }
         let closed = pane.tabs.remove(tab_idx);
+        let closed_lang = closed.lang();
         if pane.active >= pane.tabs.len() && !pane.tabs.is_empty() {
             pane.active = pane.tabs.len() - 1;
         }
-        closed.path
+        (closed.path, closed_lang)
     };
 
-    notify_lsp_tab_closed(s, closed_path);
+    notify_lsp_tab_closed(s, closed_path, closed_lang);
 
     if s.panes.get(&pane_id).map_or(false, |p| p.tabs.is_empty()) {
         s.md_panes.remove(&pane_id);
@@ -1684,6 +1872,13 @@ pub enum UserEvent {
     RemoteFileError     { token: u64, path: VPath, msg: String },
     RemoteWriteDone     { path: VPath },
     RemoteDirListing    { path: VPath, entries: Vec<(String, bool)> },
+    RemoteDirListingError { path: VPath, msg: String },
+    RemoteFsOpDone {
+        refresh_dir: VPath,
+        renamed: Option<(VPath, VPath)>,
+        open_path: Option<VPath>,
+    },
+    RemoteFsOpError { path: VPath, msg: String },
     // Collab events
     CollabMessage     { from_site_id: u64, msg: collab::CollabMsg },
     CollabConnected   { session: Box<collab::CollabSession>, doc_text: String, peers: Vec<collab::PeerInfo>, file_list: Vec<String> },
@@ -1757,6 +1952,7 @@ struct State {
     left_panel_visible: bool,
     diag_panel_sel: usize,
     context_menu: Option<ContextMenu>,
+    explorer_clipboard: Option<VPath>,
     lsp_panel:    Option<LspManagerPanel>,
     quick_finder: QuickFinder,
     global_find:  GlobalFind,
@@ -2098,6 +2294,26 @@ impl State {
         }
         self.dedup_cursors();
         self.ensure_visible();
+    }
+
+    fn insert_newline(&mut self) {
+        if self.tab().lang() != Lang::Python {
+            self.insert_str("\n");
+            return;
+        }
+        let insertions: Vec<String> = self.cursor_order_ltr().into_iter().map(|i| {
+            let cursor = &self.tab().cursors[i];
+            let pos = cursor.lo().min(self.tab().text.len_chars());
+            let line_idx = self.tab().text.char_to_line(pos);
+            let line_start = self.tab().text.line_to_char(line_idx);
+            let before: String = self.tab().text.slice(line_start..pos).chars().collect();
+            let indent: String = before.chars()
+                .take_while(|c| matches!(c, ' ' | '\t'))
+                .collect();
+            let extra = if python_line_opens_block(&before) { "    " } else { "" };
+            format!("\n{indent}{extra}")
+        }).collect();
+        self.insert_str_per_cursor(&insertions);
     }
 
     fn backspace(&mut self) {
@@ -2958,14 +3174,14 @@ fn start_lsp_for_remote_project(s: &mut State, root: &VPath, entries: &[(String,
 }
 
 fn notify_lsp_open(s: &mut State, path: &VPath) {
-    let lang = Lang::from_path(path.as_path());
-    if lang == Lang::None { return; }
-    let text = s.panes.values()
+    let tab = s.panes.values()
         .filter(|p| p.kind == PaneKind::Editor)
         .flat_map(|p| p.tabs.iter())
-        .find(|t| t.path.as_ref() == Some(path))
-        .map(|t| t.text.to_string());
-    let Some(text) = text else { return; };
+        .find(|t| t.path.as_ref() == Some(path));
+    let Some(tab) = tab else { return };
+    let lang = tab.lang();
+    if lang == Lang::None { return; }
+    let text = tab.text.to_string();
     let ssh_host = path.ssh_host().cloned();
     let lsp_root = lsp_root_for_path(s, path);
     ensure_lsp_server_running(s, lang, ssh_host.clone(), lsp_root);
@@ -2987,10 +3203,17 @@ fn notify_lsp_change(s: &mut State) {
         if pane.tabs.is_empty() { return; }
         let tab = pane.tab();
         let Some(path) = tab.path.clone() else { return };
-        let lang = Lang::from_path(path.as_path());
+        let lang = tab.lang();
         if lang == Lang::None { return; }
         (path, tab.text.to_string(), lang)
     };
+    let server_key = (path.ssh_host().cloned(), lang);
+    if s.lsp.server_for_lang_host(lang, path.ssh_host()).is_none()
+        && !s.lsp_start_errors.contains_key(&server_key)
+    {
+        let root = lsp_root_for_path(s, &path);
+        ensure_lsp_server_running(s, lang, path.ssh_host().cloned(), root);
+    }
     if let Some(srv) = s.lsp.server_for_lang_host_mut(lang, path.ssh_host()) {
         if srv.doc_version.contains_key(&path) {
             lsp::notify_did_change(srv, &path, &text);
@@ -3143,7 +3366,7 @@ fn strip_jsonc_comments(src: &str) -> String {
 }
 
 fn format_json_document(s: &mut State) {
-    let lang = s.tab().path.as_ref().map(|p| Lang::from_path(p.as_path())).unwrap_or(Lang::None);
+    let lang = s.tab().lang();
     let text = s.tab().text.to_string();
     let src = if lang == Lang::Jsonc { strip_jsonc_comments(&text) } else { text };
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&src) else { return };
@@ -4106,6 +4329,142 @@ fn open_file_dialog() -> Option<PathBuf> {
     { None }
 }
 
+fn prompt_for_name(prompt: &str, default: &str) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let script = r#"
+on run argv
+    set answer to display dialog (item 1 of argv) default answer (item 2 of argv) buttons {"Cancel", "OK"} default button "OK"
+    return text returned of answer
+end run
+"#;
+        let out = std::process::Command::new("osascript")
+            .args(["-e", script, "--", prompt, default])
+            .output().ok()?;
+        if !out.status.success() { return None; }
+        let name = String::from_utf8(out.stdout).ok()?.trim().to_owned();
+        let path = std::path::Path::new(&name);
+        if name.is_empty()
+            || matches!(name.as_str(), "." | "..")
+            || path.file_name().and_then(|value| value.to_str()) != Some(name.as_str())
+        {
+            return None;
+        }
+        Some(name)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (prompt, default);
+        None
+    }
+}
+
+fn unique_copy_destination(parent: &std::path::Path, source: &std::path::Path) -> PathBuf {
+    let file_name = source.file_name().and_then(|name| name.to_str()).unwrap_or("copy");
+    let stem = source.file_stem().and_then(|name| name.to_str()).unwrap_or(file_name);
+    let extension = source.extension().and_then(|ext| ext.to_str());
+    for index in 1usize.. {
+        let suffix = if index == 1 { " copy".to_owned() } else { format!(" copy {index}") };
+        let candidate_name = match extension {
+            Some(ext) if source.is_file() => format!("{stem}{suffix}.{ext}"),
+            _ => format!("{file_name}{suffix}"),
+        };
+        let candidate = parent.join(candidate_name);
+        if !candidate.exists() { return candidate; }
+    }
+    unreachable!()
+}
+
+fn paste_destination(parent: &std::path::Path, source: &std::path::Path) -> PathBuf {
+    let candidate = parent.join(source.file_name().unwrap_or_else(|| std::ffi::OsStr::new("copy")));
+    if candidate.exists() {
+        unique_copy_destination(parent, source)
+    } else {
+        candidate
+    }
+}
+
+fn copy_path_recursively(source: &std::path::Path, destination: &std::path::Path) -> std::io::Result<()> {
+    let metadata = std::fs::symlink_metadata(source)?;
+    if metadata.file_type().is_symlink() {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(std::fs::read_link(source)?, destination)?;
+            return Ok(());
+        }
+        #[cfg(not(unix))]
+        return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "symlink copy is unsupported"));
+    }
+    if metadata.is_file() {
+        std::fs::copy(source, destination)?;
+        return Ok(());
+    }
+    if destination.starts_with(source) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "cannot copy a folder inside itself",
+        ));
+    }
+    std::fs::create_dir(destination)?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        copy_path_recursively(&entry.path(), &destination.join(entry.file_name()))?;
+    }
+    Ok(())
+}
+
+fn refresh_explorer_now(s: &mut State) {
+    if let Some(explorer) = s.explorer.as_mut() {
+        explorer.last_refresh = Instant::now();
+        explorer.refresh_local();
+    }
+}
+
+fn update_paths_after_rename(s: &mut State, old_path: &VPath, new_path: &VPath) {
+    let affected_documents: HashMap<VPath, Lang> = s.panes.values()
+        .flat_map(|pane| pane.tabs.iter())
+        .filter_map(|tab| {
+            let path = tab.path.as_ref()?;
+            path.strip_prefix(old_path)?;
+            Some((path.clone(), tab.lang()))
+        })
+        .collect();
+    for (path, lang) in &affected_documents {
+        notify_lsp_tab_closed(s, Some(path.clone()), *lang);
+    }
+
+    let remap = |path: &VPath| -> Option<VPath> {
+        let suffix = path.strip_prefix(old_path)?;
+        Some(new_path.join(suffix))
+    };
+    for pane in s.panes.values_mut() {
+        for tab in &mut pane.tabs {
+            if let Some(new_tab_path) = tab.path.as_ref().and_then(&remap) {
+                tab.path = Some(new_tab_path);
+            }
+        }
+    }
+    let old_diagnostics = std::mem::take(&mut s.diagnostics);
+    for (path, diagnostics) in old_diagnostics {
+        s.diagnostics.insert(remap(&path).unwrap_or(path), diagnostics);
+    }
+    for (path, _) in &mut s.cursor_back {
+        if let Some(new_cursor_path) = remap(path) { *path = new_cursor_path; }
+    }
+    for (path, _) in &mut s.cursor_fwd {
+        if let Some(new_cursor_path) = remap(path) { *path = new_cursor_path; }
+    }
+    if let Some(new_source) = s.explorer_clipboard.as_ref().and_then(&remap) {
+        s.explorer_clipboard = Some(new_source);
+    }
+    let renamed_documents: Vec<VPath> = affected_documents.keys()
+        .filter_map(&remap)
+        .collect();
+    for path in renamed_documents {
+        notify_lsp_open(s, &path);
+    }
+}
+
 // ── Find helpers ──────────────────────────────────────────────────────────────
 
 fn find_matches(text: &Rope, query: &str, case_sensitive: bool, whole_word: bool) -> Vec<(usize, usize)> {
@@ -4306,6 +4665,12 @@ fn qf_next_char(s: &str, cursor: usize) -> usize {
     let mut i = cursor + 1;
     while i < s.len() && !s.is_char_boundary(i) { i += 1; }
     i
+}
+
+fn clamp_byte_index(s: &str, index: usize) -> usize {
+    let mut index = index.min(s.len());
+    while !s.is_char_boundary(index) { index -= 1; }
+    index
 }
 
 fn qf_prev_word(s: &str, cursor: usize) -> usize {
@@ -5004,7 +5369,7 @@ fn execute_command(s: &mut State, action: CommandAction) {
                         }
                     }
                 }
-                let lang = s.tab().path.as_ref().map(|p| Lang::from_path(p.as_path())).unwrap_or(Lang::None);
+                let lang = s.tab().lang();
                 let path = s.tab().path.clone();
                 // Format-on-save only runs for local files.
                 let path_str = path.as_ref()
@@ -5114,10 +5479,18 @@ fn execute_command(s: &mut State, action: CommandAction) {
             s.pane_tree = insert_pane(old, active, new_id, DropZone::Top);
             s.active_pane = new_id;
         }
-        CommandAction::ToggleFind     => { s.find_mut().open = !s.find().open; }
+        CommandAction::ToggleFind     => {
+            let open = !s.find().open;
+            let f = s.find_mut();
+            f.open = open;
+            f.input_focused = open;
+            f.cursor_query = clamp_byte_index(&f.query, f.cursor_query);
+            f.sel_anchor_q = None;
+        }
         CommandAction::ToggleReplace  => {
             let open = s.find().open;
             s.find_mut().open = true;
+            s.find_mut().input_focused = true;
             s.find_mut().replace_open = !open || !s.find().replace_open;
         }
         CommandAction::ToggleExplorer => {
@@ -5148,7 +5521,7 @@ fn execute_command(s: &mut State, action: CommandAction) {
             s.settings.save();
         }
         CommandAction::GotoDefinition => {
-            let lang  = s.tab().path.as_ref().map(|p| Lang::from_path(p.as_path())).unwrap_or(Lang::None);
+            let lang  = s.tab().lang();
             let path  = s.tab().path.clone();
             let pos   = s.tab().primary().head;
             let text  = s.tab().text.clone();
@@ -5163,7 +5536,7 @@ fn execute_command(s: &mut State, action: CommandAction) {
             }
         }
         CommandAction::FindReferences => {
-            let lang  = s.tab().path.as_ref().map(|p| Lang::from_path(p.as_path())).unwrap_or(Lang::None);
+            let lang  = s.tab().lang();
             let path  = s.tab().path.clone();
             let pos   = s.tab().primary().head;
             let text  = s.tab().text.clone();
@@ -5218,7 +5591,7 @@ fn execute_command(s: &mut State, action: CommandAction) {
         CommandAction::CursorBack    => cursor_go_back(s),
         CommandAction::CursorForward => cursor_go_fwd(s),
         CommandAction::FormatDocument => {
-            let lang = s.tab().path.as_ref().map(|p| Lang::from_path(p.as_path())).unwrap_or(Lang::None);
+            let lang = s.tab().lang();
             match lang {
                 Lang::Json | Lang::Jsonc => format_json_document(s),
                 Lang::None => {}
@@ -5233,7 +5606,7 @@ fn execute_command(s: &mut State, action: CommandAction) {
             }
         }
         CommandAction::OrganizeImports => {
-            let lang = s.tab().path.as_ref().map(|p| Lang::from_path(p.as_path())).unwrap_or(Lang::None);
+            let lang = s.tab().lang();
             let path = s.tab().path.clone();
             if lang != Lang::None {
                 if let Some(ref p) = path {
@@ -5877,6 +6250,43 @@ impl ApplicationHandler<UserEvent> for App {
                     self.dirty.store(true, Ordering::Release);
                     s.needs_redraw = true;
                 }
+                // Poll only the root and expanded folders. Remote requests are
+                // deduplicated so a slow SSH round-trip cannot accumulate threads.
+                if s.left_panel_visible && s.left_view == LeftView::FileTree {
+                    let mut remote_refreshes = Vec::new();
+                    let refreshed = s.explorer.as_mut().map_or(false, |explorer| {
+                        let interval = if explorer.root.is_remote() {
+                            Duration::from_secs(1)
+                        } else {
+                            Duration::from_millis(500)
+                        };
+                        if now.duration_since(explorer.last_refresh) < interval { return false; }
+                        explorer.last_refresh = now;
+                        match explorer.root.clone() {
+                            VPath::Local(_) => explorer.refresh_local(),
+                            VPath::Remote { host, path } => {
+                                let paths = std::iter::once(path)
+                                    .chain(explorer.entries.iter()
+                                        .filter(|entry| entry.is_dir && entry.expanded)
+                                        .map(|entry| entry.path.clone()))
+                                    .collect::<Vec<_>>();
+                                for path in paths {
+                                    if explorer.pending_remote_listings.insert(path.clone()) {
+                                        remote_refreshes.push((host.clone(), path));
+                                    }
+                                }
+                                false
+                            }
+                        }
+                    });
+                    for (host, path) in remote_refreshes {
+                        ssh::ssh_list_dir(host, path, s.proxy.clone());
+                    }
+                    if refreshed {
+                        self.dirty.store(true, Ordering::Release);
+                        s.needs_redraw = true;
+                    }
+                }
                 // Live search debounce
                 if let Some(fire_at) = s.global_find.search_fire_at {
                     if now >= fire_at {
@@ -5998,6 +6408,7 @@ impl ApplicationHandler<UserEvent> for App {
             left_panel_visible: true,
             diag_panel_sel: 0,
             context_menu: None,
+            explorer_clipboard: None,
             lsp_panel:    None,
             quick_finder: QuickFinder {
                 open: false, query: String::new(), cursor: 0, sel_anchor: None,
@@ -6363,42 +6774,56 @@ impl ApplicationHandler<UserEvent> for App {
                     && mx >= act_w_r && mx < act_w_r + s.explorer_w()
                 {
                     let row = my / lh;
-                    if row >= 2 {
-                        let scroll_off = s.explorer.as_ref().map_or(0, |ex| ex.tree_scroll);
-                        let idx = (row - 2) as usize + scroll_off;
-                        let entry = s.explorer.as_ref().and_then(|ex| {
-                            if ex.tree_search.is_empty() && idx < ex.entries.len() {
-                                Some((explorer_entry_vpath(ex, ex.entries[idx].path.clone()), ex.entries[idx].is_dir))
-                            } else {
-                                None
-                            }
-                        });
-                        if let Some((entry, is_dir)) = entry {
-                            let mut items = vec![ContextMenuItem {
-                                label: "Open Terminal Here",
-                                shortcut: "",
-                                action: CtxAction::OpenTerminalHere,
-                                enabled: true,
-                            }];
-                            if is_dir {
-                                items.insert(0, ContextMenuItem {
-                                    label: "Open Folder Here",
-                                    shortcut: "",
-                                    action: CtxAction::ExplorerOpenAsRoot,
-                                    enabled: true,
-                                });
-                            }
-                            s.context_menu = Some(ContextMenu {
-                                x: mx, y: my, hovered: 0,
-                                tab_source: None, git_entry: None,
-                                explorer_entry: Some(entry),
-                                explorer_entry_is_dir: is_dir,
-                                diag_message: None,
-                                items,
-                            });
-                            { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
-                            return;
+                    let scroll_off = s.explorer.as_ref().map_or(0, |ex| ex.tree_scroll);
+                    let idx = row.saturating_sub(2) as usize + scroll_off;
+                    let entry = s.explorer.as_ref().map(|ex| {
+                        if row >= 2 && ex.tree_search.is_empty() && idx < ex.entries.len() {
+                            (explorer_entry_vpath(ex, ex.entries[idx].path.clone()), ex.entries[idx].is_dir, false)
+                        } else {
+                            (ex.root.clone(), true, true)
                         }
+                    });
+                    if let Some((entry, is_dir, is_root)) = entry {
+                        let can_paste = match (&entry, s.explorer_clipboard.as_ref()) {
+                            (VPath::Local(_), Some(VPath::Local(_))) => true,
+                            (
+                                VPath::Remote { host: destination_host, .. },
+                                Some(VPath::Remote { host: source_host, .. }),
+                            ) => destination_host == source_host,
+                            _ => false,
+                        };
+                        let mut items = vec![];
+                        if is_dir {
+                            items.push(ContextMenuItem { label: "New File", shortcut: "", action: CtxAction::ExplorerNewFile, enabled: true });
+                            items.push(ContextMenuItem { label: "New Folder", shortcut: "", action: CtxAction::ExplorerNewFolder, enabled: true });
+                            items.push(ContextMenuItem { label: "", shortcut: "", action: CtxAction::Separator, enabled: true });
+                        }
+                        if !is_root {
+                            items.push(ContextMenuItem { label: "Copy", shortcut: "", action: CtxAction::ExplorerCopy, enabled: true });
+                            items.push(ContextMenuItem { label: "Duplicate", shortcut: "", action: CtxAction::ExplorerDuplicate, enabled: true });
+                            items.push(ContextMenuItem { label: "Rename", shortcut: "", action: CtxAction::ExplorerRename, enabled: true });
+                        }
+                        items.push(ContextMenuItem {
+                            label: "Paste",
+                            shortcut: "",
+                            action: CtxAction::ExplorerPaste,
+                            enabled: can_paste,
+                        });
+                        items.push(ContextMenuItem { label: "", shortcut: "", action: CtxAction::Separator, enabled: true });
+                        if is_dir && !is_root {
+                            items.push(ContextMenuItem { label: "Open Folder Here", shortcut: "", action: CtxAction::ExplorerOpenAsRoot, enabled: true });
+                        }
+                        items.push(ContextMenuItem { label: "Open Terminal Here", shortcut: "", action: CtxAction::OpenTerminalHere, enabled: true });
+                        s.context_menu = Some(ContextMenu {
+                            x: mx, y: my, hovered: 0,
+                            tab_source: None, git_entry: None,
+                            explorer_entry: Some(entry),
+                            explorer_entry_is_dir: is_dir,
+                            diag_message: None,
+                            items,
+                        });
+                        { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                        return;
                     }
                 }
 
@@ -6497,7 +6922,7 @@ impl ApplicationHandler<UserEvent> for App {
                     if let Some(pid) = pane_at_pos(&s.pane_tree, mx, my, area) {
                         if s.panes.get(&pid).map_or(false, |p| p.kind == PaneKind::Editor) {
                             s.active_pane = pid;
-                            let lang = s.tab().path.as_ref().map(|p| Lang::from_path(p.as_path())).unwrap_or(Lang::None);
+                            let lang = s.tab().lang();
                             let active_path = s.tab().path.clone();
                             let lsp_avail = lang != Lang::None
                                 && active_path.as_ref().and_then(|p| {
@@ -6673,6 +7098,159 @@ impl ApplicationHandler<UserEvent> for App {
                                 CtxAction::Paste => { execute_command(s, CommandAction::Paste); notify_collab_change(s); }
                                 CtxAction::CopyDiagnostic => {
                                     if let Some(msg) = diag_message { clipboard_set(&msg); }
+                                }
+                                CtxAction::ExplorerNewFile => {
+                                    if let Some(target) = explorer_entry {
+                                        let parent = if explorer_entry_is_dir {
+                                            target
+                                        } else {
+                                            target.parent().unwrap_or(target)
+                                        };
+                                        if let Some(name) = prompt_for_name("New file name", "") {
+                                            let path = parent.join(name);
+                                            match path.clone() {
+                                                VPath::Local(local_path) => {
+                                                    match std::fs::OpenOptions::new().write(true).create_new(true).open(&local_path) {
+                                                        Ok(_) => {
+                                                            refresh_explorer_now(s);
+                                                            open_or_reuse_tab(s, path);
+                                                        }
+                                                        Err(err) => s.status_msg = Some(format!("Create file: {err}")),
+                                                    }
+                                                }
+                                                VPath::Remote { host, path: remote_path } => {
+                                                    ssh::ssh_create_file(
+                                                        host,
+                                                        remote_path,
+                                                        parent.as_path().to_path_buf(),
+                                                        s.proxy.clone(),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                CtxAction::ExplorerNewFolder => {
+                                    if let Some(target) = explorer_entry {
+                                        let parent = if explorer_entry_is_dir {
+                                            target
+                                        } else {
+                                            target.parent().unwrap_or(target)
+                                        };
+                                        if let Some(name) = prompt_for_name("New folder name", "") {
+                                            let path = parent.join(name);
+                                            match path {
+                                                VPath::Local(path) => {
+                                                    match std::fs::create_dir(path) {
+                                                        Ok(_) => refresh_explorer_now(s),
+                                                        Err(err) => s.status_msg = Some(format!("Create folder: {err}")),
+                                                    }
+                                                }
+                                                VPath::Remote { host, path } => {
+                                                    ssh::ssh_create_dir(
+                                                        host,
+                                                        path,
+                                                        parent.as_path().to_path_buf(),
+                                                        s.proxy.clone(),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                CtxAction::ExplorerCopy => {
+                                    s.explorer_clipboard = explorer_entry;
+                                }
+                                CtxAction::ExplorerDuplicate => {
+                                    if let Some(source) = explorer_entry {
+                                        if let Some(parent) = source.parent() {
+                                            match (source, parent) {
+                                                (VPath::Local(source), VPath::Local(parent)) => {
+                                                    let destination = unique_copy_destination(&parent, &source);
+                                                    match copy_path_recursively(&source, &destination) {
+                                                        Ok(_) => refresh_explorer_now(s),
+                                                        Err(err) => s.status_msg = Some(format!("Duplicate: {err}")),
+                                                    }
+                                                }
+                                                (
+                                                    VPath::Remote { host, path: source },
+                                                    VPath::Remote { path: parent, .. },
+                                                ) => {
+                                                    ssh::ssh_copy_path(host, source, parent, s.proxy.clone());
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                    }
+                                }
+                                CtxAction::ExplorerPaste => {
+                                    if let (Some(source), Some(target)) = (
+                                        s.explorer_clipboard.clone(),
+                                        explorer_entry,
+                                    ) {
+                                        let parent = if explorer_entry_is_dir {
+                                            target
+                                        } else {
+                                            target.parent().unwrap_or(target)
+                                        };
+                                        match (source, parent) {
+                                            (VPath::Local(source), VPath::Local(parent)) => {
+                                                let destination = paste_destination(&parent, &source);
+                                                match copy_path_recursively(&source, &destination) {
+                                                    Ok(_) => refresh_explorer_now(s),
+                                                    Err(err) => s.status_msg = Some(format!("Paste: {err}")),
+                                                }
+                                            }
+                                            (
+                                                VPath::Remote { host: source_host, path: source },
+                                                VPath::Remote { host: destination_host, path: parent },
+                                            ) if source_host == destination_host => {
+                                                ssh::ssh_copy_path(source_host, source, parent, s.proxy.clone());
+                                            }
+                                            _ => {
+                                                s.status_msg = Some(
+                                                    "Paste: source and destination must use the same filesystem".to_owned(),
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                CtxAction::ExplorerRename => {
+                                    if let Some(old_path) = explorer_entry {
+                                        let old_name = old_path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+                                        if let (Some(parent), Some(name)) = (
+                                            old_path.parent(),
+                                            prompt_for_name("Rename to", old_name),
+                                        ) {
+                                            let new_path = parent.join(name);
+                                            match (&old_path, &new_path) {
+                                                (VPath::Local(old), VPath::Local(new)) => {
+                                                    if new.exists() {
+                                                        s.status_msg = Some(format!("Rename: {} already exists", new.display()));
+                                                    } else {
+                                                        match std::fs::rename(old, new) {
+                                                            Ok(_) => {
+                                                                update_paths_after_rename(s, &old_path, &new_path);
+                                                                refresh_explorer_now(s);
+                                                            }
+                                                            Err(err) => s.status_msg = Some(format!("Rename: {err}")),
+                                                        }
+                                                    }
+                                                }
+                                                (
+                                                    VPath::Remote { host, path: old },
+                                                    VPath::Remote { path: new, .. },
+                                                ) => ssh::ssh_rename_path(
+                                                    host.clone(),
+                                                    old.clone(),
+                                                    new.clone(),
+                                                    parent.as_path().to_path_buf(),
+                                                    s.proxy.clone(),
+                                                ),
+                                                _ => {}
+                                            }
+                                        }
+                                    }
                                 }
                                 CtxAction::ExplorerOpenAsRoot => {
                                     if let Some(path) = explorer_entry {
@@ -6897,6 +7475,9 @@ impl ApplicationHandler<UserEvent> for App {
                                     } else { None }
                                 });
                                 if let Some((host, path)) = remote_dir_to_list {
+                                    if let Some(explorer) = s.explorer.as_mut() {
+                                        explorer.pending_remote_listings.insert(path.clone());
+                                    }
                                     ssh::ssh_list_dir(host, path, s.proxy.clone());
                                 }
                                 if let Some(path) = action { open_or_reuse_tab(s, path); }
@@ -7091,6 +7672,9 @@ impl ApplicationHandler<UserEvent> for App {
                 // Which pane was clicked?
                 let area = s.pane_area();
                 let Some(clicked_pane_id) = pane_at_pos(&s.pane_tree, mx, my, area) else { return };
+                if let Some(pane) = s.panes.get_mut(&clicked_pane_id) {
+                    pane.find.input_focused = false;
+                }
                 // Clicking any content pane removes left-panel focus
                 if let Some(ex) = s.explorer.as_mut() { ex.tree_search_focused = false; }
                 s.global_find.focus = GlobalFindFocus::Results;
@@ -7563,6 +8147,7 @@ impl ApplicationHandler<UserEvent> for App {
                     my >= fy && my < fy + fh
                 };
                 if in_find {
+                    s.find_mut().input_focused = true;
                     let find_y  = pane_rect.y + pane_rect.h - fh;
                     let row_h   = s.glyphs.lh + 4;
                     let cw      = s.glyphs.cw;
@@ -7582,7 +8167,9 @@ impl ApplicationHandler<UserEvent> for App {
                             let qclip = aa_x - cw;
                             let q_vis = ((qclip - qx) / cw).max(0) as usize;
                             let f = s.find_mut();
+                            f.input_focused = true;
                             f.focus = FindFocus::Query;
+                            f.cursor_query = clamp_byte_index(&f.query, f.cursor_query);
                             let cur_chars = f.query[..f.cursor_query].chars().count();
                             let new_byte = field_click_to_byte(&f.query, mx, qx, cw, cur_chars, q_vis);
                             f.cursor_query = new_byte;
@@ -7603,7 +8190,9 @@ impl ApplicationHandler<UserEvent> for App {
                             let rclip = btn_x - cw;
                             let r_vis = ((rclip - rx) / cw).max(0) as usize;
                             let f = s.find_mut();
+                            f.input_focused = true;
                             f.focus = FindFocus::Replace;
+                            f.cursor_replace = clamp_byte_index(&f.replace, f.cursor_replace);
                             let cur_chars = f.replace[..f.cursor_replace].chars().count();
                             let new_byte = field_click_to_byte(&f.replace, mx, rx, cw, cur_chars, r_vis);
                             f.cursor_replace = new_byte;
@@ -7616,12 +8205,18 @@ impl ApplicationHandler<UserEvent> for App {
 
                 // Editor area click
                 let pos = s.xy_to_char(mx, my);
+                let now  = Instant::now();
+                let fast = now.duration_since(s.last_click_time) < Duration::from_millis(500);
+                let same = pos == s.last_click_char;
+                s.click_count = if fast && same { s.click_count + 1 } else { 1 };
+                s.last_click_time = now;
+                s.last_click_char = pos;
                 if cmd {
                     // Cmd+Click: try LSP goto-definition first, fallback to path token open
                     let click_line = s.tab().text.char_to_line(pos.min(s.tab().text.len_chars().saturating_sub(1)));
                     let line_start = s.tab().text.line_to_char(click_line);
                     let click_col  = pos.saturating_sub(line_start);
-                    let tab_lang   = s.tab().path.as_ref().map(|p| Lang::from_path(p.as_path())).unwrap_or(Lang::None);
+                    let tab_lang   = s.tab().lang();
                     let tab_path   = s.tab().path.clone();
                     let mut lsp_sent = false;
                     if tab_lang != Lang::None {
@@ -7646,16 +8241,27 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     }
                 } else if alt {
-                    s.tab_mut().cursors.push(Cursor::new(pos));
-                    s.dedup_cursors();
-                    s.mouse_down = false;
+                    if s.click_count == 2 {
+                        let (lo, hi) = word_bounds_at(s.tab(), pos);
+                        if lo < hi {
+                            s.tab_mut().cursors.retain(|cursor| {
+                                cursor.hi() <= lo || cursor.lo() >= hi
+                            });
+                            s.tab_mut().cursors.push(Cursor { head: hi, tail: lo });
+                        }
+                        s.mouse_down = false;
+                    } else {
+                        s.tab_mut().cursors.retain(|cursor| {
+                            cursor.has_sel() || cursor.head != pos
+                        });
+                        s.tab_mut().cursors.push(Cursor::new(pos));
+                        s.mouse_down = shift;
+                    }
+                } else if shift {
+                    let anchor = s.tab().primary().tail;
+                    s.tab_mut().cursors = vec![Cursor { head: pos, tail: anchor }];
+                    s.mouse_down = true;
                 } else {
-                    let now  = Instant::now();
-                    let fast = now.duration_since(s.last_click_time) < Duration::from_millis(500);
-                    let same = pos == s.last_click_char;
-                    s.click_count = if fast && same { s.click_count + 1 } else { 1 };
-                    s.last_click_time = now;
-                    s.last_click_char = pos;
                     match s.click_count {
                         2 => {
                             let (lo, hi) = word_bounds_at(s.tab(), pos);
@@ -8598,14 +9204,24 @@ impl ApplicationHandler<UserEvent> for App {
                         return;
                     }
                     s.term_sel = None;
-                    let bytes = terminal::encode_key(&event.logical_key, s.mods, event.text.as_deref());
+                    let target = {
+                        let pane = &s.panes[&s.active_pane];
+                        pane.term_ids.get(pane.active).and_then(|tid| {
+                            s.term_panes.get(tid)
+                                .map(|term| (term.pty_fd, term.grid.application_cursor))
+                        })
+                    };
+                    let application_cursor = target.map_or(false, |(_, mode)| mode);
+                    let bytes = terminal::encode_key(
+                        &event.logical_key,
+                        s.mods,
+                        event.text.as_deref(),
+                        application_cursor,
+                    );
                     if let Some(bytes) = bytes {
-                        let p = &s.panes[&s.active_pane];
-                        if let Some(&tid) = p.term_ids.get(p.active) {
-                            if let Some(tp) = s.term_panes.get(&tid) {
-                                // SAFETY: pty_fd is valid (>= 0 checked); bytes slice lives for this synchronous call.
-                                if tp.pty_fd >= 0 { let _ = unsafe { libc::write(tp.pty_fd, bytes.as_ptr().cast(), bytes.len()) }; }
-                            }
+                        if let Some((pty_fd, _)) = target {
+                            // SAFETY: pty_fd is valid (>= 0 checked); bytes slice lives for this synchronous call.
+                            if pty_fd >= 0 { let _ = unsafe { libc::write(pty_fd, bytes.as_ptr().cast(), bytes.len()) }; }
                         }
                     }
                     return;
@@ -8627,11 +9243,16 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
 
-                // Find bar: intercept editing keys (including cmd variants) when open
-                let find_handled = if s.find().open {
+                // A visible find bar only intercepts keys while its input owns focus.
+                let find_handled = if s.find().open && s.find().input_focused {
                     let key = &event.logical_key;
                     match key {
-                        Key::Named(NamedKey::Escape) => { s.find_mut().open = false; true }
+                        Key::Named(NamedKey::Escape) => {
+                            let f = s.find_mut();
+                            f.open = false;
+                            f.input_focused = false;
+                            true
+                        }
                         Key::Named(NamedKey::Tab) => {
                             if s.find().replace_open {
                                 let nf = if s.find().focus == FindFocus::Query { FindFocus::Replace } else { FindFocus::Query };
@@ -8861,18 +9482,26 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         // ── Find / Replace ────────────────────────────────────────────────────
                         else if cmd && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "f") {
-                            s.find_mut().open         = true;
-                            s.find_mut().replace_open = false;
-                            s.find_mut().focus        = FindFocus::Query;
-                            s.find_mut().query.clear();
-                            if let Some(t) = s.tab().sel_text() { s.find_mut().query = t; }
+                            let query = s.tab().sel_text().unwrap_or_default();
+                            let f = s.find_mut();
+                            f.open = true;
+                            f.input_focused = true;
+                            f.replace_open = false;
+                            f.focus = FindFocus::Query;
+                            f.query = query;
+                            f.cursor_query = f.query.len();
+                            f.sel_anchor_q = None;
                             true
                         } else if cmd && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "h") {
-                            s.find_mut().open         = true;
-                            s.find_mut().replace_open = true;
-                            s.find_mut().focus        = FindFocus::Query;
-                            s.find_mut().query.clear();
-                            if let Some(t) = s.tab().sel_text() { s.find_mut().query = t; }
+                            let query = s.tab().sel_text().unwrap_or_default();
+                            let f = s.find_mut();
+                            f.open = true;
+                            f.input_focused = true;
+                            f.replace_open = true;
+                            f.focus = FindFocus::Query;
+                            f.query = query;
+                            f.cursor_query = f.query.len();
+                            f.sel_anchor_q = None;
                             true
                         } else if cmd && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "g") {
                             if !s.find().query.is_empty() { find_step(s, shift); }
@@ -8932,7 +9561,9 @@ impl ApplicationHandler<UserEvent> for App {
                                 s.tab_mut().cursors = vec![Cursor::new(head)];
                                 true
                             } else if s.find().open {
-                                s.find_mut().open = false;
+                                let f = s.find_mut();
+                                f.open = false;
+                                f.input_focused = false;
                                 true
                             } else { false }
                         } else if alt && shift && event.physical_key == PhysicalKey::Code(KeyCode::KeyF) {
@@ -8998,7 +9629,7 @@ impl ApplicationHandler<UserEvent> for App {
                                     else if alt||ctrl { s.delete_word_fwd(); }
                                     else              { s.delete_fwd(); }
                                 }
-                                Key::Named(NamedKey::Enter)    => s.insert_str("\n"),
+                                Key::Named(NamedKey::Enter)    => s.insert_newline(),
                                 Key::Named(NamedKey::Tab)      => s.insert_str("    "),
                                 Key::Named(NamedKey::PageUp)   => s.scroll_by(-10),
                                 Key::Named(NamedKey::PageDown) => s.scroll_by(10),
@@ -9307,12 +9938,19 @@ impl ApplicationHandler<UserEvent> for App {
                     begin_remote_tab_read(s, pid, tidx, vpath);
                 }
                 // Trigger dir listing for remote explorer root on this host.
-                if let Some(ex) = &s.explorer {
+                let remote_root_to_list = s.explorer.as_ref().and_then(|ex| {
                     if ex.root.ssh_host() == Some(&host) {
-                        if let VPath::Remote { host: h, path: rpath } = ex.root.clone() {
-                            ssh::ssh_list_dir(h, rpath, s.proxy.clone());
+                        if let VPath::Remote { host, path } = ex.root.clone() {
+                            return Some((host, path));
                         }
                     }
+                    None
+                });
+                if let Some((remote_host, remote_path)) = remote_root_to_list {
+                    if let Some(explorer) = s.explorer.as_mut() {
+                        explorer.pending_remote_listings.insert(remote_path.clone());
+                    }
+                    ssh::ssh_list_dir(remote_host, remote_path, s.proxy.clone());
                 }
                 let settings_open = s.panes.values().any(|p| {
                     p.kind == PaneKind::Editor && p.tabs.iter().any(|t| t.kind == TabKind::Settings)
@@ -9400,32 +10038,55 @@ impl ApplicationHandler<UserEvent> for App {
                     start_lsp_for_remote_project(s, &path, &entries);
                 }
                 if let Some(ex) = s.explorer.as_mut() {
-                    if ex.root == path {
-                        let root_path = path.as_path().to_path_buf();
-                        ex.entries = remote_listing_to_file_entries(&root_path, entries, 0, ex.show_hidden);
-                        ex.selected = ex.selected.min(ex.entries.len().saturating_sub(1));
-                    } else if path.ssh_host() == ex.root.ssh_host() {
-                        let listing_path = path.as_path().to_path_buf();
-                        if let Some(idx) = ex.entries.iter().position(|e| e.path == listing_path) {
-                            let depth = ex.entries[idx].depth;
-                            let mut end = idx + 1;
-                            while end < ex.entries.len() && ex.entries[end].depth > depth { end += 1; }
-                            ex.entries.drain(idx + 1..end);
-                            if ex.entries[idx].expanded {
-                                let children = remote_listing_to_file_entries(
-                                    &listing_path,
-                                    entries,
-                                    depth + 1,
-                                    ex.show_hidden,
-                                );
-                                for (i, child) in children.into_iter().enumerate() {
-                                    ex.entries.insert(idx + 1 + i, child);
-                                }
-                            }
-                            ex.selected = ex.selected.min(ex.entries.len().saturating_sub(1));
-                        }
+                    ex.pending_remote_listings.remove(path.as_path());
+                    if path.ssh_host() == ex.root.ssh_host() {
+                        apply_remote_dir_listing(ex, path.as_path(), entries);
                     }
                 }
+                s.needs_redraw = true;
+                self.dirty.store(true, Ordering::Release);
+            }
+            UserEvent::RemoteDirListingError { path, msg } => {
+                if let Some(explorer) = s.explorer.as_mut() {
+                    explorer.pending_remote_listings.remove(path.as_path());
+                }
+                s.status_msg = Some(format!(
+                    "Remote listing error ({}): {msg}",
+                    path.display_short(),
+                ));
+                s.needs_redraw = true;
+                self.dirty.store(true, Ordering::Release);
+            }
+            UserEvent::RemoteFsOpDone { refresh_dir, renamed, open_path } => {
+                if let Some((old_path, new_path)) = renamed {
+                    update_paths_after_rename(s, &old_path, &new_path);
+                }
+                if let Some(path) = open_path {
+                    open_or_reuse_tab(s, path);
+                }
+
+                let refresh_request = match refresh_dir.clone() {
+                    VPath::Remote { host, path } => s.explorer.as_mut().and_then(|explorer| {
+                        if explorer.root.ssh_host() != Some(&host) {
+                            return None;
+                        }
+                        explorer.pending_remote_listings.remove(&path);
+                        explorer.pending_remote_listings.insert(path.clone());
+                        Some((host, path))
+                    }),
+                    VPath::Local(_) => None,
+                };
+                if let Some((host, path)) = refresh_request {
+                    ssh::ssh_list_dir(host, path, s.proxy.clone());
+                }
+                s.needs_redraw = true;
+                self.dirty.store(true, Ordering::Release);
+            }
+            UserEvent::RemoteFsOpError { path, msg } => {
+                s.status_msg = Some(format!(
+                    "Remote file operation error ({}): {msg}",
+                    path.display_short(),
+                ));
                 s.needs_redraw = true;
                 self.dirty.store(true, Ordering::Release);
             }
@@ -9684,6 +10345,7 @@ struct PaneSnap {
     match_ranges:   Vec<(usize, usize)>,
     find_open:      bool,
     find_repl_open: bool,
+    find_input_focused: bool,
     find_focus:     FindFocus,
     case_sensitive: bool,
     whole_word:     bool,
@@ -9861,7 +10523,7 @@ fn render(s: &mut State) {
         let active = pane.active;
         let Some(tab) = pane.tabs.get_mut(active) else { continue };
         if tab.kind == TabKind::Settings || tab.kind == TabKind::GitDiff { continue; }
-        let lang = tab.path.as_ref().map(|p| Lang::from_path(p.as_path())).unwrap_or(Lang::None);
+        let lang = tab.lang();
         let fh  = if pane.find.open { lh + 4 + if pane.find.replace_open { lh + 4 } else { 0 } } else { 0 };
         let vis = ((rect.h - tab_h - fh).max(0) / lh).max(1) as usize;
         let scroll = tab.scroll;
@@ -9948,7 +10610,7 @@ fn render(s: &mut State) {
                 tab_info, active_tab: pane.active,
                 scroll: tab_scroll, hscroll: 0, find_h: 0, editor_h: 0,
                 cursors_snap: vec![], match_ranges: vec![],
-                find_open: false, find_repl_open: false,
+                find_open: false, find_repl_open: false, find_input_focused: false,
                 find_focus: FindFocus::Query, case_sensitive: false, whole_word: false,
                 find_query: String::new(), find_repl: String::new(),
                 find_cursor_q: 0, find_cursor_r: 0,
@@ -9970,7 +10632,7 @@ fn render(s: &mut State) {
                 tab_info, active_tab: pane.active,
                 scroll: settings_scroll, hscroll: 0, find_h: 0, editor_h: 0,
                 cursors_snap: vec![], match_ranges: vec![],
-                find_open: false, find_repl_open: false,
+                find_open: false, find_repl_open: false, find_input_focused: false,
                 find_focus: FindFocus::Query, case_sensitive: false, whole_word: false,
                 find_query: String::new(), find_repl: String::new(),
                 find_cursor_q: 0, find_cursor_r: 0,
@@ -9989,7 +10651,7 @@ fn render(s: &mut State) {
         let scroll  = tab.scroll;
         let hscroll = tab.hscroll;
         let total   = tab.text.len_lines();
-        let lang    = tab.path.as_ref().map(|p| Lang::from_path(p.as_path())).unwrap_or(Lang::None);
+        let lang    = tab.lang();
 
         let cursors_snap: Vec<(usize, usize, Option<(usize, usize)>)> = tab.cursors.iter().map(|c| {
             let head = c.head.min(tab.text.len_chars());
@@ -10070,13 +10732,14 @@ fn render(s: &mut State) {
             scroll, hscroll, find_h: fh, editor_h: eh,
             cursors_snap, match_ranges,
             find_open: pane.find.open, find_repl_open: pane.find.replace_open,
+            find_input_focused: pane.find.input_focused,
             find_focus: pane.find.focus, case_sensitive: pane.find.case_sensitive,
             whole_word: pane.find.whole_word,
             find_query: fq, find_repl: pane.find.replace.clone(),
-            find_cursor_q: pane.find.query[..pane.find.cursor_query].chars().count(),
-            find_cursor_r: pane.find.replace[..pane.find.cursor_replace].chars().count(),
-            find_sel_q: pane.find.sel_anchor_q.map(|a| pane.find.query[..a].chars().count()),
-            find_sel_r: pane.find.sel_anchor_r.map(|a| pane.find.replace[..a].chars().count()),
+            find_cursor_q: pane.find.query[..clamp_byte_index(&pane.find.query, pane.find.cursor_query)].chars().count(),
+            find_cursor_r: pane.find.replace[..clamp_byte_index(&pane.find.replace, pane.find.cursor_replace)].chars().count(),
+            find_sel_q: pane.find.sel_anchor_q.map(|a| pane.find.query[..clamp_byte_index(&pane.find.query, a)].chars().count()),
+            find_sel_r: pane.find.sel_anchor_r.map(|a| pane.find.replace[..clamp_byte_index(&pane.find.replace, a)].chars().count()),
             lines, total, max_line_len, gutter_w, ln_digits,
             tab_info, active_tab: pane.active,
             path_name: tab.display_name().to_owned(), dirty: tab.dirty,
@@ -11480,7 +12143,7 @@ fn render(s: &mut State) {
                 }
                 let q_disp: String = snap.find_query.chars().skip(q_hscroll).take(q_vis + 1).collect();
                 draw_str(buf, w, h, g, &q_disp, qx, row1_base, FG, qclip);
-                if snap.find_focus == FindFocus::Query {
+                if snap.find_input_focused && snap.find_focus == FindFocus::Query {
                     let cx = qx + (snap.find_cursor_q - q_hscroll) as i32 * cw;
                     if cx < qclip { fill(buf, w, h, cx, find_y + 2, 2, lh, ACCENT); }
                 }
@@ -11517,7 +12180,7 @@ fn render(s: &mut State) {
                     }
                     let r_disp: String = snap.find_repl.chars().skip(r_hscroll).take(r_vis + 1).collect();
                     draw_str(buf, w, h, g, &r_disp, rx, row2_base, FG, rclip);
-                    if snap.find_focus == FindFocus::Replace {
+                    if snap.find_input_focused && snap.find_focus == FindFocus::Replace {
                         let cx = rx + (snap.find_cursor_r - r_hscroll) as i32 * cw;
                         if cx < rclip { fill(buf, w, h, cx, row2_y + 2, 2, lh, ACCENT); }
                     }
@@ -11912,6 +12575,20 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
+    fn test_dir(label: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "local-text-{label}-{}-{nonce}",
+            std::process::id(),
+        ));
+        std::fs::create_dir(&path).unwrap();
+        path
+    }
 
     #[test]
     fn apply_delta_saturates_and_clamps() {
@@ -11938,5 +12615,145 @@ mod tests {
             build_format_command("fmt", "/tmp/x'y.rs"),
             "fmt '/tmp/x'\\''y.rs'",
         );
+    }
+
+    #[test]
+    fn python_is_detected_from_shebang_without_python_extension() {
+        assert_eq!(
+            Lang::from_path_and_first_line(
+                Some(std::path::Path::new("tool")),
+                "#!/usr/bin/env -S python3 -u\n",
+            ),
+            Lang::Python,
+        );
+        assert_eq!(
+            Lang::from_path_and_first_line(
+                Some(std::path::Path::new("tool.txt")),
+                "#!/opt/homebrew/bin/python3.13",
+            ),
+            Lang::Python,
+        );
+        assert_eq!(
+            Lang::from_path_and_first_line(
+                Some(std::path::Path::new("tool.rs")),
+                "#!/usr/bin/python3",
+            ),
+            Lang::Rust,
+        );
+        assert_eq!(
+            Lang::from_path_and_first_line(None, "#!/bin/sh"),
+            Lang::None,
+        );
+    }
+
+    #[test]
+    fn python_block_header_detection_ignores_comments_and_string_hashes() {
+        assert!(python_line_opens_block("    if ready:"));
+        assert!(python_line_opens_block("if ready:  # explanation"));
+        assert!(!python_line_opens_block("value = \"#:\""));
+        assert!(!python_line_opens_block("print('not a block')"));
+    }
+
+    #[test]
+    fn stale_field_cursor_is_clamped_to_a_utf8_boundary() {
+        assert_eq!(clamp_byte_index("", 4), 0);
+        assert_eq!(clamp_byte_index("é", 1), 0);
+        assert_eq!(clamp_byte_index("é", 2), 2);
+        assert_eq!(clamp_byte_index("é", usize::MAX), 2);
+    }
+
+    #[test]
+    fn explorer_refresh_finds_new_files_and_preserves_expansion() {
+        let root = test_dir("refresh");
+        let nested = root.join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let mut explorer = FileExplorer::new(VPath::Local(root.clone()));
+        let nested_idx = explorer.entries.iter()
+            .position(|entry| entry.path == nested)
+            .unwrap();
+        explorer.toggle(nested_idx);
+
+        let new_path = nested.join("created.py");
+        std::fs::write(&new_path, "print('ok')\n").unwrap();
+        assert!(explorer.refresh_local());
+        assert!(explorer.entries.iter().any(|entry| entry.path == new_path));
+        assert!(explorer.entries.iter().any(|entry| {
+            entry.path == nested && entry.expanded
+        }));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn remote_explorer_refresh_finds_new_files_and_preserves_expansion() {
+        let host = vpath::SshHost {
+            user: Some("dev".to_owned()),
+            host: "example.test".to_owned(),
+            port: Some(2222),
+        };
+        let mut explorer = FileExplorer::new(VPath::Remote {
+            host,
+            path: PathBuf::from("/workspace"),
+        });
+        apply_remote_dir_listing(
+            &mut explorer,
+            Path::new("/workspace"),
+            vec![("src".to_owned(), true), ("Cargo.toml".to_owned(), false)],
+        );
+        let src_idx = explorer.entries.iter()
+            .position(|entry| entry.path == Path::new("/workspace/src"))
+            .unwrap();
+        explorer.toggle(src_idx);
+        apply_remote_dir_listing(
+            &mut explorer,
+            Path::new("/workspace/src"),
+            vec![("main.rs".to_owned(), false)],
+        );
+        explorer.selected = explorer.entries.iter()
+            .position(|entry| entry.path == Path::new("/workspace/src/main.rs"))
+            .unwrap();
+
+        apply_remote_dir_listing(
+            &mut explorer,
+            Path::new("/workspace"),
+            vec![
+                ("src".to_owned(), true),
+                ("Cargo.toml".to_owned(), false),
+                ("created-from-terminal".to_owned(), false),
+            ],
+        );
+
+        assert!(explorer.entries.iter().any(|entry| {
+            entry.path == Path::new("/workspace/created-from-terminal")
+        }));
+        assert!(explorer.entries.iter().any(|entry| {
+            entry.path == Path::new("/workspace/src") && entry.expanded
+        }));
+        assert_eq!(
+            explorer.entries[explorer.selected].path,
+            Path::new("/workspace/src/main.rs"),
+        );
+    }
+
+    #[test]
+    fn recursive_copy_copies_directories_and_rejects_self_copy() {
+        let root = test_dir("copy");
+        let source = root.join("source");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("file.txt"), "content").unwrap();
+        let destination = root.join("destination");
+        copy_path_recursively(&source, &destination).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(destination.join("file.txt")).unwrap(),
+            "content",
+        );
+        let other = root.join("other");
+        std::fs::create_dir(&other).unwrap();
+        assert_eq!(paste_destination(&other, &source), other.join("source"));
+        std::fs::create_dir(other.join("source")).unwrap();
+        assert_eq!(paste_destination(&other, &source), other.join("source copy"));
+        assert!(copy_path_recursively(&source, &source.join("nested-copy")).is_err());
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
