@@ -58,7 +58,11 @@ impl GlyphCacheLimit {
     ];
 }
 
+// `#[serde(default)]` on the container: any field missing from config.json (older
+// file, hand edit) takes its value from `Settings::default()` instead of failing the
+// whole parse and silently resetting every setting.
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Settings {
     pub renderer:         RendererBackend,
     pub vsync:            bool,
@@ -113,6 +117,12 @@ pub struct Settings {
     /// Blacklist globs — matching paths are never shared regardless of role.
     #[serde(default)]
     pub collab_exclude_globs: Vec<String>,
+    /// Project roots whose `.vscode/local-text.json` the user has trusted, mapped to
+    /// the exact file contents that were trusted. A project config can choose which
+    /// program runs as the language server, so it is only applied when its current
+    /// contents match what the user approved.
+    #[serde(default)]
+    pub trusted_project_configs: std::collections::HashMap<String, String>,
 }
 
 impl Default for Settings {
@@ -140,6 +150,7 @@ impl Default for Settings {
             collab_role_perms:        crate::collab::RolePermissions::default(),
             collab_include_globs:     Vec::new(),
             collab_exclude_globs:     Vec::new(),
+            trusted_project_configs:  std::collections::HashMap::new(),
         }
     }
 }
@@ -161,13 +172,76 @@ impl Settings {
     pub fn load() -> Self {
         let path = match Self::config_path() { Some(p) => p, None => return Self::default() };
         let text = match fs::read_to_string(&path) { Ok(t) => t, Err(_) => return Self::default() };
-        serde_json::from_str(&text).unwrap_or_default()
+        let (settings, fully_valid) = Self::parse_lenient(&text);
+        if !fully_valid {
+            // Keep the user's original file: the next save() rewrites config.json, so
+            // stash a copy of what we couldn't fully understand instead of losing it.
+            let backup = path.with_extension("json.bak");
+            let _ = fs::write(&backup, &text);
+            eprintln!(
+                "local-text: some settings in {} were invalid and were reset; original saved to {}",
+                path.display(), backup.display(),
+            );
+        }
+        settings
+    }
+
+    /// Parse settings, keeping every field that is individually valid. Returns the
+    /// settings plus whether the whole file parsed cleanly. A single bad value (wrong
+    /// type, unknown enum variant) only resets that one field to its default.
+    fn parse_lenient(text: &str) -> (Self, bool) {
+        if let Ok(s) = serde_json::from_str::<Self>(text) {
+            return (s, true);
+        }
+        let Ok(serde_json::Value::Object(user)) = serde_json::from_str::<serde_json::Value>(text) else {
+            return (Self::default(), false);
+        };
+        let Ok(serde_json::Value::Object(mut merged)) = serde_json::to_value(Self::default()) else {
+            return (Self::default(), false);
+        };
+        for (key, value) in user {
+            let mut trial = merged.clone();
+            trial.insert(key.clone(), value.clone());
+            if serde_json::from_value::<Self>(serde_json::Value::Object(trial)).is_ok() {
+                merged.insert(key, value);
+            }
+        }
+        let settings = serde_json::from_value(serde_json::Value::Object(merged)).unwrap_or_default();
+        (settings, false)
     }
 
     pub fn save(&self) {
         let Some(path) = Self::config_path() else { return };
         if let Ok(text) = serde_json::to_string_pretty(self) {
-            let _ = fs::write(path, text);
+            // Write-then-rename so a crash mid-write can't leave a truncated config.
+            let tmp = path.with_extension("json.tmp");
+            if fs::write(&tmp, text).is_ok() && fs::rename(&tmp, &path).is_err() {
+                let _ = fs::remove_file(&tmp);
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_fields_take_defaults() {
+        let (s, ok) = Settings::parse_lenient(r#"{"font_size": 18.0}"#);
+        assert!(ok);
+        assert_eq!(s.font_size, 18.0);
+        assert!(s.vsync); // default, even though "vsync"/"renderer" are absent
+    }
+
+    #[test]
+    fn one_bad_field_does_not_reset_the_rest() {
+        let (s, ok) = Settings::parse_lenient(
+            r#"{"font_size": 20.0, "renderer": "quantum", "recent_remote_hosts": ["ssh://h:/x"]}"#,
+        );
+        assert!(!ok);
+        assert_eq!(s.font_size, 20.0);
+        assert_eq!(s.recent_remote_hosts, vec!["ssh://h:/x".to_owned()]);
+        assert!(s.renderer == RendererBackend::Cpu);
     }
 }

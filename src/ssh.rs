@@ -33,25 +33,31 @@ pub const REQUIRED_SETUP_VERSION: u32 = 1;
 /// If the socket already exists, this returns immediately via `SshConnected`.
 pub fn ensure_control_master(host: SshHost, proxy: EventLoopProxy<UserEvent>) {
     let socket = host.control_path();
-    // Fast path: socket already exists — no new thread needed.
-    if socket.exists() {
+    // Fast path: socket already exists and we know the remote home — no new thread needed.
+    if socket.exists() && crate::vpath::remote_home(&host).is_some() {
         let _ = proxy.send_event(UserEvent::SshConnected { host });
         return;
     }
     thread::spawn(move || {
-        let _ = proxy.send_event(UserEvent::SshConnecting { host: host.clone() });
-        match open_control_master(&host) {
-            Ok(()) => {
-                // Run setup check asynchronously after connecting.
-                let host2 = host.clone();
-                let proxy2 = proxy.clone();
-                thread::spawn(move || check_setup(&host2, &proxy2));
-                let _ = proxy.send_event(UserEvent::SshConnected { host });
-            }
-            Err(msg) => {
+        if !socket.exists() {
+            let _ = proxy.send_event(UserEvent::SshConnecting { host: host.clone() });
+            if let Err(msg) = open_control_master(&host) {
                 let _ = proxy.send_event(UserEvent::SshError { host, msg });
+                return;
+            }
+            // Run setup check asynchronously after connecting.
+            let host2 = host.clone();
+            let proxy2 = proxy.clone();
+            thread::spawn(move || check_setup(&host2, &proxy2));
+        }
+        // Learn the real home directory so `~` paths can be made absolute (it is
+        // `/root` for root and `/Users/<name>` on macOS, not always `/home/<user>`).
+        if let Ok(home) = run_ssh_capture(&host, &["sh", "-c", "printf '%s' \"$HOME\""]) {
+            if home.starts_with('/') && !home.contains('\n') {
+                crate::vpath::set_remote_home(&host, PathBuf::from(home));
             }
         }
+        let _ = proxy.send_event(UserEvent::SshConnected { host });
     });
 }
 
@@ -72,20 +78,49 @@ pub fn ssh_read_file(host: SshHost, path: PathBuf, token: u64, proxy: EventLoopP
     });
 }
 
-/// Write a file to a remote host.  Sends `RemoteWriteDone` on success or
-/// `SshError` on failure.
-pub fn ssh_write_file(host: SshHost, path: PathBuf, content: String, proxy: EventLoopProxy<UserEvent>) {
+/// Per-file write slots. Each save gets a sequence number; a save only writes if
+/// no newer save of the same file has already completed, so saves that finish out
+/// of order can never leave older content on disk.
+fn write_slot(host: &SshHost, path: &Path) -> std::sync::Arc<std::sync::Mutex<u64>> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    static SLOTS: OnceLock<Mutex<HashMap<(SshHost, PathBuf), Arc<Mutex<u64>>>>> = OnceLock::new();
+    let mut slots = SLOTS.get_or_init(|| Mutex::new(HashMap::new()))
+        .lock().unwrap_or_else(|p| p.into_inner());
+    Arc::clone(slots.entry((host.clone(), path.to_path_buf())).or_default())
+}
+
+static WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Write a file to a remote host. Sends `RemoteWriteDone` (carrying `generation`,
+/// the buffer's edit generation at save time) on success or `RemoteWriteError`.
+pub fn ssh_write_file(host: SshHost, path: PathBuf, content: String, generation: u64, proxy: EventLoopProxy<UserEvent>) {
+    let seq = WRITE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     thread::spawn(move || {
         let vpath = VPath::Remote { host: host.clone(), path: path.clone() };
+        let slot = write_slot(&host, &path);
+        let mut last_written = slot.lock().unwrap_or_else(|p| p.into_inner());
+        if *last_written > seq {
+            return; // a newer save of this file already landed
+        }
         match write_remote_file(&host, &path, &content) {
             Ok(()) => {
-                let _ = proxy.send_event(UserEvent::RemoteWriteDone { path: vpath });
+                *last_written = seq;
+                let _ = proxy.send_event(UserEvent::RemoteWriteDone { path: vpath, generation });
             }
             Err(msg) => {
-                let _ = proxy.send_event(UserEvent::SshError { host, msg });
+                let _ = proxy.send_event(UserEvent::RemoteWriteError { path: vpath, msg });
             }
         }
     });
+}
+
+/// Blocking remote write, for saving on quit (the process must not exit while a
+/// background write is still streaming the file).
+pub fn ssh_write_file_blocking(host: &SshHost, path: &Path, content: &str) -> Result<(), String> {
+    let slot = write_slot(host, path);
+    let _guard = slot.lock().unwrap_or_else(|p| p.into_inner());
+    write_remote_file(host, path, content)
 }
 
 /// List a remote directory. Sends a listing-specific result so a transient
@@ -342,7 +377,7 @@ pub fn read_remote_file_sync(host: &SshHost, remote_path: &str) -> Option<String
     }
     cmd.arg(host.host_arg())
        .arg("--")
-       .arg(format!("cat {}", shell_quote(remote_path)))
+       .arg(remote_command(&["sh", "-c", &format!("cat -- {}", remote_path_expr(Path::new(remote_path)))]))
        .stdin(Stdio::null())
        .stdout(Stdio::piped())
        .stderr(Stdio::null());
@@ -475,9 +510,44 @@ pub fn run_ssh_capture(host: &SshHost, remote_argv: &[&str]) -> Result<String, S
     }
 }
 
-/// Write `content` to `remote_path` on `host` using `ssh … cat >`.
+/// Shell script that safely replaces `target` with exactly `expected_len` bytes
+/// read from stdin. The data is streamed into a temp file beside the target and its
+/// size checked first, so a dropped connection never truncates the real file. The
+/// temp file then atomically replaces a regular file we own (keeping its mode);
+/// symlinks and files owned by someone else are rewritten in place instead, so the
+/// link and the owner are preserved.
+fn remote_save_script(target: &Path, expected_len: usize) -> String {
+    format!(
+        r#"target={target}
+expected={expected_len}
+case "$target" in
+    */*) dir=${{target%/*}}; [ -n "$dir" ] || dir=/ ;;
+    *) dir=. ;;
+esac
+tmp=$(mktemp "$dir/.lt-save.XXXXXX") || exit 1
+trap 'rm -f "$tmp"' EXIT HUP INT TERM
+cat > "$tmp" || exit 1
+actual=$(wc -c < "$tmp" | tr -d ' ')
+if [ "$actual" != "$expected" ]; then
+    printf 'incomplete transfer (%s of %s bytes); file left unchanged\n' "$actual" "$expected" >&2
+    exit 1
+fi
+if [ -L "$target" ] || {{ [ -e "$target" ] && [ ! -O "$target" ]; }}; then
+    cat -- "$tmp" > "$target" || exit 1
+else
+    if [ -e "$target" ]; then
+        mode=$(stat -c %a -- "$target" 2>/dev/null || stat -f %Lp -- "$target" 2>/dev/null)
+        [ -n "$mode" ] && chmod "$mode" "$tmp"
+    fi
+    mv -f -- "$tmp" "$target" || exit 1
+fi"#,
+        target = remote_path_expr(target),
+    )
+}
+
+/// Write `content` to `remote_path` on `host` (see `remote_save_script`).
 fn write_remote_file(host: &SshHost, remote_path: &Path, content: &str) -> Result<(), String> {
-    let script = format!("cat > {}", remote_path_expr(remote_path));
+    let script = remote_save_script(remote_path, content.len());
     let remote_command = remote_command(&["sh", "-c", &script]);
     let mut cmd = Command::new("ssh");
     cmd.arg("-o").arg(format!("ControlPath={}", host.control_path().display()))
@@ -495,13 +565,18 @@ fn write_remote_file(host: &SshHost, remote_path: &Path, content: &str) -> Resul
     let mut child = cmd.spawn()
         .map_err(|e| format!("ssh spawn error: {e}"))?;
 
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(content.as_bytes())
-            .map_err(|e| format!("ssh write error: {e}"))?;
+    let write_result = match child.stdin.take() {
+        Some(mut stdin) => stdin.write_all(content.as_bytes()), // stdin dropped → EOF
+        None => Ok(()),
+    };
+    // Always reap the child, even if the write failed.
+    let output = child.wait_with_output().map_err(|e| format!("ssh wait error: {e}"))?;
+    if let Err(e) = write_result {
+        return Err(format!("ssh write error: {e}"));
     }
-    let status = child.wait().map_err(|e| format!("ssh wait error: {e}"))?;
-    if status.success() { Ok(()) } else {
-        Err(format!("ssh write failed with status {status}"))
+    if output.status.success() { Ok(()) } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!("ssh write failed ({}): {}", output.status, stderr.trim()))
     }
 }
 
@@ -740,6 +815,46 @@ mod tests {
         );
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn remote_save_script_replaces_atomically_and_rejects_short_input() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("lt-ssh-save-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join("file with space.txt");
+        std::fs::write(&target, "old contents\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        let run = |script: String, input: &str| {
+            let mut child = Command::new("sh").args(["-c", &script])
+                .stdin(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+            child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+            child.wait_with_output().unwrap()
+        };
+
+        // Truncated transfer: target must be untouched and no temp file left behind.
+        let out = run(remote_save_script(&target, 100), "partial");
+        assert!(!out.status.success());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "old contents\n");
+
+        // Full transfer replaces the file and keeps its mode.
+        let new = "new contents\r\nline 2";
+        assert!(run(remote_save_script(&target, new.len()), new).status.success());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), new);
+        assert_eq!(std::fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o640);
+
+        // Writing through a symlink keeps the link.
+        let link = root.join("link.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(run(remote_save_script(&link, 3), "abc").status.success());
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "abc");
+
+        let leftovers: Vec<_> = std::fs::read_dir(&root).unwrap()
+            .flatten().filter(|e| e.file_name().to_string_lossy().starts_with(".lt-save")).collect();
+        assert!(leftovers.is_empty());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

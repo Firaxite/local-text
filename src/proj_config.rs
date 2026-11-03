@@ -36,15 +36,30 @@ struct ServerConfig {
 /// Load the launch overrides for `bin` from the project at `root`. Returns the
 /// default (empty) overrides when the file is absent, unreadable, malformed, or
 /// has no entry for `bin`.
+///
+/// The config can choose which program runs as the language server, so callers
+/// must only apply it once the user has trusted these exact contents (see
+/// `parse_project_lsp_config` + `Settings::trusted_project_configs`).
+#[cfg(test)]
 pub fn load_project_lsp_config(root: &VPath, bin: &str) -> LspLaunchOverrides {
-    let Some(text) = read_config_text(root) else { return LspLaunchOverrides::default() };
-    let Ok(cfg) = serde_json::from_str::<HashMap<String, ServerConfig>>(&text) else {
+    read_config_text(root)
+        .map(|text| parse_project_lsp_config(&text, bin))
+        .unwrap_or_default()
+}
+
+/// Parse config text into overrides for `bin`. Environment variable names that are
+/// not plain shell identifiers are dropped: on remote hosts they are interpolated
+/// into an `export NAME=…` line, where anything else would be shell syntax.
+pub fn parse_project_lsp_config(text: &str, bin: &str) -> LspLaunchOverrides {
+    let Ok(cfg) = serde_json::from_str::<HashMap<String, ServerConfig>>(text) else {
         return LspLaunchOverrides::default();
     };
     let Some(server) = cfg.get(bin) else { return LspLaunchOverrides::default() };
     // Sort env for deterministic ordering across runs (HashMap iteration order is random).
-    let mut env: Vec<(String, String)> =
-        server.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    let mut env: Vec<(String, String)> = server.env.iter()
+        .filter(|(k, _)| is_valid_env_name(k))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
     env.sort();
     LspLaunchOverrides {
         command: server.command.clone(),
@@ -53,7 +68,18 @@ pub fn load_project_lsp_config(root: &VPath, bin: &str) -> LspLaunchOverrides {
     }
 }
 
-fn read_config_text(root: &VPath) -> Option<String> {
+/// True if the parsed config actually changes how a server is launched.
+pub fn overrides_anything(o: &LspLaunchOverrides) -> bool {
+    o.command.is_some() || o.args.is_some() || !o.env.is_empty()
+}
+
+fn is_valid_env_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c == '_' || c.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
+pub fn read_config_text(root: &VPath) -> Option<String> {
     match root {
         VPath::Local(p) => std::fs::read_to_string(p.join(CONFIG_REL_PATH)).ok(),
         VPath::Remote { host, path } => {
@@ -91,6 +117,15 @@ mod tests {
         assert!(none.command.is_none() && none.args.is_none() && none.env.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn invalid_env_names_are_dropped() {
+        let ov = parse_project_lsp_config(
+            r#"{"pylsp":{"env":{"OK_1":"a","bad; rm -rf ~":"b","1X":"c","":"d"}}}"#,
+            "pylsp",
+        );
+        assert_eq!(ov.env, vec![("OK_1".to_owned(), "a".to_owned())]);
     }
 
     #[test]

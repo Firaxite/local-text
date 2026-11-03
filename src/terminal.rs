@@ -597,8 +597,9 @@ fn parse_osc7_path(url: &str) -> Option<std::path::PathBuf> {
         // file://hostname/path — skip up to first '/'
         { let i = rest.find('/')?; &rest[i..] }
     };
-    // Percent-decode basic %XX sequences
-    let decoded = percent_decode(path_str);
+    // Percent-decode %XX sequences into raw bytes, then require valid UTF-8 so
+    // non-ASCII directory names (sent as %C3%A9 etc.) come back intact.
+    let decoded = String::from_utf8(percent_decode(path_str)).ok()?;
     // Reject control bytes (including NUL): any terminal output can emit OSC 7, and a
     // smuggled `%00`/`%1b` would put a NUL or escape into the cwd PathBuf — invalid for
     // any later FFI/display use.
@@ -608,19 +609,19 @@ fn parse_osc7_path(url: &str) -> Option<std::path::PathBuf> {
     Some(std::path::PathBuf::from(decoded))
 }
 
-fn percent_decode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
+fn percent_decode(s: &str) -> Vec<u8> {
     let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
             if let (Some(h), Some(l)) = (from_hex(bytes[i+1]), from_hex(bytes[i+2])) {
-                out.push(char::from(h << 4 | l));
+                out.push(h << 4 | l);
                 i += 3;
                 continue;
             }
         }
-        out.push(bytes[i] as char);
+        out.push(bytes[i]);
         i += 1;
     }
     out
@@ -728,6 +729,16 @@ pub fn spawn_terminal_with_shell(pane_id: usize, cols: usize, rows: usize,
         .or_else(|| env::var("SHELL").ok())
         .unwrap_or_else(|| "/bin/sh".to_owned());
 
+    // Everything the child needs is prepared *before* forkpty. The editor is
+    // multi-threaded (SSH, LSP and PTY readers), and after fork() only
+    // async-signal-safe functions may be called in the child: allocating (CString::new,
+    // setenv) could deadlock on a malloc lock another thread held at fork time.
+    let Some(exec) = PreparedExec::new(&shell, is_override, cwd.as_deref()) else {
+        let mut pane = new_log_pane(pane_id, cols, rows, "Terminal".to_owned());
+        feed_bytes(&mut pane, format!("[local-text] cannot start shell {shell:?}\r\n").as_bytes());
+        return pane;
+    };
+
     let mut ws = libc::winsize {
         ws_col: cols as u16,
         ws_row: rows as u16,
@@ -740,51 +751,26 @@ pub fn spawn_terminal_with_shell(pane_id: usize, cols: usize, rows: usize,
     let pid = unsafe {
         libc::forkpty(&mut master_fd, ptr::null_mut(), ptr::null_mut(), &mut ws)
     };
-    assert!(pid >= 0, "forkpty failed: {}", std::io::Error::last_os_error());
+    if pid < 0 {
+        let err = std::io::Error::last_os_error();
+        let mut pane = new_log_pane(pane_id, cols, rows, "Terminal".to_owned());
+        feed_bytes(&mut pane, format!("[local-text] forkpty failed: {err}\r\n").as_bytes());
+        return pane;
+    }
 
     if pid == 0 {
-        // SAFETY: we are in the forked child process; the NUL-terminated literals and
-        // argv array are valid for the duration of these calls. execvp replaces the
-        // process image so no cleanup is needed on success; exit(1) handles failure.
+        // SAFETY: we are in the forked child. Only async-signal-safe calls follow
+        // (chdir, execve, _exit), all on buffers prepared before the fork.
         unsafe {
-            // Change to the requested working directory before exec (best effort).
-            if let Some(ref dir) = cwd {
-                use std::os::unix::ffi::OsStrExt;
-                if let Ok(c_dir) = CString::new(dir.as_os_str().as_bytes()) {
-                    libc::chdir(c_dir.as_ptr()); // ignore failure — shell will report it
-                }
+            if let Some(dir) = exec.cwd.as_ref() {
+                libc::chdir(dir.as_ptr()); // best effort — the shell starts in $HOME otherwise
             }
-            libc::setenv(
-                b"TERM\0".as_ptr().cast(),
-                b"xterm-256color\0".as_ptr().cast(),
-                1,
-            );
-            // NOTE: we are post-fork in the child. A panic here would unwind through the
-            // parent's atexit handlers, so on any error we must fall through to exit(1)
-            // rather than unwrap. An embedded NUL in `shell` makes CString::new fail.
-            if is_override {
-                // The override is a full command string with arguments (e.g.
-                // "ssh -o ControlPath=... user@host"). execvp does NOT perform
-                // shell word-splitting — it would try to find a file literally
-                // named the whole string, which doesn't exist. Delegate to
-                // `sh -c <cmd>` so the shell parses the arguments correctly.
-                if let (Ok(sh_c), Ok(flag_c), Ok(cmd_c)) = (
-                    CString::new("sh"),
-                    CString::new("-c"),
-                    CString::new(shell.as_str()),
-                ) {
-                    libc::execvp(
-                        sh_c.as_ptr(),
-                        [sh_c.as_ptr(), flag_c.as_ptr(), cmd_c.as_ptr(), ptr::null()].as_ptr(),
-                    );
-                }
-            } else if let Ok(shell_c) = CString::new(shell.as_str()) {
-                // Plain shell path (e.g. "/bin/zsh") — exec directly with no extra args.
-                libc::execvp(shell_c.as_ptr(), [shell_c.as_ptr(), ptr::null()].as_ptr());
-            }
-            libc::exit(1);
+            libc::execve(exec.program.as_ptr(), exec.argv_ptrs.as_ptr(), exec.envp_ptrs.as_ptr());
+            // _exit, not exit: never run the parent's atexit handlers in the child.
+            libc::_exit(127);
         }
     }
+    drop(exec);
 
     // Parent: spawn reader thread
     let closed = Arc::new(AtomicBool::new(false));
@@ -833,6 +819,66 @@ pub fn spawn_terminal_with_shell(pane_id: usize, cols: usize, rows: usize,
         title: "Terminal".to_owned(),
         shell,
     }
+}
+
+/// Program, argv, environment and cwd for the PTY child, as C strings built in
+/// the parent so the child never allocates between fork and exec.
+#[cfg(unix)]
+struct PreparedExec {
+    program:   CString,
+    _argv:     Vec<CString>,
+    argv_ptrs: Vec<*const libc::c_char>,
+    _envp:     Vec<CString>,
+    envp_ptrs: Vec<*const libc::c_char>,
+    cwd:       Option<CString>,
+}
+
+#[cfg(unix)]
+impl PreparedExec {
+    fn new(shell: &str, is_override: bool, cwd: Option<&std::path::Path>) -> Option<Self> {
+        use std::os::unix::ffi::OsStrExt;
+        // An override is a full command line (e.g. "ssh -o ControlPath=… user@host"),
+        // so run it through `/bin/sh -c`. A plain shell is exec'd directly; execve
+        // doesn't search PATH, so resolve a bare name ourselves.
+        let (program, argv): (CString, Vec<CString>) = if is_override {
+            let sh = CString::new("/bin/sh").ok()?;
+            (sh.clone(), vec![sh, CString::new("-c").ok()?, CString::new(shell).ok()?])
+        } else {
+            let resolved = resolve_in_path(shell).unwrap_or_else(|| std::path::PathBuf::from("/bin/sh"));
+            let program = CString::new(resolved.as_os_str().as_bytes()).ok()?;
+            (program, vec![CString::new(shell).ok()?])
+        };
+        let mut envp: Vec<CString> = std::env::vars_os()
+            .filter(|(k, _)| k.as_bytes() != b"TERM")
+            .filter_map(|(k, v)| {
+                let mut entry = k.as_bytes().to_vec();
+                entry.push(b'=');
+                entry.extend_from_slice(v.as_bytes());
+                CString::new(entry).ok()
+            })
+            .collect();
+        envp.push(CString::new("TERM=xterm-256color").ok()?);
+        let cwd = cwd.and_then(|d| CString::new(d.as_os_str().as_bytes()).ok());
+        let argv_ptrs = argv.iter().map(|a| a.as_ptr()).chain(std::iter::once(std::ptr::null())).collect();
+        let envp_ptrs = envp.iter().map(|e| e.as_ptr()).chain(std::iter::once(std::ptr::null())).collect();
+        Some(PreparedExec { program, _argv: argv, argv_ptrs, _envp: envp, envp_ptrs, cwd })
+    }
+}
+
+/// Find an executable the way execvp would: absolute/relative paths are used as
+/// given, bare names are looked up in $PATH.
+#[cfg(unix)]
+fn resolve_in_path(name: &str) -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    if name.contains('/') { return Some(std::path::PathBuf::from(name)); }
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| {
+            std::fs::metadata(candidate)
+                .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
+        })
 }
 
 /// Create a display-only TermPane with no PTY and no child process.
@@ -963,6 +1009,30 @@ mod tests {
             parse_osc7_path("file:///home/user/proj"),
             Some(std::path::PathBuf::from("/home/user/proj")),
         );
+    }
+
+    #[test]
+    fn osc7_decodes_utf8_paths() {
+        assert_eq!(
+            parse_osc7_path("file://host/home/me/caf%C3%A9 dir"),
+            Some(std::path::PathBuf::from("/home/me/café dir")),
+        );
+        assert_eq!(
+            parse_osc7_path("file:///home/me/naïve"),
+            Some(std::path::PathBuf::from("/home/me/naïve")),
+        );
+        assert!(parse_osc7_path("file:///bad/%FF%FE").is_none());
+    }
+
+    #[test]
+    fn prepared_exec_resolves_shell_and_sets_term() {
+        let exec = PreparedExec::new("sh", false, None).unwrap();
+        assert!(exec.program.to_bytes().ends_with(b"/sh"));
+        assert!(exec._envp.iter().any(|e| e.to_bytes() == b"TERM=xterm-256color"));
+        assert_eq!(exec.argv_ptrs.last().copied(), Some(std::ptr::null()));
+        let ov = PreparedExec::new("echo hi", true, None).unwrap();
+        assert_eq!(ov.program.to_bytes(), b"/bin/sh");
+        assert_eq!(ov._argv.len(), 3);
     }
 
     #[test]

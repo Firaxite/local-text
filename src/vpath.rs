@@ -155,6 +155,11 @@ impl VPath {
     /// Parse `"ssh://[user@]host[:port]:path"` → `VPath::Remote`.
     /// If `:path` is omitted, the path defaults to `~` on the remote.
     /// or any other string → `VPath::Local`.
+    ///
+    /// A leading `~` is kept as-is: the remote home directory isn't known until we
+    /// connect (it is `/root` for root, `/Users/<name>` on macOS, …). Remote shell
+    /// commands expand it themselves, and `resolve_remote_tilde` rewrites it to the
+    /// real absolute path once `$HOME` has been read from the host.
     pub fn parse(s: &str) -> Self {
         if let Some(rest) = s.strip_prefix("ssh://") {
             let Some((host_part, path_part)) = split_ssh_host_and_path(rest) else {
@@ -183,8 +188,7 @@ impl VPath {
 
             if !host.is_empty() {
                 let ssh_host = SshHost { user, host, port };
-                let raw = PathBuf::from(path_part);
-                let path = expand_tilde(&ssh_host, &raw);
+                let path = PathBuf::from(path_part);
                 return VPath::Remote { host: ssh_host, path };
             }
         }
@@ -284,12 +288,21 @@ impl VPath {
     /// LSP server process runs *on the remote*, where that path is local.
     pub fn to_lsp_uri(&self) -> String {
         match self {
-            VPath::Local(p) => format!("file://{}", p.display()),
-            VPath::Remote { host, path } => {
-                let path = remote_lsp_path(host, path);
-                format!("file://{}", path.display())
-            }
+            VPath::Local(p) => path_to_file_uri(p),
+            VPath::Remote { host, path } => path_to_file_uri(&expand_tilde(host, path)),
         }
+    }
+
+    /// If this is a remote path starting with `~` and the host's home directory is
+    /// known, return the equivalent absolute path.
+    pub fn resolve_remote_tilde(&self) -> Option<VPath> {
+        let VPath::Remote { host, path } = self else { return None };
+        let raw = path.to_string_lossy();
+        if raw != "~" && !raw.starts_with("~/") { return None; }
+        let home = remote_home(host)?;
+        let rest = raw.strip_prefix('~').unwrap_or("").trim_start_matches('/');
+        let abs = if rest.is_empty() { home } else { home.join(rest) };
+        Some(VPath::Remote { host: host.clone(), path: abs })
     }
 
     /// Short human-readable display for status bar / command palette.
@@ -320,24 +333,115 @@ impl VPath {
     }
 }
 
-/// Expand a leading `~` to `/home/{user}` when the host has a known user.
-/// Returns the path unchanged if no user is set or the path is already absolute.
-fn expand_tilde(host: &SshHost, path: &Path) -> PathBuf {
-    let Some(user) = host.user.as_deref() else {
-        return path.to_path_buf();
-    };
-    let path_str = path.to_string_lossy();
-    if path_str == "~" {
-        PathBuf::from(format!("/home/{user}"))
-    } else if let Some(rest) = path_str.strip_prefix("~/") {
-        PathBuf::from(format!("/home/{user}/{rest}"))
-    } else {
-        path.to_path_buf()
-    }
+// ── Remote home directories ───────────────────────────────────────────────────
+
+fn remote_homes() -> &'static std::sync::Mutex<std::collections::HashMap<SshHost, PathBuf>> {
+    static HOMES: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<SshHost, PathBuf>>> =
+        std::sync::OnceLock::new();
+    HOMES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-fn remote_lsp_path(host: &SshHost, path: &Path) -> PathBuf {
-    expand_tilde(host, path)
+/// Record the `$HOME` reported by `host` (read once after connecting).
+pub fn set_remote_home(host: &SshHost, home: PathBuf) {
+    remote_homes().lock().unwrap_or_else(|p| p.into_inner()).insert(host.clone(), home);
+}
+
+/// The host's home directory, if it has been read.
+pub fn remote_home(host: &SshHost) -> Option<PathBuf> {
+    remote_homes().lock().unwrap_or_else(|p| p.into_inner()).get(host).cloned()
+}
+
+/// Expand a leading `~` using the host's real home directory. Before that is known
+/// we fall back to the conventional location (`/root` for root, `/home/<user>`
+/// otherwise); if there's no user either, the path is returned unchanged.
+fn expand_tilde(host: &SshHost, path: &Path) -> PathBuf {
+    let path_str = path.to_string_lossy();
+    let rest = if path_str == "~" {
+        ""
+    } else if let Some(rest) = path_str.strip_prefix("~/") {
+        rest
+    } else {
+        return path.to_path_buf();
+    };
+    let home = match remote_home(host) {
+        Some(home) => home,
+        None => match host.user.as_deref() {
+            Some("root") => PathBuf::from("/root"),
+            Some(user)   => PathBuf::from(format!("/home/{user}")),
+            None         => return path.to_path_buf(),
+        },
+    };
+    if rest.is_empty() { home } else { home.join(rest) }
+}
+
+// ── file:// URIs ──────────────────────────────────────────────────────────────
+
+/// Percent-encode a path into a `file://` URI. Everything outside the RFC 3986
+/// unreserved set (plus `/`) is escaped, so spaces, `#`, `%`, `?` and non-ASCII
+/// names survive the round trip through a language server.
+pub fn path_to_file_uri(path: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    let mut out = String::from("file://");
+    for &b in path.as_os_str().as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Decode a `file://` URI (as sent by a language server) back into a path.
+/// Accepts `file:///abs` and `file://localhost/abs`; returns None for anything else.
+pub fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    let rest = uri.strip_prefix("file://")?;
+    let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+    if !rest.starts_with('/') { return None; }
+    // Drop any query/fragment (not part of a file path once decoded).
+    let rest = rest.split(['?', '#']).next().unwrap_or(rest);
+    let bytes = rest.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+            if let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push(h << 4 | l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    if out.contains(&0) { return None; }
+    Some(PathBuf::from(std::ffi::OsString::from_vec(out)))
+}
+
+/// Map a URI reported by a language server back to a VPath. For remote servers the
+/// server sees absolute paths; if the matching open path uses `~`, the caller
+/// compares via `VPath::same_file`.
+pub fn lsp_uri_to_vpath(uri: &str, ssh_host: Option<&SshHost>) -> Option<VPath> {
+    let path = file_uri_to_path(uri)?;
+    Some(match ssh_host {
+        Some(host) => VPath::Remote { host: host.clone(), path },
+        None       => VPath::Local(path),
+    })
+}
+
+impl VPath {
+    /// True if both paths name the same file, treating a remote `~/x` and the
+    /// absolute path under the host's home as equal.
+    pub fn same_file(&self, other: &VPath) -> bool {
+        if self == other { return true; }
+        match (self, other) {
+            (VPath::Remote { host: h1, path: p1 }, VPath::Remote { host: h2, path: p2 }) if h1 == h2 =>
+                expand_tilde(h1, p1) == expand_tilde(h2, p2),
+            _ => false,
+        }
+    }
 }
 
 fn split_ssh_host_and_path(rest: &str) -> Option<(&str, &str)> {
@@ -439,7 +543,35 @@ mod tests {
         assert_remote("ssh://example.com:/srv/app", None, "example.com", None, "/srv/app");
         assert_remote("ssh://example.com:2222", None, "example.com", Some(2222), "~");
         assert_remote("ssh://example.com:2222:/srv/app", None, "example.com", Some(2222), "/srv/app");
-        assert_remote("ssh://me@example.com:~/src/app", Some("me"), "example.com", None, "/home/me/src/app");
+        // `~` is kept until the real remote $HOME is known.
+        assert_remote("ssh://me@example.com:~/src/app", Some("me"), "example.com", None, "~/src/app");
+    }
+
+    #[test]
+    fn tilde_uses_resolved_home_then_falls_back() {
+        let root = SshHost { user: Some("root".into()), host: "tilde-test-root".into(), port: None };
+        let p = VPath::Remote { host: root.clone(), path: PathBuf::from("~/proj/a.rs") };
+        assert_eq!(p.to_lsp_uri(), "file:///root/proj/a.rs");
+
+        let mac = SshHost { user: Some("me".into()), host: "tilde-test-mac".into(), port: None };
+        set_remote_home(&mac, PathBuf::from("/Users/me"));
+        let p = VPath::Remote { host: mac.clone(), path: PathBuf::from("~/x") };
+        assert_eq!(p.to_lsp_uri(), "file:///Users/me/x");
+        assert_eq!(
+            p.resolve_remote_tilde(),
+            Some(VPath::Remote { host: mac.clone(), path: PathBuf::from("/Users/me/x") }),
+        );
+        assert!(p.same_file(&VPath::Remote { host: mac, path: PathBuf::from("/Users/me/x") }));
+    }
+
+    #[test]
+    fn file_uris_round_trip_special_characters() {
+        let p = Path::new("/tmp/My Project/a#b%c/é.rs");
+        let uri = path_to_file_uri(p);
+        assert_eq!(uri, "file:///tmp/My%20Project/a%23b%25c/%C3%A9.rs");
+        assert_eq!(file_uri_to_path(&uri).as_deref(), Some(p));
+        assert_eq!(file_uri_to_path("file://localhost/x/y").as_deref(), Some(Path::new("/x/y")));
+        assert_eq!(file_uri_to_path("file://relative"), None);
     }
 
     #[test]
@@ -456,6 +588,7 @@ mod tests {
 
     #[test]
     fn expands_remote_tilde_for_lsp_uri_when_user_is_known() {
+        // No resolved home for this host → conventional fallback for a non-root user.
         let path = VPath::parse("ssh://me@example.com:~/src/app/main.ts");
         assert_eq!(path.to_lsp_uri(), "file:///home/me/src/app/main.ts");
     }

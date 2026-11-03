@@ -8,10 +8,10 @@
 // A background thread reads messages from the server's stdout and sends them
 // to the main loop via EventLoopProxy<UserEvent>.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 use winit::event_loop::EventLoopProxy;
@@ -30,8 +30,13 @@ const MAX_LSP_FRAME: usize = 64 << 20; // 64 MiB
 pub enum PendingKind {
     Definition,
     References,
-    Formatting { path: VPath },
-    OrganizeImports { path: VPath },
+    /// `generation`: the buffer's edit generation the request was computed for
+    /// (stale results are dropped). `save_after`: format-on-save — write the
+    /// file again once the edits are applied.
+    Formatting { path: VPath, generation: u64, save_after: bool },
+    /// `then_format`: format-on-save also wants formatting; request it after the
+    /// import edits land (both can't be computed against the same version).
+    OrganizeImports { path: VPath, generation: u64, then_format: bool, save_after: bool },
 }
 
 // ── LspLaunchOverrides ────────────────────────────────────────────────────────
@@ -48,11 +53,88 @@ pub struct LspLaunchOverrides {
     pub env:     Vec<(String, String)>,
 }
 
+// ── Outgoing message queue ────────────────────────────────────────────────────
+//
+// Messages to the server are written by a dedicated thread, never by the UI
+// thread: a server that stops reading (busy indexing, wedged, or a stalled SSH
+// link) would otherwise fill the pipe and freeze the editor inside write().
+// Because document sync is full-text, a newer didChange for the same document
+// supersedes an older one still waiting in the queue, so a stuck server costs at
+// most one pending copy of each document rather than one per keystroke.
+
+enum Outgoing {
+    Raw(String),
+    DocChange { uri: String, body: String },
+}
+
+struct OutQueue {
+    items:  VecDeque<Outgoing>,
+    closed: bool,
+}
+
+pub struct LspWriter {
+    queue: Arc<(Mutex<OutQueue>, Condvar)>,
+}
+
+impl LspWriter {
+    fn spawn(mut stdin: ChildStdin) -> Self {
+        let queue = Arc::new((Mutex::new(OutQueue { items: VecDeque::new(), closed: false }), Condvar::new()));
+        let q = Arc::clone(&queue);
+        thread::spawn(move || loop {
+            let next = {
+                let (lock, cvar) = &*q;
+                let mut st = lock.lock().unwrap_or_else(|p| p.into_inner());
+                while st.items.is_empty() && !st.closed {
+                    st = cvar.wait(st).unwrap_or_else(|p| p.into_inner());
+                }
+                match st.items.pop_front() {
+                    Some(item) => item,
+                    None => break, // closed and drained
+                }
+            };
+            let body = match next { Outgoing::Raw(b) | Outgoing::DocChange { body: b, .. } => b };
+            if write_message(&mut stdin, &body).is_err() { break; }
+        });
+        LspWriter { queue }
+    }
+
+    fn push(&self, item: Outgoing) {
+        let (lock, cvar) = &*self.queue;
+        let mut st = lock.lock().unwrap_or_else(|p| p.into_inner());
+        if enqueue(&mut st, item) { cvar.notify_one(); }
+    }
+}
+
+/// Add `item` to the queue; returns true if a new entry was appended. A didChange
+/// replaces a still-queued change for the same document, but only when it is the
+/// last entry — so it never jumps ahead of a request queued after it.
+fn enqueue(st: &mut OutQueue, item: Outgoing) -> bool {
+    if st.closed { return false; }
+    if let Outgoing::DocChange { uri, body } = &item {
+        if let Some(Outgoing::DocChange { uri: last_uri, body: last_body }) = st.items.back_mut() {
+            if last_uri == uri {
+                *last_body = body.clone();
+                return false;
+            }
+        }
+    }
+    st.items.push_back(item);
+    true
+}
+
+impl Drop for LspWriter {
+    fn drop(&mut self) {
+        let (lock, cvar) = &*self.queue;
+        lock.lock().unwrap_or_else(|p| p.into_inner()).closed = true;
+        cvar.notify_one();
+    }
+}
+
 // ── LspServer ─────────────────────────────────────────────────────────────────
 pub struct LspServer {
     pub lang:           Lang,
     pub process:        Child,
-    pub stdin:          ChildStdin,
+    writer:             LspWriter,
     pub output_pane_id: usize,
     pub request_id:     u64,
     pub doc_version:    HashMap<VPath, u64>,
@@ -87,14 +169,15 @@ impl LspManager {
 // ── JSON-RPC framing ──────────────────────────────────────────────────────────
 
 /// Write a Content-Length-framed JSON-RPC message to the server's stdin.
-pub fn write_message(stdin: &mut ChildStdin, body: &str) -> std::io::Result<()> {
+fn write_message(stdin: &mut impl Write, body: &str) -> std::io::Result<()> {
     write!(stdin, "Content-Length: {}\r\n\r\n{}", body.len(), body)?;
     stdin.flush()
 }
 
 /// Read one Content-Length-framed message from a buffered reader.
 /// Returns None on EOF or parse error.
-pub fn read_message<R: BufRead>(reader: &mut R) -> Option<String> {
+#[cfg(test)]
+fn read_message<R: BufRead>(reader: &mut R) -> Option<String> {
     let mut content_length: Option<usize> = None;
     loop {
         let mut line = String::new();
@@ -119,7 +202,7 @@ pub fn send_notification(server: &mut LspServer, method: &str, params: serde_jso
         "method":  method,
         "params":  params,
     }).to_string();
-    let _ = write_message(&mut server.stdin, &body);
+    server.writer.push(Outgoing::Raw(body));
 }
 
 /// Send a JSON-RPC request. Returns the request id.
@@ -132,7 +215,7 @@ pub fn send_request(server: &mut LspServer, method: &str, params: serde_json::Va
         "method":  method,
         "params":  params,
     }).to_string();
-    let _ = write_message(&mut server.stdin, &body);
+    server.writer.push(Outgoing::Raw(body));
     id
 }
 
@@ -147,11 +230,7 @@ pub fn parse_diagnostics(json: &str, ssh_host: Option<&SshHost>) -> Option<(VPat
     if v["method"].as_str() != Some("textDocument/publishDiagnostics") { return None; }
     let params = &v["params"];
     let uri = params["uri"].as_str()?;
-    let raw_path = PathBuf::from(uri.strip_prefix("file://")?);
-    let path = match ssh_host {
-        Some(host) => VPath::Remote { host: host.clone(), path: raw_path },
-        None       => VPath::Local(raw_path),
-    };
+    let path = crate::vpath::lsp_uri_to_vpath(uri, ssh_host)?;
     let diags = params["diagnostics"].as_array()?.iter().filter_map(|d| {
         let s = &d["range"]["start"];
         let e = &d["range"]["end"];
@@ -180,6 +259,40 @@ pub fn is_initialize_response(json: &str) -> bool {
 
 // ── Server spawning ───────────────────────────────────────────────────────────
 
+/// Built-in server command for a language.
+fn default_command(lang: Lang) -> Option<(&'static str, &'static [&'static str])> {
+    match lang {
+        // rust-analyzer speaks LSP over stdin/stdout by default and *rejects* an
+        // unknown `--stdio` flag ("unexpected flag: `--stdio`"), unlike the
+        // Node-based servers below which require it.
+        Lang::Rust       => Some(("rust-analyzer", &[])),
+        Lang::TypeScript => Some(("typescript-language-server", &["--stdio"])),
+        Lang::Python     => Some(("pylsp", &[])),
+        Lang::None | Lang::Json | Lang::Jsonc | Lang::Markdown | Lang::Css | Lang::Html => None,
+    }
+}
+
+/// The program and arguments that will actually run: per-project overrides
+/// (`.vscode/local-text.json`) applied over the built-in defaults.
+pub fn resolve_command(lang: Lang, overrides: &LspLaunchOverrides) -> Option<(String, Vec<String>)> {
+    let (default_bin, default_args) = default_command(lang)?;
+    let bin = overrides.command.clone().unwrap_or_else(|| default_bin.to_owned());
+    let args = match &overrides.args {
+        Some(a) => a.clone(),
+        None    => default_args.iter().map(|s| (*s).to_owned()).collect(),
+    };
+    Some((bin, args))
+}
+
+/// Human-readable command line for the LSP output banner, showing overrides.
+pub fn invocation_string(lang: Lang, overrides: &LspLaunchOverrides) -> Option<String> {
+    let (bin, args) = resolve_command(lang, overrides)?;
+    let mut parts: Vec<String> = overrides.env.iter().map(|(k, v)| format!("{k}={}", crate::ssh::shell_quote(v))).collect();
+    parts.push(crate::ssh::shell_quote(&bin));
+    parts.extend(args.iter().map(|a| crate::ssh::shell_quote(a)));
+    Some(parts.join(" "))
+}
+
 /// Spawn a language server for the given language. Returns None if the binary
 /// is not installed or the language has no configured server.
 ///
@@ -194,21 +307,7 @@ pub fn start_server(
     cwd: Option<&VPath>,
     overrides: &LspLaunchOverrides,
 ) -> Option<LspServer> {
-    let (default_bin, default_args): (&str, &[&str]) = match lang {
-        // rust-analyzer speaks LSP over stdin/stdout by default and *rejects* an
-        // unknown `--stdio` flag ("unexpected flag: `--stdio`"), unlike the
-        // Node-based servers below which require it.
-        Lang::Rust       => ("rust-analyzer", &[]),
-        Lang::TypeScript => ("typescript-language-server", &["--stdio"]),
-        Lang::Python     => ("pylsp", &[]),
-        Lang::None | Lang::Json | Lang::Jsonc | Lang::Markdown | Lang::Css | Lang::Html => return None,
-    };
-    // Apply per-project overrides (`.vscode/local-text.json`); fall back to defaults.
-    let bin: String = overrides.command.clone().unwrap_or_else(|| default_bin.to_owned());
-    let args: Vec<String> = match &overrides.args {
-        Some(a) => a.clone(),
-        None    => default_args.iter().map(|s| (*s).to_owned()).collect(),
-    };
+    let (bin, args) = resolve_command(lang, overrides)?;
 
     let mut child = if let Some(ref host) = ssh_host {
         let remote_cwd = cwd.and_then(|p| match p {
@@ -309,16 +408,23 @@ pub fn start_server(
         let _ = proxy_out.send_event(UserEvent::LspServerStopped { server_id: opi });
     });
 
-    // stderr reader: raw bytes → TermOutput (preserves ANSI colors from the server)
+    // stderr reader: raw bytes → TermOutput (preserves ANSI colors from the server).
+    // Read byte lines, not `lines()`: a non-UTF-8 line must not be dropped, and a
+    // persistent read error must end the loop rather than spin.
     let proxy_err = proxy;
     thread::spawn(move || {
-        let reader = BufReader::new(stderr);
-        for line in reader.lines().flatten() {
-            let mut bytes = line.into_bytes();
-            bytes.push(b'\n');
+        let mut reader = BufReader::new(stderr);
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            match reader.read_until(b'\n', &mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            if !line.ends_with(b"\n") { line.push(b'\n'); }
             let _ = proxy_err.send_event(UserEvent::TermOutput {
                 pane_id: opi,
-                data:    bytes.into_boxed_slice(),
+                data:    line.clone().into_boxed_slice(),
             });
         }
     });
@@ -326,7 +432,7 @@ pub fn start_server(
     Some(LspServer {
         lang,
         process: child,
-        stdin,
+        writer: LspWriter::spawn(stdin),
         output_pane_id,
         request_id: 0,
         doc_version: HashMap::new(),
@@ -412,8 +518,11 @@ fn server_log_line(v: &serde_json::Value) -> Option<String> {
     }
 }
 
-/// Send textDocument/didOpen.
+/// Send textDocument/didOpen. Before the initialize handshake has completed the
+/// LSP spec forbids document notifications, so nothing is sent (and the document
+/// isn't recorded as open); the caller re-opens every tab once `initialized` is sent.
 pub fn notify_did_open(server: &mut LspServer, path: &VPath, text: &str) {
+    if !server.initialized { return; }
     let lang_id = match server.lang {
         Lang::Rust       => "rust",
         Lang::TypeScript => "typescript",
@@ -430,11 +539,21 @@ pub fn notify_did_open(server: &mut LspServer, path: &VPath, text: &str) {
 
 /// Send textDocument/didChange.
 pub fn notify_did_change(server: &mut LspServer, path: &VPath, text: &str) {
-    let ver = server.doc_version.entry(path.clone()).or_insert(0);
+    if !server.initialized { return; }
+    let Some(ver) = server.doc_version.get_mut(path) else {
+        // Never opened on this server — open it instead.
+        notify_did_open(server, path, text);
+        return;
+    };
     *ver += 1;
     let version = *ver;
     let params = did_change_params(path, text, version);
-    send_notification(server, "textDocument/didChange", params);
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method":  "textDocument/didChange",
+        "params":  params,
+    }).to_string();
+    server.writer.push(Outgoing::DocChange { uri: path.to_lsp_uri(), body });
 }
 
 /// Send the `initialized` notification (after receiving initialize response).
@@ -445,11 +564,11 @@ pub fn send_initialized(server: &mut LspServer) {
 
 /// Send textDocument/didClose and remove the tracked document version.
 pub fn notify_did_close(server: &mut LspServer, path: &VPath) {
+    if server.doc_version.remove(path).is_none() { return; } // never opened
     let params = serde_json::json!({
         "textDocument": { "uri": path.to_lsp_uri() }
     });
     send_notification(server, "textDocument/didClose", params);
-    server.doc_version.remove(path);
 }
 
 pub fn request_definition(srv: &mut LspServer, path: &VPath, line: usize, col: usize) -> u64 {
@@ -471,16 +590,16 @@ pub fn request_references(srv: &mut LspServer, path: &VPath, line: usize, col: u
     id
 }
 
-pub fn request_formatting(srv: &mut LspServer, path: &VPath) -> u64 {
+pub fn request_formatting(srv: &mut LspServer, path: &VPath, generation: u64, save_after: bool) -> u64 {
     let id = send_request(srv, "textDocument/formatting", serde_json::json!({
         "textDocument": { "uri": path.to_lsp_uri() },
         "options": { "tabSize": 4, "insertSpaces": true }
     }));
-    srv.pending.insert(id, PendingKind::Formatting { path: path.clone() });
+    srv.pending.insert(id, PendingKind::Formatting { path: path.clone(), generation, save_after });
     id
 }
 
-pub fn request_organize_imports(srv: &mut LspServer, path: &VPath) -> u64 {
+pub fn request_organize_imports(srv: &mut LspServer, path: &VPath, generation: u64, then_format: bool, save_after: bool) -> u64 {
     let id = send_request(srv, "textDocument/codeAction", serde_json::json!({
         "textDocument": { "uri": path.to_lsp_uri() },
         "range": {
@@ -489,7 +608,7 @@ pub fn request_organize_imports(srv: &mut LspServer, path: &VPath) -> u64 {
         },
         "context": { "only": ["source.organizeImports"], "diagnostics": [] }
     }));
-    srv.pending.insert(id, PendingKind::OrganizeImports { path: path.clone() });
+    srv.pending.insert(id, PendingKind::OrganizeImports { path: path.clone(), generation, then_format, save_after });
     id
 }
 
@@ -594,6 +713,23 @@ mod tests {
         }
         assert_eq!(framed, vec![body]);
         assert_eq!(unframed, vec!["node crashed\n"]);
+    }
+
+    #[test]
+    fn queued_doc_changes_coalesce_but_keep_order_with_requests() {
+        let mut q = OutQueue { items: VecDeque::new(), closed: false };
+        let change = |uri: &str, body: &str| Outgoing::DocChange { uri: uri.into(), body: body.into() };
+        assert!(enqueue(&mut q, change("a", "v1")));
+        assert!(!enqueue(&mut q, change("a", "v2")));      // replaces v1
+        assert!(enqueue(&mut q, change("b", "v1")));       // different doc
+        assert!(enqueue(&mut q, Outgoing::Raw("req".into())));
+        assert!(enqueue(&mut q, change("b", "v2")));       // after a request: appended
+        let bodies: Vec<String> = q.items.iter().map(|o| match o {
+            Outgoing::Raw(b) | Outgoing::DocChange { body: b, .. } => b.clone(),
+        }).collect();
+        assert_eq!(bodies, ["v2", "v1", "req", "v2"]);
+        q.closed = true;
+        assert!(!enqueue(&mut q, Outgoing::Raw("late".into())));
     }
 
     #[test]

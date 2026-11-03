@@ -1,8 +1,17 @@
 // Collaborative editing — end-to-end encrypted real-time co-editing.
 //
-// Algorithm: Central-server Operational Transformation (Jupiter variant).
-// The host is the total-order authority; all ops are sequenced through it.
-// No CRDT library is needed because the host provides total ordering.
+// Algorithm: server-ordered operational transformation (the ot.js / Jupiter
+// scheme). The host is the server: it owns every shared document, assigns each
+// applied operation a revision number, and transforms an incoming operation
+// against everything applied since the revision the guest based it on. A guest
+// has at most one operation in flight per document; further local edits are
+// composed into a buffer until the host acknowledges it. `TextOperation`
+// (retain / insert / delete spans covering the whole document) gives `compose`
+// and `transform` that provably converge, unlike position-pair transforms.
+//
+// Documents are identified by their workspace-relative path ("src/main.rs") on
+// both sides; the host maps that to its file, a guest to a tab with
+// `collab_path` set.
 //
 // Encryption: XChaCha20-Poly1305 with a pre-shared session key (PSK).
 // The host generates a random 32-byte key and embeds it in the invite string:
@@ -112,14 +121,9 @@ impl RolePermissions {
     }
 }
 
-// ── Terminal info ─────────────────────────────────────────────────────────────
-
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct TermInfo {
-    pub term_id: usize,
-    pub title:   String,
-    pub shared:  bool,
-}
+use std::collections::{HashSet, VecDeque};
+use std::net::Shutdown;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 // ── Peer colours (assigned round-robin by host) ───────────────────────────────
 const PEER_COLORS: &[u32] = &[
@@ -133,12 +137,231 @@ const PEER_COLORS: &[u32] = &[
     0xF72585, // pink
 ];
 
-// ── Text operation primitives ──────────────────────────────────────────────────
+// ── TextOperation (port of ot.js) ─────────────────────────────────────────────
+//
+// An operation walks the whole document: Retain(n) keeps n chars, Insert(s)
+// inserts s, Delete(n) removes n chars. `base_len` is the document length (in
+// chars — Unicode scalar values, the same unit as ropey) it applies to, and
+// `target_len` the length afterwards. Normal form: adjacent components of the
+// same kind are merged and an insert always precedes an adjacent delete.
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub enum TextOp {
-    Insert { pos: usize, text: String, site_id: u64 },
-    Delete { pos: usize, len: usize },
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum Comp {
+    R(usize),
+    I(String),
+    D(usize),
+}
+
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TextOperation {
+    pub ops: Vec<Comp>,
+    pub base_len: usize,
+    pub target_len: usize,
+}
+
+fn char_len(s: &str) -> usize { s.chars().count() }
+
+/// Split `s` after `n` chars.
+fn split_at_char(s: &str, n: usize) -> (&str, &str) {
+    match s.char_indices().nth(n) {
+        Some((b, _)) => s.split_at(b),
+        None => (s, ""),
+    }
+}
+
+impl TextOperation {
+    pub fn new() -> Self { Self::default() }
+
+    pub fn retain(&mut self, n: usize) -> &mut Self {
+        if n == 0 { return self; }
+        self.base_len += n;
+        self.target_len += n;
+        if let Some(Comp::R(last)) = self.ops.last_mut() { *last += n; } else { self.ops.push(Comp::R(n)); }
+        self
+    }
+
+    pub fn insert(&mut self, s: &str) -> &mut Self {
+        if s.is_empty() { return self; }
+        self.target_len += char_len(s);
+        let len = self.ops.len();
+        match self.ops.last_mut() {
+            Some(Comp::I(last)) => last.push_str(s),
+            Some(Comp::D(_)) => {
+                // Keep inserts before deletes: merge into a preceding insert or put
+                // the insert in front of the delete.
+                if len >= 2 {
+                    if let Comp::I(prev) = &mut self.ops[len - 2] {
+                        prev.push_str(s);
+                        return self;
+                    }
+                }
+                self.ops.insert(len - 1, Comp::I(s.to_owned()));
+            }
+            _ => self.ops.push(Comp::I(s.to_owned())),
+        }
+        self
+    }
+
+    pub fn delete(&mut self, n: usize) -> &mut Self {
+        if n == 0 { return self; }
+        self.base_len += n;
+        if let Some(Comp::D(last)) = self.ops.last_mut() { *last += n; } else { self.ops.push(Comp::D(n)); }
+        self
+    }
+
+    pub fn is_noop(&self) -> bool {
+        self.ops.iter().all(|c| matches!(c, Comp::R(_)))
+    }
+
+    /// The operation turning a document of `base_len` chars into one where
+    /// `deleted` chars at `prefix` were replaced by `inserted` (`suffix` chars kept
+    /// after the change). This is what a local edit looks like after diffing.
+    pub fn from_change(prefix: usize, deleted: usize, inserted: &str, suffix: usize) -> Self {
+        let mut op = TextOperation::new();
+        op.retain(prefix).insert(inserted).delete(deleted).retain(suffix);
+        op
+    }
+
+    /// Apply to a rope. Fails (leaving the rope unchanged) if the lengths don't match.
+    pub fn apply(&self, rope: &mut Rope) -> Result<(), String> {
+        if rope.len_chars() != self.base_len {
+            return Err(format!("operation base length {} != document length {}", self.base_len, rope.len_chars()));
+        }
+        let mut pos = 0;
+        for c in &self.ops {
+            match c {
+                Comp::R(n) => pos += n,
+                Comp::I(s) => { rope.insert(pos, s); pos += char_len(s); }
+                Comp::D(n) => rope.remove(pos..pos + n),
+            }
+        }
+        Ok(())
+    }
+
+    /// `self` followed by `b`, as one operation.
+    pub fn compose(&self, b: &TextOperation) -> Result<TextOperation, String> {
+        if self.target_len != b.base_len {
+            return Err("compose: length mismatch".to_owned());
+        }
+        let mut out = TextOperation::new();
+        let mut i1 = self.ops.iter().cloned();
+        let mut i2 = b.ops.iter().cloned();
+        let (mut op1, mut op2) = (i1.next(), i2.next());
+        loop {
+            match (op1.take(), op2.take()) {
+                (None, None) => break,
+                (Some(Comp::D(n)), o2) => { out.delete(n); op1 = i1.next(); op2 = o2; }
+                (o1, Some(Comp::I(s))) => { out.insert(&s); op1 = o1; op2 = i2.next(); }
+                (None, _) => return Err("compose: first operation too short".to_owned()),
+                (_, None) => return Err("compose: first operation too long".to_owned()),
+                (Some(Comp::R(a)), Some(Comp::R(b2))) => {
+                    let m = a.min(b2);
+                    out.retain(m);
+                    op1 = if a > m { Some(Comp::R(a - m)) } else { i1.next() };
+                    op2 = if b2 > m { Some(Comp::R(b2 - m)) } else { i2.next() };
+                }
+                (Some(Comp::I(s)), Some(Comp::D(d))) => {
+                    let l = char_len(&s);
+                    let m = l.min(d);
+                    op1 = if l > m { Some(Comp::I(split_at_char(&s, m).1.to_owned())) } else { i1.next() };
+                    op2 = if d > m { Some(Comp::D(d - m)) } else { i2.next() };
+                }
+                (Some(Comp::I(s)), Some(Comp::R(r))) => {
+                    let l = char_len(&s);
+                    let m = l.min(r);
+                    let (head, tail) = split_at_char(&s, m);
+                    out.insert(head);
+                    op1 = if l > m { Some(Comp::I(tail.to_owned())) } else { i1.next() };
+                    op2 = if r > m { Some(Comp::R(r - m)) } else { i2.next() };
+                }
+                (Some(Comp::R(r)), Some(Comp::D(d))) => {
+                    let m = r.min(d);
+                    out.delete(m);
+                    op1 = if r > m { Some(Comp::R(r - m)) } else { i1.next() };
+                    op2 = if d > m { Some(Comp::D(d - m)) } else { i2.next() };
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Transform two concurrent operations `a` and `b` (same base). Returns
+    /// `(a', b')` such that `apply(apply(doc, a), b') == apply(apply(doc, b), a')`.
+    /// When both insert at the same position, `a`'s text comes first; the server
+    /// and clients always pass the guest's own operation as `a`.
+    pub fn transform(a: &TextOperation, b: &TextOperation) -> Result<(TextOperation, TextOperation), String> {
+        if a.base_len != b.base_len {
+            return Err("transform: base length mismatch".to_owned());
+        }
+        let (mut ap, mut bp) = (TextOperation::new(), TextOperation::new());
+        let mut i1 = a.ops.iter().cloned();
+        let mut i2 = b.ops.iter().cloned();
+        let (mut op1, mut op2) = (i1.next(), i2.next());
+        loop {
+            match (op1.take(), op2.take()) {
+                (None, None) => break,
+                (Some(Comp::I(s)), o2) => {
+                    bp.retain(char_len(&s));
+                    ap.insert(&s);
+                    op1 = i1.next();
+                    op2 = o2;
+                }
+                (o1, Some(Comp::I(s))) => {
+                    ap.retain(char_len(&s));
+                    bp.insert(&s);
+                    op1 = o1;
+                    op2 = i2.next();
+                }
+                (None, _) => return Err("transform: first operation too short".to_owned()),
+                (_, None) => return Err("transform: first operation too long".to_owned()),
+                (Some(Comp::R(x)), Some(Comp::R(y))) => {
+                    let m = x.min(y);
+                    ap.retain(m);
+                    bp.retain(m);
+                    op1 = if x > m { Some(Comp::R(x - m)) } else { i1.next() };
+                    op2 = if y > m { Some(Comp::R(y - m)) } else { i2.next() };
+                }
+                (Some(Comp::D(x)), Some(Comp::D(y))) => {
+                    // Both deleted the same text: nothing left to do for either.
+                    let m = x.min(y);
+                    op1 = if x > m { Some(Comp::D(x - m)) } else { i1.next() };
+                    op2 = if y > m { Some(Comp::D(y - m)) } else { i2.next() };
+                }
+                (Some(Comp::D(x)), Some(Comp::R(y))) => {
+                    let m = x.min(y);
+                    ap.delete(m);
+                    op1 = if x > m { Some(Comp::D(x - m)) } else { i1.next() };
+                    op2 = if y > m { Some(Comp::R(y - m)) } else { i2.next() };
+                }
+                (Some(Comp::R(x)), Some(Comp::D(y))) => {
+                    let m = x.min(y);
+                    bp.delete(m);
+                    op1 = if x > m { Some(Comp::R(x - m)) } else { i1.next() };
+                    op2 = if y > m { Some(Comp::D(y - m)) } else { i2.next() };
+                }
+            }
+        }
+        Ok((ap, bp))
+    }
+
+    /// Where a cursor at `index` ends up after this operation (text inserted at
+    /// the cursor pushes it right; a deleted range collapses it to the start).
+    pub fn transform_index(&self, index: usize) -> usize {
+        let mut remaining = index as isize;
+        let mut new_index = index as isize;
+        for c in &self.ops {
+            match c {
+                Comp::R(n) => remaining -= *n as isize,
+                Comp::I(s) => new_index += char_len(s) as isize,
+                Comp::D(n) => {
+                    new_index -= remaining.min(*n as isize).max(0);
+                    remaining -= *n as isize;
+                }
+            }
+            if remaining < 0 { break; }
+        }
+        new_index.max(0) as usize
+    }
 }
 
 // ── Remote cursor position ─────────────────────────────────────────────────────
@@ -167,6 +390,14 @@ impl Default for PeerRole {
     fn default() -> Self { PeerRole::Viewer }
 }
 
+/// A document's full contents at a revision.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct DocSnapshot {
+    pub path:    String,
+    pub content: String,
+    pub rev:     u64,
+}
+
 // ── Wire messages ─────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -175,29 +406,24 @@ pub enum CollabMsg {
     // Guest → Host
     Join { peer_name: String },
 
-    // Host → Guest (initial sync — includes role config and filtered file list)
+    // Host → Guest (initial sync). `doc` is the host's current document, if the
+    // guest's role may see it; the file list follows separately (`FileList`).
     Welcome {
         your_site_id: u64,
-        doc_text:     String,
-        server_clock: u64,
         peers:        Vec<PeerInfo>,
         role:         PeerRole,
         role_perms:   RolePermissions,
-        file_list:    Vec<String>,
+        doc:          Option<DocSnapshot>,
     },
 
-    // Client → Host → all others (host also applies to itself)
-    Op {
-        site_id: u64,
-        clock:   u64,
-        ops:     Vec<TextOp>,
-        path:    String,
-    },
+    /// Guest → Host: a local edit, based on host revision `base_rev` of `path`.
+    Op { path: String, base_rev: u64, op: TextOperation },
+    /// Host → Guest: an edit applied by the host as revision `rev`.
+    RemoteOp { path: String, rev: u64, site_id: u64, op: TextOperation },
+    /// Host → the guest whose `Op` became revision `rev`.
+    Ack { path: String, rev: u64 },
 
-    // Host → sending client
-    Ack { clock: u64, path: String },
-
-    // Cursor broadcast with file context (either direction via host)
+    // Cursor broadcast (relayed by the host). `site_id` is filled in by the host.
     CursorUpdate { site_id: u64, cursors: Vec<RemoteCursorPos>, path: String },
 
     // Host → all
@@ -205,48 +431,78 @@ pub enum CollabMsg {
     PeerLeft      { site_id: u64 },
 
     // File access
-    FileList      { paths: Vec<String> },                // Host → Guest (re-sent on role/glob change)
-    FileRequest   { path: String },                      // Guest → Host
-    FileResponse  { path: String, content: String, server_clock: u64 }, // Host → Guest
-    FileDenied    { path: String },                      // Host → Guest
-    FileSaved     { path: String, content: String },     // Host → all VIEW_FILES peers (on save)
+    FileList      { paths: Vec<String> },          // Host → Guest (re-sent on role/glob change)
+    FileRequest   { path: String },                // Guest → Host
+    FileResponse  { doc: DocSnapshot },            // Host → Guest (also used to resync)
+    FileDenied    { path: String },                // Host → Guest (also: access revoked)
+    FileClosed    { path: String },                // Guest → Host: stop sending this doc
+    FileClosedByHost { path: String },             // Host → Guest: host closed the document
 
     // Role management
     RoleConfig    { perms: RolePermissions },            // Host → all (config changed)
     PeerRoleChanged { site_id: u64, role: PeerRole },   // Host → all
     RoleChangeRequest { target_site_id: u64, new_role: PeerRole }, // Moderator → Host
 
-    // Terminal sharing
-    TerminalList  { terms: Vec<TermInfo> },              // Host → VIEW_TERMINALS peers
-    TerminalOutput{ term_id: usize, data: Vec<u8> },     // Host → VIEW_TERMINALS peers
-    TerminalInput { term_id: usize, data: Vec<u8> },     // Guest → Host (OPEN_TERMINALS required)
-    TerminalOpen  { },                                   // Guest → Host (request new shell)
-    TerminalOpened{ term_id: usize },                    // Host → requesting guest
-
     Error { message: String },
 }
 
-// ── In-flight ops (guest side) ────────────────────────────────────────────────
+// ── Per-document OT state ─────────────────────────────────────────────────────
 
-#[derive(Clone)]
-pub struct InflightOp {
-    pub clock: u64,
-    pub ops:   Vec<TextOp>,
+/// Guest side of one shared document.
+#[derive(Default)]
+pub struct ClientDoc {
+    /// Last host revision incorporated.
+    pub rev:      u64,
+    /// Sent to the host, not yet acknowledged.
+    pub awaiting: Option<TextOperation>,
+    /// Local edits made while `awaiting` is outstanding (composed together).
+    pub buffer:   Option<TextOperation>,
+}
+
+/// Host side of one shared document: the revision counter and recent history.
+#[derive(Default)]
+pub struct ServerDoc {
+    pub rev:       u64,
+    history:       VecDeque<TextOperation>,
+    history_start: u64, // revision of history[0]'s base
+}
+
+const MAX_HISTORY: usize = 5000;
+
+impl ServerDoc {
+    fn record(&mut self, op: TextOperation) -> u64 {
+        self.history.push_back(op);
+        self.rev += 1;
+        while self.history.len() > MAX_HISTORY {
+            self.history.pop_front();
+            self.history_start += 1;
+        }
+        self.rev
+    }
+
+    /// Rebase a guest operation made against `base_rev` onto the current revision.
+    /// None if `base_rev` is unknown (too old or in the future) — resync needed.
+    pub fn rebase(&self, base_rev: u64, mut op: TextOperation) -> Option<TextOperation> {
+        if base_rev < self.history_start || base_rev > self.rev { return None; }
+        let skip = (base_rev - self.history_start) as usize;
+        for concurrent in self.history.iter().skip(skip) {
+            op = TextOperation::transform(&op, concurrent).ok()?.0;
+        }
+        Some(op)
+    }
 }
 
 // ── Session state ─────────────────────────────────────────────────────────────
+
+type GuestTxs = Arc<Mutex<HashMap<u64, mpsc::SyncSender<Vec<u8>>>>>;
 
 pub struct CollabSession {
     pub site_id:          u64,
     pub role:             CollabRole,
     pub peers:            Vec<PeerInfo>,
-    /// In-flight ops per file path (guest only; host acks immediately).
-    pub inflight:         HashMap<String, Vec<InflightOp>>,
-    pub local_clock:      u64,
-    pub server_clock:     u64,
-    /// Remote cursor positions, keyed by site_id.  Value includes path.
+    /// Remote cursor positions, keyed by site_id: (workspace-relative path, cursors).
     pub remote_cursors:   HashMap<u64, (String, Vec<RemoteCursorPos>)>,
-    pub send_tx:          mpsc::Sender<Vec<u8>>,
+    /// Host only: absolute path of the document that was active when hosting started.
     pub doc_path:         String,
     pub session_key:      [u8; 32],
     pub last_cursor_sent: Instant,
@@ -258,50 +514,33 @@ pub struct CollabSession {
     pub include_globs:    Vec<String>,
     /// Exclude globs (blacklist).
     pub exclude_globs:    Vec<String>,
+    /// Guest: OT state per open shared document.
+    pub client_docs:      HashMap<String, ClientDoc>,
+    /// Host: OT state per document any guest has open.
+    pub server_docs:      HashMap<String, ServerDoc>,
+    /// Host: which documents each guest has open (only they get its edits/cursors).
+    pub open_docs:        HashMap<u64, HashSet<String>>,
 }
 
 pub enum CollabRole {
     Host {
-        guest_txs:    Arc<Mutex<HashMap<u64, mpsc::Sender<Vec<u8>>>>>,
-        next_site_id: u64,
-        port:         u16,
-        invite_str:   String,
+        guest_txs:  GuestTxs,
+        port:       u16,
+        invite_str: String,
     },
-    Guest,
+    Guest {
+        to_host: mpsc::Sender<Vec<u8>>,
+    },
 }
 
 impl CollabSession {
-    /// Enqueue a local op for `path`: add to per-path inflight and send to server.
-    pub fn send_local_op(&mut self, path: String, ops: Vec<TextOp>) {
-        self.local_clock += 1;
-        let clock = self.local_clock;
-        let msg = CollabMsg::Op {
-            site_id: self.site_id,
-            clock,
-            ops:     ops.clone(),
-            path:    path.clone(),
-        };
-        self.inflight.entry(path).or_default().push(InflightOp { clock, ops });
-        if let Ok(frame) = encrypt_msg(&self.session_key, &msg) {
-            let _ = self.send_tx.send(frame);
-        }
-    }
-
-    /// Send a cursor update with file context (debounced by caller).
-    pub fn send_cursor_update(&mut self, path: String, cursors: Vec<RemoteCursorPos>) {
-        let msg = CollabMsg::CursorUpdate { site_id: self.site_id, cursors, path };
-        if let Ok(frame) = encrypt_msg(&self.session_key, &msg) {
-            let _ = self.send_tx.send(frame);
-        }
-        self.last_cursor_sent = Instant::now();
-    }
+    pub fn is_host(&self) -> bool { matches!(self.role, CollabRole::Host { .. }) }
 
     pub fn cursor_debounce_elapsed(&self) -> bool {
         self.last_cursor_sent.elapsed() >= Duration::from_millis(50)
     }
 
-    /// Return the effective permission bits for a peer by site_id.
-    /// Returns `perms::ALL` for the host (site 0).
+    /// Effective permission bits for a peer by site_id (host = site 0 = everything).
     pub fn peer_perms(&self, site_id: u64) -> u16 {
         if site_id == 0 { return perms::ALL; }
         match self.peers.iter().find(|p| p.site_id == site_id) {
@@ -310,7 +549,11 @@ impl CollabSession {
         }
     }
 
-    /// Return this session's own permission bits.
+    pub fn peer_role(&self, site_id: u64) -> Option<PeerRole> {
+        self.peers.iter().find(|p| p.site_id == site_id).map(|p| p.role)
+    }
+
+    /// This session's own permission bits.
     pub fn my_perms(&self) -> u16 {
         match self.my_role {
             None       => perms::ALL,
@@ -318,50 +561,148 @@ impl CollabSession {
         }
     }
 
-    /// Send a message directly to a specific guest (host only) or to the host (guest).
+    /// Host: may `site_id` see `path`? (role, hidden files, include/exclude globs)
+    pub fn guest_may_view(&self, site_id: u64, path: &str) -> bool {
+        match self.peer_role(site_id) {
+            Some(role) => is_safe_rel_path(path)
+                && guest_can_view(path, role, &self.role_perms, &self.include_globs, &self.exclude_globs),
+            None => false,
+        }
+    }
+
+    /// Host: may `site_id` edit `path`?
+    pub fn guest_may_write(&self, site_id: u64, path: &str) -> bool {
+        self.guest_may_view(site_id, path)
+            && self.peer_role(site_id).map_or(false, |role| guest_can_write(path, role, &self.role_perms))
+    }
+
+    /// Send to one guest (host) or to the host (guest). A guest whose queue is
+    /// full (not reading) is disconnected rather than buffered without bound.
     pub fn send_to_site(&self, site_id: u64, msg: &CollabMsg) {
-        if let Ok(frame) = encrypt_msg(&self.session_key, msg) {
-            match &self.role {
-                CollabRole::Host { guest_txs, .. } => {
-                    if let Some(tx) = lock_recover(guest_txs).get(&site_id) {
-                        let _ = tx.send(frame);
-                    }
+        let Ok(frame) = encrypt_msg(&self.session_key, msg) else { return };
+        match &self.role {
+            CollabRole::Host { guest_txs, .. } => {
+                let mut map = lock_recover(guest_txs);
+                if let Some(tx) = map.get(&site_id) {
+                    if tx.try_send(frame).is_err() { map.remove(&site_id); }
                 }
-                CollabRole::Guest => {
-                    let _ = self.send_tx.send(frame);
-                }
+            }
+            CollabRole::Guest { to_host } => { let _ = to_host.send(frame); }
+        }
+    }
+
+    /// Host: send to every guest (except one) for which `filter` holds.
+    pub fn broadcast_where(&self, except: Option<u64>, msg: &CollabMsg, filter: impl Fn(u64) -> bool) {
+        let CollabRole::Host { guest_txs, .. } = &self.role else { return };
+        let Ok(frame) = encrypt_msg(&self.session_key, msg) else { return };
+        let mut map = lock_recover(guest_txs);
+        let targets: Vec<u64> = map.keys().copied().filter(|&sid| Some(sid) != except && filter(sid)).collect();
+        for sid in targets {
+            if let Some(tx) = map.get(&sid) {
+                if tx.try_send(frame.clone()).is_err() { map.remove(&sid); }
             }
         }
     }
 
-    /// Broadcast a message to all guests except one (host only).
-    /// As a guest, sends to the host (ignores except_site_id).
-    pub fn broadcast_except_msg(&self, except_site_id: Option<u64>, msg: &CollabMsg) {
-        if let Ok(frame) = encrypt_msg(&self.session_key, msg) {
-            match &self.role {
-                CollabRole::Host { guest_txs, .. } => {
-                    broadcast_to_guests(guest_txs, except_site_id, frame);
-                }
-                CollabRole::Guest => {
-                    let _ = self.send_tx.send(frame);
-                }
-            }
-        }
+    /// Host: send to every guest (except one).
+    pub fn broadcast_except_msg(&self, except: Option<u64>, msg: &CollabMsg) {
+        self.broadcast_where(except, msg, |_| true);
+    }
+
+    /// Host: guests that currently have `path` open (and may still see it).
+    pub fn guests_with_doc(&self, path: &str) -> Vec<u64> {
+        self.open_docs.iter()
+            .filter(|(sid, docs)| docs.contains(path) && self.guest_may_view(**sid, path))
+            .map(|(&sid, _)| sid)
+            .collect()
     }
 
     /// Invite string (host only; empty string for guests).
     pub fn invite_str(&self) -> &str {
         match &self.role {
             CollabRole::Host { invite_str, .. } => invite_str,
-            CollabRole::Guest => "",
+            CollabRole::Guest { .. } => "",
         }
     }
 
     /// Number of connected peers (not counting self).
     pub fn peer_count(&self) -> usize { self.peers.len() }
+
+    // ── Guest-side OT ────────────────────────────────────────────────────────
+
+    /// Guest: record a local edit to `path` and send it unless one is in flight.
+    pub fn client_local_edit(&mut self, path: &str, op: TextOperation) {
+        if op.is_noop() { return; }
+        let Some(doc) = self.client_docs.get_mut(path) else { return };
+        if doc.awaiting.is_none() {
+            let msg = CollabMsg::Op { path: path.to_owned(), base_rev: doc.rev, op: op.clone() };
+            doc.awaiting = Some(op);
+            self.send_to_site(0, &msg);
+        } else {
+            doc.buffer = Some(match doc.buffer.take() {
+                Some(b) => match b.compose(&op) {
+                    Ok(c) => c,
+                    Err(_) => return,
+                },
+                None => op,
+            });
+        }
+    }
+
+    /// Guest: the host applied our in-flight operation as `rev`.
+    pub fn client_ack(&mut self, path: &str, rev: u64) {
+        let Some(doc) = self.client_docs.get_mut(path) else { return };
+        doc.rev = rev;
+        doc.awaiting = doc.buffer.take();
+        if let Some(next) = doc.awaiting.clone() {
+            let msg = CollabMsg::Op { path: path.to_owned(), base_rev: rev, op: next };
+            self.send_to_site(0, &msg);
+        }
+    }
+
+    /// Guest: an operation from the host (revision `rev`). Returns it rebased onto
+    /// our pending local edits — the version to apply to the local buffer.
+    pub fn client_remote_op(&mut self, path: &str, rev: u64, op: TextOperation) -> Option<TextOperation> {
+        let doc = self.client_docs.get_mut(path)?;
+        let mut op = op;
+        if let Some(awaiting) = doc.awaiting.take() {
+            let (a2, o2) = TextOperation::transform(&awaiting, &op).ok()?;
+            doc.awaiting = Some(a2);
+            op = o2;
+        }
+        if let Some(buffer) = doc.buffer.take() {
+            let (b2, o3) = TextOperation::transform(&buffer, &op).ok()?;
+            doc.buffer = Some(b2);
+            op = o3;
+        }
+        doc.rev = rev;
+        Some(op)
+    }
+
+    // ── Host-side OT ─────────────────────────────────────────────────────────
+
+    /// Host: a local edit of the host's own copy of `path`; broadcast it.
+    pub fn host_local_edit(&mut self, path: &str, op: TextOperation) {
+        if op.is_noop() { return; }
+        let Some(doc) = self.server_docs.get_mut(path) else { return }; // nobody shares it
+        let rev = doc.record(op.clone());
+        let targets = self.guests_with_doc(path);
+        let msg = CollabMsg::RemoteOp { path: path.to_owned(), rev, site_id: 0, op };
+        self.broadcast_where(None, &msg, |sid| targets.contains(&sid));
+    }
+
+    /// Host: accept a guest operation already rebased and applied; record and fan out.
+    pub fn host_commit_guest_op(&mut self, from_site_id: u64, path: &str, op: TextOperation) {
+        let Some(doc) = self.server_docs.get_mut(path) else { return };
+        let rev = doc.record(op.clone());
+        let targets = self.guests_with_doc(path);
+        let msg = CollabMsg::RemoteOp { path: path.to_owned(), rev, site_id: from_site_id, op };
+        self.broadcast_where(Some(from_site_id), &msg, |sid| targets.contains(&sid));
+        self.send_to_site(from_site_id, &CollabMsg::Ack { path: path.to_owned(), rev });
+    }
 }
 
-// ── Host: fan-out broadcast ───────────────────────────────────────────────────
+// ── Host: fan-out helpers ─────────────────────────────────────────────────────
 
 /// Lock a mutex, recovering from poisoning instead of cascading the panic. If one collab
 /// thread panics while holding `guest_txs`, the lock is poisoned and every other thread
@@ -370,18 +711,6 @@ impl CollabSession {
 /// across a panic — recovering the guard is safe.
 fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-fn broadcast_to_guests(
-    guest_txs: &Arc<Mutex<HashMap<u64, mpsc::Sender<Vec<u8>>>>>,
-    except_site_id: Option<u64>,
-    frame: Vec<u8>,
-) {
-    let map = lock_recover(guest_txs);
-    for (&sid, tx) in map.iter() {
-        if except_site_id == Some(sid) { continue; }
-        let _ = tx.send(frame.clone());
-    }
 }
 
 // ── Encryption / decryption ───────────────────────────────────────────────────
@@ -408,7 +737,7 @@ pub fn encrypt_msg(key: &[u8; 32], msg: &CollabMsg) -> std::io::Result<Vec<u8>> 
     let json = serde_json::to_vec(msg)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let pad_size = match msg {
-        CollabMsg::Op { .. } => PAD_OP_SIZE,
+        CollabMsg::Op { .. } | CollabMsg::RemoteOp { .. } => PAD_OP_SIZE,
         _                   => PAD_CONTROL_SIZE,
     };
     let padded = pad_to(&json, pad_size);
@@ -416,7 +745,7 @@ pub fn encrypt_msg(key: &[u8; 32], msg: &CollabMsg) -> std::io::Result<Vec<u8>> 
     let cipher = XChaCha20Poly1305::new(key.into());
     let nonce  = XChaCha20Poly1305::generate_nonce(&mut OsRng);  // 24 bytes
     let ct     = cipher.encrypt(&nonce, padded.as_ref())
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "encrypt error"))?;
+        .map_err(|_| std::io::Error::other("encrypt error"))?;
 
     // Frame: [4-byte len][24-byte nonce][ciphertext+tag]
     let frame_body_len = nonce.len() + ct.len();
@@ -446,11 +775,17 @@ pub fn decrypt_frame(key: &[u8; 32], frame: &[u8]) -> Result<CollabMsg, String> 
 
 // ── Frame I/O ─────────────────────────────────────────────────────────────────
 
-pub fn read_frame(stream: &mut impl Read) -> std::io::Result<Vec<u8>> {
+/// Frame cap once a connection has authenticated (a document can be large).
+const MAX_FRAME: usize = 64 * 1024 * 1024;
+/// Frame cap before a valid `Join`: an unauthenticated client must not be able to
+/// make the host allocate 64 MiB per connection.
+const MAX_PREAUTH_FRAME: usize = 64 * 1024;
+
+pub fn read_frame(stream: &mut impl Read, max_len: usize) -> std::io::Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf)?;
     let len = u32::from_be_bytes(len_buf) as usize;
-    if len > 64 * 1024 * 1024 { // 64 MiB sanity cap
+    if len > max_len {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "frame too large"));
     }
     let mut buf = vec![0u8; len];
@@ -463,189 +798,13 @@ pub fn write_frame(stream: &mut impl Write, frame: &[u8]) -> std::io::Result<()>
     stream.flush()
 }
 
-// ── Operational Transformation ────────────────────────────────────────────────
-
-/// Transform Insert A against Insert B. Returns new position for A.
-fn xform_ii(a_pos: usize, _a_len: usize, a_site: u64, b_pos: usize, b_len: usize, b_site: u64) -> usize {
-    if b_pos < a_pos { a_pos + b_len }
-    else if b_pos > a_pos { a_pos }
-    else if b_site < a_site { a_pos + b_len }
-    else { a_pos }
-}
-
-/// Transform Insert against Delete. Returns new position for the Insert.
-fn xform_id(ins_pos: usize, del_pos: usize, del_len: usize) -> usize {
-    if ins_pos <= del_pos { ins_pos }
-    else if ins_pos >= del_pos + del_len { ins_pos - del_len }
-    else { del_pos }
-}
-
-/// Transform Delete against Insert. Returns new (pos, len) for the Delete.
-fn xform_di(del_pos: usize, del_len: usize, ins_pos: usize, ins_len: usize) -> (usize, usize) {
-    if ins_pos <= del_pos { (del_pos + ins_len, del_len) }
-    else if ins_pos >= del_pos + del_len { (del_pos, del_len) }
-    else { (del_pos, del_len + ins_len) }
-}
-
-/// Transform Delete against Delete. Returns None if A is fully consumed by B.
-fn xform_dd(a_pos: usize, a_len: usize, b_pos: usize, b_len: usize) -> Option<(usize, usize)> {
-    let a_left  = b_pos.saturating_sub(a_pos);
-    let a_right = (a_pos + a_len).saturating_sub(b_pos + b_len);
-    if a_left + a_right == 0 { return None; }
-    let new_pos = a_pos.min(b_pos);
-    Some((new_pos, a_left + a_right))
-}
-
-/// Transform a single op A against a single op B (B has already been applied).
-fn xform_op(a: TextOp, b: &TextOp) -> Option<TextOp> {
-    match (a, b) {
-        (TextOp::Insert { pos: ap, text: at, site_id: asid },
-         TextOp::Insert { pos: bp, text: bt, site_id: bsid }) => {
-            let new_pos = xform_ii(ap, at.chars().count(), asid, *bp, bt.chars().count(), *bsid);
-            Some(TextOp::Insert { pos: new_pos, text: at, site_id: asid })
-        }
-        (TextOp::Insert { pos: ap, text: at, site_id: asid },
-         TextOp::Delete { pos: dp, len: dl }) => {
-            let new_pos = xform_id(ap, *dp, *dl);
-            Some(TextOp::Insert { pos: new_pos, text: at, site_id: asid })
-        }
-        (TextOp::Delete { pos: dp, len: dl },
-         TextOp::Insert { pos: ip, text: it, site_id: _ }) => {
-            let (np, nl) = xform_di(dp, dl, *ip, it.chars().count());
-            Some(TextOp::Delete { pos: np, len: nl })
-        }
-        (TextOp::Delete { pos: ap, len: al },
-         TextOp::Delete { pos: bp, len: bl }) => {
-            xform_dd(ap, al, *bp, *bl).map(|(p, l)| TextOp::Delete { pos: p, len: l })
-        }
-    }
-}
-
-/// Transform a compound op A (Vec<TextOp>) against a single op B.
-/// Updates A in place; returns the mirrored transformation of B against A.
-fn xform_compound_against_op(a_ops: &mut Vec<TextOp>, b: TextOp) -> Option<TextOp> {
-    let mut b_current = Some(b);
-    for a_op in a_ops.iter_mut() {
-        if let Some(b_op) = b_current.take() {
-            let new_a = xform_op(a_op.clone(), &b_op);
-            let new_b = xform_op(b_op, a_op);
-            if let Some(na) = new_a { *a_op = na; }
-            b_current = new_b;
-        }
-    }
-    b_current
-}
-
-/// Transform remote_ops against inflight_ops in place.
-/// On return: remote_ops has been rebased on top of inflight_ops,
-/// and inflight_ops has been rebased on top of (the original) remote_ops.
-pub fn integrate_remote_against_inflight(remote_ops: &mut Vec<TextOp>, inflight: &mut Vec<InflightOp>) {
-    for inflight_op in inflight.iter_mut() {
-        let mut new_remote = Vec::with_capacity(remote_ops.len());
-        for r_op in remote_ops.drain(..) {
-            let r_transformed = xform_compound_against_op(&mut inflight_op.ops, r_op);
-            if let Some(t) = r_transformed { new_remote.push(t); }
-        }
-        *remote_ops = new_remote;
-    }
-}
-
-// ── Cursor adjustment ─────────────────────────────────────────────────────────
-//
-// Rust equivalent of `adjustOffset()` from multi-user-editor/Editor.tsx.
-// In local-text cursor positions are usize char offsets into the Rope —
-// much simpler than the DOM positions that required heavy iteration in the
-// browser-based project.
-
-pub fn adjust_cursor_pos(cursor_pos: usize, op: &TextOp, local_site_id: u64) -> usize {
-    match op {
-        TextOp::Insert { pos, text, site_id: remote_sid } => {
-            let len = text.chars().count();
-            if *pos < cursor_pos {
-                cursor_pos + len    // insert before cursor → shift right
-            } else if *pos == cursor_pos && *remote_sid < local_site_id {
-                cursor_pos + len    // same pos, remote wins tiebreak → cursor shifts right
-            } else {
-                cursor_pos          // insert at or after cursor → no change
-            }
-        }
-        TextOp::Delete { pos, len } => {
-            let end = pos + len;
-            if end <= cursor_pos     { cursor_pos - len }   // delete entirely before
-            else if *pos < cursor_pos { *pos }              // cursor inside deleted region → clamp
-            else                     { cursor_pos }         // delete at or after cursor
-        }
-    }
-}
-
-/// Apply a list of ops to adjust a cursor (head, tail) pair.
-pub fn adjust_cursor(head: usize, tail: usize, ops: &[TextOp], local_site_id: u64) -> (usize, usize) {
-    let mut h = head;
-    let mut t = tail;
-    for op in ops {
-        h = adjust_cursor_pos(h, op, local_site_id);
-        t = adjust_cursor_pos(t, op, local_site_id);
-    }
-    (h, t)
-}
-
-// ── Apply ops to a Rope (no undo entry) ──────────────────────────────────────
-
-pub fn apply_ops_to_rope(rope: &mut Rope, ops: &[TextOp]) {
-    for op in ops {
-        match op {
-            TextOp::Insert { pos, text, .. } => {
-                let p = (*pos).min(rope.len_chars());
-                rope.insert(p, text);
-            }
-            TextOp::Delete { pos, len } => {
-                let p   = (*pos).min(rope.len_chars());
-                let end = (p + len).min(rope.len_chars());
-                if p < end { rope.remove(p..end); }
-            }
-        }
-    }
-}
-
-// ── Op extraction from Rope diff ─────────────────────────────────────────────
-//
-// Finds the common prefix and suffix char counts to extract what changed.
-// Produces at most one Delete + one Insert.  This is correct for all editor
-// operations because the existing code processes multi-cursor edits left-to-right
-// with delta tracking, producing one contiguous changed region.
-
-pub fn extract_ops(before: &Rope, after: &Rope, site_id: u64) -> Vec<TextOp> {
-    // Collect to char vecs for simple character comparison.
-    // Edits are small and this runs only when collab is active.
-    let before_chars: Vec<char> = before.chars().collect();
-    let after_chars:  Vec<char> = after.chars().collect();
-
-    let prefix = before_chars.iter().zip(after_chars.iter())
-        .take_while(|(a, b)| a == b).count();
-
-    let max_suffix = before_chars.len().saturating_sub(prefix)
-        .min(after_chars.len().saturating_sub(prefix));
-    let suffix = before_chars[prefix..].iter().rev()
-        .zip(after_chars[prefix..].iter().rev())
-        .take(max_suffix)
-        .take_while(|(a, b)| a == b)
-        .count();
-
-    let deleted = before_chars.len() - prefix - suffix;
-    let inserted: String = after_chars[prefix..after_chars.len() - suffix].iter().collect();
-
-    let mut ops = Vec::new();
-    if deleted > 0 {
-        ops.push(TextOp::Delete { pos: prefix, len: deleted });
-    }
-    if !inserted.is_empty() {
-        // After applying the delete (if any), the insertion position is `prefix`.
-        ops.push(TextOp::Insert { pos: prefix, text: inserted, site_id });
-    }
-    ops
-}
-
 // ── File access control ───────────────────────────────────────────────────────
+
+/// A workspace-relative path made only of normal components (no absolute paths,
+/// `.` or `..`): the only form guests are allowed to name files in.
+pub fn is_safe_rel_path(rel: &str) -> bool {
+    !rel.is_empty() && Path::new(rel).components().all(|c| matches!(c, Component::Normal(_)))
+}
 
 /// Returns true if `path` (relative to workspace root, using `/` separators)
 /// is visible to a peer with the given role and permission config.
@@ -685,7 +844,7 @@ pub fn guest_can_view(
 /// containment so a symlink inside the workspace can't redirect outside it either. Returns
 /// None on escape or if the path can't be resolved (e.g. missing file).
 pub fn resolve_under_root(root: &Path, rel: &str) -> Option<PathBuf> {
-    if Path::new(rel).components().any(|c| !matches!(c, Component::Normal(_))) {
+    if !is_safe_rel_path(rel) {
         return None;
     }
     let canon_root = root.canonicalize().ok()?;
@@ -718,9 +877,12 @@ fn glob_match(pattern: &str, path: &str) -> bool {
                 (0..=s.len()).any(|i| inner(rest, &s[i..]))
             }
             Some(&b'*') => {
-                // `*` matches any sequence not containing `/`
+                // `*` matches any sequence not containing `/`: stop extending at the
+                // first separator (the old check only looked at the last character
+                // consumed, so `*.md` also matched `secret/notes.md`).
                 let rest = &pat[1..];
-                (0..=s.len()).filter(|&i| i == 0 || s[i-1] != b'/').any(|i| inner(rest, &s[i..]))
+                let max = s.iter().position(|&c| c == b'/').unwrap_or(s.len());
+                (0..=max).any(|i| inner(rest, &s[i..]))
             }
             Some(&b'{') => {
                 // `{a,b,c}` — alternation
@@ -747,6 +909,13 @@ fn glob_match(pattern: &str, path: &str) -> bool {
 
 // ── Host session startup ──────────────────────────────────────────────────────
 
+/// Per-guest outgoing queue length. A guest that stops reading fills it and is
+/// disconnected instead of growing the host's memory without bound.
+const GUEST_QUEUE: usize = 4096;
+/// Connections that haven't sent a valid Join yet.
+const MAX_PENDING_CONNECTIONS: usize = 16;
+static PENDING_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
+
 pub fn start_host(
     port:          u16,
     doc_path:      String,
@@ -767,15 +936,11 @@ pub fn start_host(
     let key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(session_key);
     let invite_str = format!("lt-collab://{}:{}#{}", lan_ip, port, key_b64);
 
-    let guest_txs: Arc<Mutex<HashMap<u64, mpsc::Sender<Vec<u8>>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let guest_txs: GuestTxs = Arc::new(Mutex::new(HashMap::new()));
 
     // Bind listener
     let listener = TcpListener::bind(format!("0.0.0.0:{port}"))
         .map_err(|e| format!("Failed to bind port {port}: {e}"))?;
-
-    // Channel for the host to broadcast to all guests.
-    let (host_tx, host_rx) = mpsc::channel::<Vec<u8>>();
 
     // Start accept loop
     let guest_txs_accept  = Arc::clone(&guest_txs);
@@ -785,46 +950,31 @@ pub fn start_host(
         let mut next_site_id: u64 = 1;  // host is site 0
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
+            if PENDING_CONNECTIONS.fetch_add(1, Ordering::AcqRel) >= MAX_PENDING_CONNECTIONS {
+                PENDING_CONNECTIONS.fetch_sub(1, Ordering::AcqRel);
+                let _ = stream.shutdown(Shutdown::Both);
+                continue;
+            }
             let _ = stream.set_nodelay(true);
             let sid       = next_site_id;
             next_site_id += 1;
             let color     = PEER_COLORS[sid as usize % PEER_COLORS.len()];
-
-            let (guest_tx, guest_rx) = mpsc::channel::<Vec<u8>>();
-            lock_recover(&guest_txs_accept).insert(sid, guest_tx);
 
             let proxy2     = proxy_accept.clone();
             let guest_txs2 = Arc::clone(&guest_txs_accept);
             let key2       = session_key_clone;
 
             std::thread::spawn(move || {
-                handle_guest(stream, sid, color, &key2, guest_rx, guest_txs2, proxy2);
+                handle_guest(stream, sid, color, &key2, guest_txs2, proxy2);
             });
-        }
-    });
-
-    // Host's own writer thread (broadcasts to all guests)
-    let guest_txs_writer = Arc::clone(&guest_txs);
-    std::thread::spawn(move || {
-        for frame in host_rx {
-            broadcast_to_guests(&guest_txs_writer, None, frame);
         }
     });
 
     Ok(CollabSession {
         site_id:     0,
-        role:        CollabRole::Host {
-            guest_txs,
-            next_site_id: 1,
-            port,
-            invite_str,
-        },
+        role:        CollabRole::Host { guest_txs, port, invite_str },
         peers:           Vec::new(),
-        inflight:        HashMap::new(),
-        local_clock:     0,
-        server_clock:    0,
         remote_cursors:  HashMap::new(),
-        send_tx:         host_tx,
         doc_path,
         session_key,
         last_cursor_sent: Instant::now(),
@@ -832,68 +982,73 @@ pub fn start_host(
         my_role:        None,
         include_globs,
         exclude_globs,
+        client_docs:    HashMap::new(),
+        server_docs:    HashMap::new(),
+        open_docs:      HashMap::new(),
     })
 }
 
 /// Per-guest connection handler (runs on its own thread).
-/// Waits for Join, notifies main thread, then relays subsequent messages.
+/// Waits (briefly, with small frames only) for a valid encrypted Join before the
+/// connection is registered for any traffic, then relays messages to the main loop.
 fn handle_guest(
     stream:    TcpStream,
     site_id:   u64,
     color:     u32,
     key:       &[u8; 32],
-    rx:        mpsc::Receiver<Vec<u8>>,
-    guest_txs: Arc<Mutex<HashMap<u64, mpsc::Sender<Vec<u8>>>>>,
+    guest_txs: GuestTxs,
     proxy:     EventLoopProxy<UserEvent>,
 ) {
-    let mut reader = stream.try_clone().expect("clone stream");
-    let mut writer = stream;
+    let key = *key;
+    let Ok(mut reader) = stream.try_clone() else {
+        PENDING_CONNECTIONS.fetch_sub(1, Ordering::AcqRel);
+        return;
+    };
+    // ── Authenticate: the first frame must decrypt to a Join ────────────────
+    let _ = reader.set_read_timeout(Some(Duration::from_secs(15)));
+    let join = read_frame(&mut reader, MAX_PREAUTH_FRAME).ok()
+        .and_then(|f| decrypt_frame(&key, &f).ok());
+    PENDING_CONNECTIONS.fetch_sub(1, Ordering::AcqRel);
+    let Some(CollabMsg::Join { peer_name }) = join else {
+        let _ = stream.shutdown(Shutdown::Both);
+        return;
+    };
+    let _ = reader.set_read_timeout(None);
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(20)));
 
-    // Writer thread for this guest
+    // Writer thread for this guest. When it stops (write error or the host
+    // dropped our queue as too slow) the socket is shut down so the reader ends too.
+    let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(GUEST_QUEUE);
+    let mut writer = stream;
     std::thread::spawn(move || {
         for frame in rx {
             if write_frame(&mut writer, &frame).is_err() { break; }
         }
+        let _ = writer.shutdown(Shutdown::Both);
     });
+    lock_recover(&guest_txs).insert(site_id, tx);
 
-    // Read-side: wait for Join, then loop on messages
-    let key = *key;  // copy for this thread
-    loop {
-        let frame = match read_frame(&mut reader) {
-            Ok(f) => f,
-            Err(_) => {
-                // Disconnect: remove from guest map, notify main thread
-                lock_recover(&guest_txs).remove(&site_id);
-                let _ = proxy.send_event(UserEvent::CollabGuestLeft { site_id });
-                return;
+    let peer = PeerInfo {
+        site_id,
+        name: peer_name.chars().take(64).collect(),
+        color,
+        role: PeerRole::Viewer, // placeholder; host assigns real role
+        current_file: String::new(),
+    };
+    let _ = proxy.send_event(UserEvent::CollabGuestJoined { site_id, peer });
+
+    while let Ok(frame) = read_frame(&mut reader, MAX_FRAME) {
+        match decrypt_frame(&key, &frame) {
+            Ok(CollabMsg::Join { .. }) => {} // already joined
+            Ok(msg) => {
+                let _ = proxy.send_event(UserEvent::CollabMessage { from_site_id: site_id, msg });
             }
-        };
-        let msg = match decrypt_frame(&key, &frame) {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("collab: decrypt error from site {site_id}: {e}");
-                continue;
-            }
-        };
-        match msg {
-            CollabMsg::Join { peer_name } => {
-                // Notify main thread with peer info; it will assign a role,
-                // send Welcome, and broadcast PeerJoined.
-                let peer = PeerInfo {
-                    site_id,
-                    name: peer_name,
-                    color,
-                    role: PeerRole::Viewer, // placeholder; host assigns real role
-                    current_file: String::new(),
-                };
-                let _ = proxy.send_event(UserEvent::CollabGuestJoined { site_id, peer });
-            }
-            other => {
-                // Forward all other messages to main thread
-                let _ = proxy.send_event(UserEvent::CollabMessage { from_site_id: site_id, msg: other });
-            }
+            Err(e) => eprintln!("collab: decrypt error from site {site_id}: {e}"),
         }
     }
+    // Disconnect: remove from guest map, notify main thread
+    lock_recover(&guest_txs).remove(&site_id);
+    let _ = proxy.send_event(UserEvent::CollabGuestLeft { site_id });
 }
 
 // ── Guest session startup ─────────────────────────────────────────────────────
@@ -933,7 +1088,10 @@ pub fn connect_guest(
         };
         let _ = stream.set_nodelay(true);
 
-        let mut reader = stream.try_clone().expect("clone");
+        let Ok(mut reader) = stream.try_clone() else {
+            let _ = proxy.send_event(UserEvent::CollabError { msg: "socket error".to_owned() });
+            return;
+        };
         let mut writer = stream;
 
         // Send Join
@@ -952,7 +1110,7 @@ pub fn connect_guest(
 
         // Expect Welcome
         let welcome = loop {
-            let frame = match read_frame(&mut reader) {
+            let frame = match read_frame(&mut reader, MAX_FRAME) {
                 Ok(f) => f,
                 Err(e) => {
                     let _ = proxy.send_event(UserEvent::CollabError { msg: format!("read error: {e}") });
@@ -960,8 +1118,8 @@ pub fn connect_guest(
                 }
             };
             match decrypt_frame(&session_key, &frame) {
-                Ok(CollabMsg::Welcome { your_site_id, doc_text, server_clock, peers, role, role_perms, file_list }) => {
-                    break (your_site_id, doc_text, server_clock, peers, role, role_perms, file_list);
+                Ok(CollabMsg::Welcome { your_site_id, peers, role, role_perms, doc }) => {
+                    break (your_site_id, peers, role, role_perms, doc);
                 }
                 Ok(CollabMsg::Error { message }) => {
                     let _ = proxy.send_event(UserEvent::CollabError { msg: message });
@@ -976,7 +1134,7 @@ pub fn connect_guest(
                 _ => { /* ignore other messages before Welcome */ }
             }
         };
-        let (site_id, doc_text, server_clock, peers, my_role, role_perms, file_list) = welcome;
+        let (site_id, peers, my_role, role_perms, doc) = welcome;
 
         // Writer thread
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
@@ -988,28 +1146,27 @@ pub fn connect_guest(
 
         let session = Box::new(CollabSession {
             site_id,
-            role:            CollabRole::Guest,
-            peers:           peers.clone(),
-            inflight:        HashMap::new(),
-            local_clock:     0,
-            server_clock,
+            role:            CollabRole::Guest { to_host: tx },
+            peers,
             remote_cursors:  HashMap::new(),
-            send_tx:         tx,
-            doc_path:        String::new(), // set from tab path in main after CollabConnected
+            doc_path:        String::new(),
             session_key,
             last_cursor_sent: Instant::now(),
             role_perms,
             my_role:         Some(my_role),
-            include_globs:   Vec::new(), // host-side only; guests receive filtered FileList
+            include_globs:   Vec::new(), // host-side only; guests receive a filtered FileList
             exclude_globs:   Vec::new(),
+            client_docs:     HashMap::new(),
+            server_docs:     HashMap::new(),
+            open_docs:       HashMap::new(),
         });
 
-        let _ = proxy.send_event(UserEvent::CollabConnected { session, doc_text, peers, file_list });
+        let _ = proxy.send_event(UserEvent::CollabConnected { session, doc });
 
         // Reader loop
         let key = session_key;
         loop {
-            let frame = match read_frame(&mut reader) {
+            let frame = match read_frame(&mut reader, MAX_FRAME) {
                 Ok(f) => f,
                 Err(_) => {
                     let _ = proxy.send_event(UserEvent::CollabDisconnected);
@@ -1068,5 +1225,198 @@ mod tests {
         assert!(resolve_under_root(&dir, "sub/../../escape").is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn single_star_does_not_cross_directories() {
+        assert!(glob_match("*.md", "README.md"));
+        assert!(!glob_match("*.md", "secret/notes.md"));
+        assert!(glob_match("**/*.md", "secret/notes.md"));
+        assert!(glob_match("src/*.rs", "src/main.rs"));
+        assert!(!glob_match("src/*.rs", "src/a/b.rs"));
+    }
+
+    fn apply(doc: &str, op: &TextOperation) -> String {
+        let mut r = Rope::from_str(doc);
+        op.apply(&mut r).unwrap();
+        r.to_string()
+    }
+
+    fn change(doc: &str, start: usize, del: usize, ins: &str) -> TextOperation {
+        let len = doc.chars().count();
+        TextOperation::from_change(start, del, ins, len - start - del)
+    }
+
+    #[test]
+    fn disjoint_concurrent_deletes_keep_all_other_text() {
+        let doc = "0123456789abcdefghij";
+        let a = change(doc, 10, 5, ""); // delete "abcde"
+        let b = change(doc, 0, 3, "");  // delete "012"
+        let (a2, b2) = TextOperation::transform(&a, &b).unwrap();
+        let left = apply(&apply(doc, &a), &b2);
+        let right = apply(&apply(doc, &b), &a2);
+        assert_eq!(left, "3456789fghij");
+        assert_eq!(left, right);
+    }
+
+    #[test]
+    fn insert_inside_concurrent_delete_converges() {
+        let doc = "0123456789";
+        let a = change(doc, 2, 5, "");
+        let b = change(doc, 4, 0, "XY");
+        let (a2, b2) = TextOperation::transform(&a, &b).unwrap();
+        assert_eq!(apply(&apply(doc, &a), &b2), apply(&apply(doc, &b), &a2));
+    }
+
+    #[test]
+    fn compose_matches_sequential_application() {
+        let doc = "hello world";
+        let a = change(doc, 5, 0, ",");
+        let mid = apply(doc, &a);
+        let b = change(&mid, 7, 5, "there");
+        let c = a.compose(&b).unwrap();
+        assert_eq!(apply(doc, &c), apply(&mid, &b));
+        assert_eq!(apply(doc, &c), "hello, there");
+    }
+
+    #[test]
+    fn transform_index_moves_cursors() {
+        let doc = "abcdef";
+        assert_eq!(change(doc, 0, 0, "XX").transform_index(3), 5);
+        assert_eq!(change(doc, 4, 0, "XX").transform_index(3), 3);
+        assert_eq!(change(doc, 1, 3, "").transform_index(3), 1);  // inside deletion
+        assert_eq!(change(doc, 0, 2, "").transform_index(5), 3);
+    }
+
+    /// Simulates the full protocol (host + two guests, random concurrent edits
+    /// with arbitrary delivery interleaving) and checks every copy converges.
+    #[test]
+    fn random_sessions_converge() {
+        use rand::{Rng, SeedableRng};
+        for seed in 0..300u64 {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+            let initial = "The quick brown fox jumps over the lazy dog.";
+            let mut host = Rope::from_str(initial);
+            let mut server = ServerDoc::default();
+            struct G { text: Rope, doc: ClientDoc, inbox: VecDeque<CollabMsg>, outbox: VecDeque<(u64, TextOperation)> }
+            let mut guests: Vec<G> = (0..2).map(|_| G {
+                text: Rope::from_str(initial), doc: ClientDoc::default(),
+                inbox: VecDeque::new(), outbox: VecDeque::new(),
+            }).collect();
+            let random_edit = |rng: &mut rand::rngs::StdRng, text: &Rope| {
+                let len = text.len_chars();
+                let start = rng.gen_range(0..=len);
+                let del = rng.gen_range(0..=(len - start).min(4));
+                let ins: String = (0..rng.gen_range(0..4)).map(|_| (b'a' + rng.gen_range(0..26)) as char).collect();
+                TextOperation::from_change(start, del, &ins, len - start - del)
+            };
+            for _ in 0..60 {
+                match rng.gen_range(0..5) {
+                    0 => { // host edits
+                        let op = random_edit(&mut rng, &host);
+                        op.apply(&mut host).unwrap();
+                        let rev = server.record(op.clone());
+                        for g in guests.iter_mut() {
+                            g.inbox.push_back(CollabMsg::RemoteOp { path: String::new(), rev, site_id: 0, op: op.clone() });
+                        }
+                    }
+                    1 | 2 => { // a guest edits
+                        let gi = rng.gen_range(0..guests.len());
+                        let g = &mut guests[gi];
+                        let op = random_edit(&mut rng, &g.text);
+                        op.apply(&mut g.text).unwrap();
+                        if g.doc.awaiting.is_none() {
+                            g.outbox.push_back((g.doc.rev, op.clone()));
+                            g.doc.awaiting = Some(op);
+                        } else {
+                            g.doc.buffer = Some(match g.doc.buffer.take() { Some(b) => b.compose(&op).unwrap(), None => op });
+                        }
+                    }
+                    3 => { // host processes one guest op
+                        let gi = rng.gen_range(0..guests.len());
+                        if let Some((base, op)) = guests[gi].outbox.pop_front() {
+                            let op = server.rebase(base, op).unwrap();
+                            op.apply(&mut host).unwrap();
+                            let rev = server.record(op.clone());
+                            for (j, g) in guests.iter_mut().enumerate() {
+                                if j == gi { g.inbox.push_back(CollabMsg::Ack { path: String::new(), rev }); }
+                                else { g.inbox.push_back(CollabMsg::RemoteOp { path: String::new(), rev, site_id: 1, op: op.clone() }); }
+                            }
+                        }
+                    }
+                    _ => { // a guest receives one message
+                        let gi = rng.gen_range(0..guests.len());
+                        let g = &mut guests[gi];
+                        match g.inbox.pop_front() {
+                            Some(CollabMsg::Ack { rev, .. }) => {
+                                g.doc.rev = rev;
+                                g.doc.awaiting = g.doc.buffer.take();
+                                if let Some(next) = g.doc.awaiting.clone() { g.outbox.push_back((rev, next)); }
+                            }
+                            Some(CollabMsg::RemoteOp { rev, op, .. }) => {
+                                let mut op = op;
+                                if let Some(a) = g.doc.awaiting.take() {
+                                    let (a2, o2) = TextOperation::transform(&a, &op).unwrap();
+                                    g.doc.awaiting = Some(a2); op = o2;
+                                }
+                                if let Some(b) = g.doc.buffer.take() {
+                                    let (b2, o3) = TextOperation::transform(&b, &op).unwrap();
+                                    g.doc.buffer = Some(b2); op = o3;
+                                }
+                                g.doc.rev = rev;
+                                op.apply(&mut g.text).unwrap();
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            // Drain everything.
+            loop {
+                let mut progressed = false;
+                for gi in 0..guests.len() {
+                    if let Some((base, op)) = guests[gi].outbox.pop_front() {
+                        progressed = true;
+                        let op = server.rebase(base, op).unwrap();
+                        op.apply(&mut host).unwrap();
+                        let rev = server.record(op.clone());
+                        for (j, g) in guests.iter_mut().enumerate() {
+                            if j == gi { g.inbox.push_back(CollabMsg::Ack { path: String::new(), rev }); }
+                            else { g.inbox.push_back(CollabMsg::RemoteOp { path: String::new(), rev, site_id: 1, op: op.clone() }); }
+                        }
+                    }
+                }
+                for g in guests.iter_mut() {
+                    while let Some(msg) = g.inbox.pop_front() {
+                        progressed = true;
+                        match msg {
+                            CollabMsg::Ack { rev, .. } => {
+                                g.doc.rev = rev;
+                                g.doc.awaiting = g.doc.buffer.take();
+                                if let Some(next) = g.doc.awaiting.clone() { g.outbox.push_back((rev, next)); }
+                            }
+                            CollabMsg::RemoteOp { rev, op, .. } => {
+                                let mut op = op;
+                                if let Some(a) = g.doc.awaiting.take() {
+                                    let (a2, o2) = TextOperation::transform(&a, &op).unwrap();
+                                    g.doc.awaiting = Some(a2); op = o2;
+                                }
+                                if let Some(b) = g.doc.buffer.take() {
+                                    let (b2, o3) = TextOperation::transform(&b, &op).unwrap();
+                                    g.doc.buffer = Some(b2); op = o3;
+                                }
+                                g.doc.rev = rev;
+                                op.apply(&mut g.text).unwrap();
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                if !progressed { break; }
+            }
+            for g in &guests {
+                assert_eq!(g.text.to_string(), host.to_string(), "seed {seed} diverged");
+            }
+        }
     }
 }
