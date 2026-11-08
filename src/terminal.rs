@@ -1,15 +1,13 @@
 // Terminal pane: PTY + VT100/ANSI grid + key encoding.
 //
 // One TermPane is created per terminal pane.  The PTY is set up via libc::forkpty
-// (macOS / any POSIX system).  A background reader thread forwards raw bytes from
-// the PTY master fd to the main event loop via EventLoopProxy<UserEvent>.
+// on macOS/Linux and a ConPTY pseudoconsole on Windows (see the `sys` modules).
+// A background reader thread forwards raw bytes from the PTY to the main event
+// loop via EventLoopProxy<UserEvent>.
 // The main thread calls feed_bytes() in user_event(), which runs the vte parser
 // and updates the grid in-place.
 
 use std::collections::VecDeque;
-use std::ffi::CString;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use vte::{Perform, Parser};
 use winit::event_loop::EventLoopProxy;
 use winit::keyboard::{Key, ModifiersState, NamedKey};
@@ -560,6 +558,15 @@ impl<'a> Perform for VteHandler<'a> {
                 }
             }
         }
+        // OSC 9;9: Windows Terminal's CWD report, `9;9;"C:\path"` (what PowerShell /
+        // cmd prompts are configured to emit there). vte splits on ';', so a path
+        // containing ';' arrives in several pieces.
+        if params.len() >= 3 && params[0] == b"9" && params[1] == b"9" {
+            let joined = params[2..].join(&b';');
+            if let Some(path) = std::str::from_utf8(&joined).ok().and_then(parse_osc9_9_path) {
+                self.grid.cwd = Some(path);
+            }
+        }
         // OSC 0/2: window/tab title (ignored for now)
     }
 
@@ -606,7 +613,24 @@ fn parse_osc7_path(url: &str) -> Option<std::path::PathBuf> {
     if decoded.chars().any(|c| c.is_control()) {
         return None;
     }
+    // Windows: `file:///C:/dir` names `C:/dir`, not `/C:/dir`.
+    #[cfg(windows)]
+    if let Some(rest) = decoded.strip_prefix('/') {
+        let b = rest.as_bytes();
+        if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+            return Some(std::path::PathBuf::from(rest));
+        }
+    }
     Some(std::path::PathBuf::from(decoded))
+}
+
+/// Parse the payload of OSC 9;9 (`"C:\dir"`, quotes optional) into an absolute path.
+fn parse_osc9_9_path(raw: &str) -> Option<std::path::PathBuf> {
+    let s = raw.trim();
+    let s = s.strip_prefix('"').and_then(|t| t.strip_suffix('"')).unwrap_or(s);
+    if s.is_empty() || s.chars().any(|c| c.is_control()) { return None; }
+    let path = std::path::PathBuf::from(s);
+    path.has_root().then_some(path)
 }
 
 fn percent_decode(s: &str) -> Vec<u8> {
@@ -656,40 +680,98 @@ fn ansi256(n: u8) -> u32 {
 }
 
 // ── TermPane ──────────────────────────────────────────────────────────────────
-pub struct TermPane {
-    pub id:      usize,
-    pub grid:    TermGrid,
-    parser:      Parser,
-    pub pty_fd:  i32,
-    child_pid:   libc::pid_t,
-    child_alive: Arc<AtomicBool>,
-    closed:      Arc<AtomicBool>,
-    pub _reader: std::thread::JoinHandle<()>,
-    pub title:   String,
-    pub shell:   String,
+
+/// What a terminal pane runs.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TermCommand {
+    /// The user's shell: the `terminal_shell` setting if set, else `$SHELL`
+    /// (Unix) or PowerShell / `%COMSPEC%` (Windows).
+    DefaultShell(Vec<String>),
+    /// A program and its arguments, run directly without a shell parsing them
+    /// (e.g. `ssh -t host …` for a remote workspace).
+    Argv(Vec<String>),
 }
 
-impl Drop for TermPane {
-    fn drop(&mut self) {
-        self.closed.store(true, Ordering::Release);
-        if self.child_pid > 0 && self.child_alive.load(Ordering::Acquire) {
-            // Ask the whole terminal session to exit, then fall back to the
-            // shell process itself in case it is not the process-group leader.
-            unsafe {
-                let _ = libc::kill(-self.child_pid, libc::SIGHUP);
-                let _ = libc::kill(self.child_pid, libc::SIGHUP);
-            }
-        }
-        if self.pty_fd >= 0 {
-            // SAFETY: pty_fd is a valid open file descriptor owned by this TermPane.
-            unsafe { libc::close(self.pty_fd); }
-            self.pty_fd = -1;
+impl TermCommand {
+    /// The shell for a new terminal: `configured` (the `terminal_shell` setting,
+    /// an argv) when non-empty, else the platform default.
+    pub fn shell(configured: &[String]) -> Self {
+        TermCommand::DefaultShell(configured.iter().filter(|a| !a.is_empty()).cloned().collect())
+    }
+
+    /// Program + arguments to start.
+    fn argv(&self) -> Vec<String> {
+        match self {
+            TermCommand::DefaultShell(cfg) if !cfg.is_empty() => cfg.clone(),
+            TermCommand::DefaultShell(_) => vec![default_shell()],
+            TermCommand::Argv(argv) => argv.clone(),
         }
     }
 }
 
+/// `$SHELL`, falling back to `/bin/sh` when it's unset or not installed.
+#[cfg(unix)]
+fn default_shell() -> String {
+    std::env::var("SHELL").ok()
+        .filter(|s| !s.is_empty() && crate::os::find_executable(s).is_some())
+        .unwrap_or_else(|| "/bin/sh".to_owned())
+}
+
+/// PowerShell 7 (`pwsh`) if installed, else Windows PowerShell, else `%COMSPEC%`
+/// (cmd.exe). `$SHELL` is ignored: when set on Windows it is an MSYS/Cygwin path.
+#[cfg(windows)]
+fn default_shell() -> String {
+    ["pwsh.exe", "powershell.exe"].iter()
+        .find_map(|name| crate::os::find_executable(name))
+        .map(|p| p.to_string_lossy().into_owned())
+        .or_else(|| std::env::var("COMSPEC").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "cmd.exe".to_owned())
+}
+
+/// Receives a PTY's output from its reader thread: `Some(bytes)` for each chunk
+/// (return false to stop forwarding), then `None` once at EOF.
+pub type OutputSink = Box<dyn FnMut(Option<Box<[u8]>>) -> bool + Send>;
+
+/// Write side of a pane's PTY. Copyable so key/mouse handlers can grab it and
+/// write after other borrows of the pane end; only valid while the pane lives
+/// (every use is synchronous, inside the event handler that looked it up).
+#[derive(Clone, Copy)]
+pub struct PtyInput(sys::RawInput);
+
+impl PtyInput {
+    /// Send bytes to the program in the terminal. Silently ignored for
+    /// display-only panes (LSP output) and once the PTY has closed.
+    pub fn write(self, bytes: &[u8]) {
+        sys::write_input(self.0, bytes);
+    }
+}
+
+pub struct TermPane {
+    pub id:      usize,
+    pub grid:    TermGrid,
+    parser:      Parser,
+    pty:         Option<sys::Pty>,
+    pub _reader: std::thread::JoinHandle<()>,
+    pub title:   String,
+    /// What this pane runs, so "split terminal" can start the same thing.
+    pub command: TermCommand,
+}
+
 impl TermPane {
-    pub fn child_pid(&self) -> libc::pid_t { self.child_pid }
+    /// OS process id of the program in the terminal (None for display-only panes).
+    pub fn child_pid(&self) -> Option<u32> {
+        self.pty.as_ref().map(|p| p.child_pid())
+    }
+
+    /// Where keystrokes for this pane go.
+    pub fn input(&self) -> PtyInput {
+        PtyInput(self.pty.as_ref().map_or(sys::NO_INPUT, |p| p.raw_input()))
+    }
+
+    /// Shorthand for `self.input().write(bytes)`.
+    pub fn write_input(&self, bytes: &[u8]) {
+        self.input().write(bytes);
+    }
 }
 
 /// Parse raw PTY bytes and update the grid.
@@ -703,203 +785,481 @@ pub fn feed_bytes(pane: &mut TermPane, data: &[u8]) {
 /// Resize the PTY and grid when the pane area changes.
 pub fn resize_pty(pane: &mut TermPane, cols: usize, rows: usize) {
     if cols == pane.grid.cols && rows == pane.grid.rows { return; }
-    let ws = libc::winsize { ws_col: cols as u16, ws_row: rows as u16, ws_xpixel: 0, ws_ypixel: 0 };
-    // SAFETY: pty_fd is a valid open PTY master fd; ws is a correctly-sized winsize struct.
-    unsafe { libc::ioctl(pane.pty_fd, libc::TIOCSWINSZ, &ws); }
+    if let Some(pty) = pane.pty.as_ref() {
+        pty.resize(cols, rows);
+    }
     pane.grid.resize(cols, rows);
 }
 
-/// Fork a PTY, exec $SHELL (or shell_override) in the child, and start a reader thread.
-#[cfg(unix)]
+/// Start `command` in a new PTY (in `cwd` when given) and a reader thread that
+/// forwards its output to the event loop as `TermOutput`. A program that can't be
+/// started yields a display-only pane explaining why.
 pub fn spawn_terminal(pane_id: usize, cols: usize, rows: usize,
-    proxy: EventLoopProxy<UserEvent>, cwd: Option<std::path::PathBuf>) -> TermPane {
-    spawn_terminal_with_shell(pane_id, cols, rows, proxy, None, cwd)
-}
-
-#[cfg(unix)]
-pub fn spawn_terminal_with_shell(pane_id: usize, cols: usize, rows: usize,
-    proxy: EventLoopProxy<UserEvent>, shell_override: Option<String>,
+    proxy: EventLoopProxy<UserEvent>, command: TermCommand,
     cwd: Option<std::path::PathBuf>) -> TermPane {
-    use std::env;
-    use std::ptr;
-
-    // Track whether we got an explicit override so we can choose the right exec strategy.
-    let is_override = shell_override.is_some();
-    let shell = shell_override
-        .or_else(|| env::var("SHELL").ok())
-        .unwrap_or_else(|| "/bin/sh".to_owned());
-
-    // Everything the child needs is prepared *before* forkpty. The editor is
-    // multi-threaded (SSH, LSP and PTY readers), and after fork() only
-    // async-signal-safe functions may be called in the child: allocating (CString::new,
-    // setenv) could deadlock on a malloc lock another thread held at fork time.
-    let Some(exec) = PreparedExec::new(&shell, is_override, cwd.as_deref()) else {
-        let mut pane = new_log_pane(pane_id, cols, rows, "Terminal".to_owned());
-        feed_bytes(&mut pane, format!("[local-text] cannot start shell {shell:?}\r\n").as_bytes());
-        return pane;
-    };
-
-    let mut ws = libc::winsize {
-        ws_col: cols as u16,
-        ws_row: rows as u16,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-
-    let mut master_fd: libc::c_int = -1;
-    // SAFETY: forkpty is a POSIX API; master_fd is out-param, ws is valid winsize.
-    let pid = unsafe {
-        libc::forkpty(&mut master_fd, ptr::null_mut(), ptr::null_mut(), &mut ws)
-    };
-    if pid < 0 {
-        let err = std::io::Error::last_os_error();
-        let mut pane = new_log_pane(pane_id, cols, rows, "Terminal".to_owned());
-        feed_bytes(&mut pane, format!("[local-text] forkpty failed: {err}\r\n").as_bytes());
-        return pane;
-    }
-
-    if pid == 0 {
-        // SAFETY: we are in the forked child. Only async-signal-safe calls follow
-        // (chdir, execve, _exit), all on buffers prepared before the fork.
-        unsafe {
-            if let Some(dir) = exec.cwd.as_ref() {
-                libc::chdir(dir.as_ptr()); // best effort — the shell starts in $HOME otherwise
-            }
-            libc::execve(exec.program.as_ptr(), exec.argv_ptrs.as_ptr(), exec.envp_ptrs.as_ptr());
-            // _exit, not exit: never run the parent's atexit handlers in the child.
-            libc::_exit(127);
-        }
-    }
-    drop(exec);
-
-    // Parent: spawn reader thread
-    let closed = Arc::new(AtomicBool::new(false));
-    let child_alive = Arc::new(AtomicBool::new(true));
-    let reader_closed = Arc::clone(&closed);
-    let reader_child_alive = Arc::clone(&child_alive);
-    let reader = std::thread::spawn(move || {
-        let mut buf = [0u8; 4096];
-        loop {
-            if reader_closed.load(Ordering::Acquire) { break; }
-            // SAFETY: master_fd is a valid open PTY master fd; buf is a mutable
-            // stack-allocated slice sized to match the length argument.
-            let n = unsafe { libc::read(master_fd, buf.as_mut_ptr().cast(), buf.len()) };
-            if n < 0 {
-                let err = std::io::Error::last_os_error();
-                if err.raw_os_error() == Some(libc::EINTR) { continue; }
-                let _ = proxy.send_event(UserEvent::Redraw);
-                break;
-            }
-            if n <= 0 {
-                let _ = proxy.send_event(UserEvent::Redraw);
-                break;
-            }
-            if reader_closed.load(Ordering::Acquire) { break; }
-            // Box<[u8]> carries exactly n bytes with no excess capacity.
-            let data: Box<[u8]> = buf[..n as usize].into();
-            if proxy.send_event(UserEvent::TermOutput { pane_id, data }).is_err() { break; }
-        }
-        if pid > 0 {
-            let mut status: libc::c_int = 0;
-            // Reap the forked shell/ssh process off the UI thread.
-            unsafe { let _ = libc::waitpid(pid, &mut status, 0); }
-            reader_child_alive.store(false, Ordering::Release);
-        }
+    let argv = command.argv();
+    // PTY output → TermOutput events; EOF → one last redraw.
+    let sink: sys::OutputSink = Box::new(move |chunk| match chunk {
+        Some(data) => proxy.send_event(UserEvent::TermOutput { pane_id, data }).is_ok(),
+        None => { let _ = proxy.send_event(UserEvent::Redraw); false }
     });
-
-    TermPane {
-        id: pane_id,
-        grid: TermGrid::new(cols, rows),
-        parser: Parser::new(),
-        pty_fd: master_fd,
-        child_pid: pid,
-        child_alive,
-        closed,
-        _reader: reader,
-        title: "Terminal".to_owned(),
-        shell,
+    match sys::Pty::spawn(&argv, cwd.as_deref(), cols, rows, sink) {
+        Ok((pty, reader)) => TermPane {
+            id: pane_id,
+            grid: TermGrid::new(cols, rows),
+            parser: Parser::new(),
+            pty: Some(pty),
+            _reader: reader,
+            title: "Terminal".to_owned(),
+            command,
+        },
+        Err(msg) => {
+            let mut pane = new_log_pane(pane_id, cols, rows, "Terminal".to_owned());
+            pane.command = command;
+            feed_bytes(&mut pane, format!("[local-text] {msg}\r\n").as_bytes());
+            pane
+        }
     }
-}
-
-/// Program, argv, environment and cwd for the PTY child, as C strings built in
-/// the parent so the child never allocates between fork and exec.
-#[cfg(unix)]
-struct PreparedExec {
-    program:   CString,
-    _argv:     Vec<CString>,
-    argv_ptrs: Vec<*const libc::c_char>,
-    _envp:     Vec<CString>,
-    envp_ptrs: Vec<*const libc::c_char>,
-    cwd:       Option<CString>,
-}
-
-#[cfg(unix)]
-impl PreparedExec {
-    fn new(shell: &str, is_override: bool, cwd: Option<&std::path::Path>) -> Option<Self> {
-        use std::os::unix::ffi::OsStrExt;
-        // An override is a full command line (e.g. "ssh -o ControlPath=… user@host"),
-        // so run it through `/bin/sh -c`. A plain shell is exec'd directly; execve
-        // doesn't search PATH, so resolve a bare name ourselves.
-        let (program, argv): (CString, Vec<CString>) = if is_override {
-            let sh = CString::new("/bin/sh").ok()?;
-            (sh.clone(), vec![sh, CString::new("-c").ok()?, CString::new(shell).ok()?])
-        } else {
-            let resolved = resolve_in_path(shell).unwrap_or_else(|| std::path::PathBuf::from("/bin/sh"));
-            let program = CString::new(resolved.as_os_str().as_bytes()).ok()?;
-            (program, vec![CString::new(shell).ok()?])
-        };
-        let mut envp: Vec<CString> = std::env::vars_os()
-            .filter(|(k, _)| k.as_bytes() != b"TERM")
-            .filter_map(|(k, v)| {
-                let mut entry = k.as_bytes().to_vec();
-                entry.push(b'=');
-                entry.extend_from_slice(v.as_bytes());
-                CString::new(entry).ok()
-            })
-            .collect();
-        envp.push(CString::new("TERM=xterm-256color").ok()?);
-        let cwd = cwd.and_then(|d| CString::new(d.as_os_str().as_bytes()).ok());
-        let argv_ptrs = argv.iter().map(|a| a.as_ptr()).chain(std::iter::once(std::ptr::null())).collect();
-        let envp_ptrs = envp.iter().map(|e| e.as_ptr()).chain(std::iter::once(std::ptr::null())).collect();
-        Some(PreparedExec { program, _argv: argv, argv_ptrs, _envp: envp, envp_ptrs, cwd })
-    }
-}
-
-/// Find an executable the way execvp would: absolute/relative paths are used as
-/// given, bare names are looked up in $PATH.
-#[cfg(unix)]
-fn resolve_in_path(name: &str) -> Option<std::path::PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
-    if name.contains('/') { return Some(std::path::PathBuf::from(name)); }
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(name))
-        .find(|candidate| {
-            std::fs::metadata(candidate)
-                .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-                .unwrap_or(false)
-        })
 }
 
 /// Create a display-only TermPane with no PTY and no child process.
-/// Used to show LSP server output (stderr/stdout) with full VT100 rendering.
-/// `pty_fd = -1` means writes are silently discarded; Drop guards are already
-/// conditioned on `child_pid > 0` and `pty_fd >= 0`.
-#[cfg(unix)]
+/// Used to show LSP server output (stderr/stdout) with full VT100 rendering;
+/// writes to it are discarded.
 pub fn new_log_pane(id: usize, cols: usize, rows: usize, title: String) -> TermPane {
-    let child_alive = Arc::new(AtomicBool::new(false));
-    let closed      = Arc::new(AtomicBool::new(false));
     TermPane {
         id,
-        grid:        TermGrid::new(cols, rows),
-        parser:      Parser::new(),
-        pty_fd:      -1,
-        child_pid:   -1,
-        child_alive,
-        closed,
-        _reader:     std::thread::spawn(|| {}),
+        grid:    TermGrid::new(cols, rows),
+        parser:  Parser::new(),
+        pty:     None,
+        _reader: std::thread::spawn(|| {}),
         title,
-        shell:       String::new(),
+        command: TermCommand::Argv(Vec::new()),
+    }
+}
+
+// ── PTY backend: Unix (forkpty) ───────────────────────────────────────────────
+#[cfg(unix)]
+mod sys {
+    use std::ffi::CString;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    pub use super::OutputSink;
+
+    pub type RawInput = libc::c_int;
+    pub const NO_INPUT: RawInput = -1;
+
+    pub fn write_input(fd: RawInput, bytes: &[u8]) {
+        if fd < 0 { return; }
+        let mut rest = bytes;
+        while !rest.is_empty() {
+            // SAFETY: fd is the PTY master owned by a live TermPane (see PtyInput);
+            // `rest` is a valid slice for the duration of the call.
+            let n = unsafe { libc::write(fd, rest.as_ptr().cast(), rest.len()) };
+            if n < 0 {
+                if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) { continue; }
+                return;
+            }
+            if n == 0 { return; }
+            rest = &rest[n as usize..];
+        }
+    }
+
+    pub struct Pty {
+        fd:          libc::c_int,
+        pid:         libc::pid_t,
+        child_alive: Arc<AtomicBool>,
+        closed:      Arc<AtomicBool>,
+    }
+
+    impl Drop for Pty {
+        fn drop(&mut self) {
+            self.closed.store(true, Ordering::Release);
+            if self.pid > 0 && self.child_alive.load(Ordering::Acquire) {
+                // Ask the whole terminal session to exit, then fall back to the
+                // shell process itself in case it is not the process-group leader.
+                unsafe {
+                    let _ = libc::kill(-self.pid, libc::SIGHUP);
+                    let _ = libc::kill(self.pid, libc::SIGHUP);
+                }
+            }
+            // SAFETY: fd is the PTY master fd owned by this Pty.
+            unsafe { libc::close(self.fd); }
+        }
+    }
+
+    impl Pty {
+        pub fn child_pid(&self) -> u32 { self.pid as u32 }
+        pub fn raw_input(&self) -> RawInput { self.fd }
+
+        pub fn resize(&self, cols: usize, rows: usize) {
+            let ws = libc::winsize { ws_col: cols as u16, ws_row: rows as u16, ws_xpixel: 0, ws_ypixel: 0 };
+            // SAFETY: fd is a valid open PTY master fd; ws is a correctly-sized winsize struct.
+            unsafe { libc::ioctl(self.fd, libc::TIOCSWINSZ, &ws); }
+        }
+
+        /// Fork a PTY, exec `argv` in the child, and start a reader thread feeding `sink`.
+        pub fn spawn(argv: &[String], cwd: Option<&std::path::Path>, cols: usize, rows: usize,
+            mut sink: OutputSink)
+            -> Result<(Pty, std::thread::JoinHandle<()>), String> {
+            // Everything the child needs is prepared *before* forkpty. The editor is
+            // multi-threaded (SSH, LSP and PTY readers), and after fork() only
+            // async-signal-safe functions may be called in the child: allocating
+            // (CString::new, setenv) could deadlock on a malloc lock another thread
+            // held at fork time.
+            let exec = PreparedExec::new(argv, cwd)
+                .ok_or_else(|| format!("cannot start {:?}", argv.first().map(String::as_str).unwrap_or("")))?;
+
+            let mut ws = libc::winsize { ws_col: cols as u16, ws_row: rows as u16, ws_xpixel: 0, ws_ypixel: 0 };
+            let mut master_fd: libc::c_int = -1;
+            // SAFETY: forkpty is a POSIX API; master_fd is out-param, ws is valid winsize.
+            let pid = unsafe {
+                libc::forkpty(&mut master_fd, std::ptr::null_mut(), std::ptr::null_mut(), &mut ws)
+            };
+            if pid < 0 {
+                return Err(format!("forkpty failed: {}", std::io::Error::last_os_error()));
+            }
+            if pid == 0 {
+                // SAFETY: we are in the forked child. Only async-signal-safe calls follow
+                // (chdir, execve, _exit), all on buffers prepared before the fork.
+                unsafe {
+                    if let Some(dir) = exec.cwd.as_ref() {
+                        libc::chdir(dir.as_ptr()); // best effort — the shell starts in $HOME otherwise
+                    }
+                    libc::execve(exec.program.as_ptr(), exec.argv_ptrs.as_ptr(), exec.envp_ptrs.as_ptr());
+                    // _exit, not exit: never run the parent's atexit handlers in the child.
+                    libc::_exit(127);
+                }
+            }
+            drop(exec);
+
+            let closed = Arc::new(AtomicBool::new(false));
+            let child_alive = Arc::new(AtomicBool::new(true));
+            let reader_closed = Arc::clone(&closed);
+            let reader_child_alive = Arc::clone(&child_alive);
+            let reader = std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                loop {
+                    if reader_closed.load(Ordering::Acquire) { break; }
+                    // SAFETY: master_fd is a valid open PTY master fd; buf is a mutable
+                    // stack-allocated slice sized to match the length argument.
+                    let n = unsafe { libc::read(master_fd, buf.as_mut_ptr().cast(), buf.len()) };
+                    if n < 0 {
+                        let err = std::io::Error::last_os_error();
+                        if err.raw_os_error() == Some(libc::EINTR) { continue; }
+                        sink(None); // EIO: the child side closed
+                        break;
+                    }
+                    if n == 0 {
+                        sink(None);
+                        break;
+                    }
+                    if reader_closed.load(Ordering::Acquire) { break; }
+                    // Box<[u8]> carries exactly n bytes with no excess capacity.
+                    let data: Box<[u8]> = buf[..n as usize].into();
+                    if !sink(Some(data)) { break; }
+                }
+                let mut status: libc::c_int = 0;
+                // Reap the forked shell/ssh process off the UI thread.
+                unsafe { let _ = libc::waitpid(pid, &mut status, 0); }
+                reader_child_alive.store(false, Ordering::Release);
+            });
+            Ok((Pty { fd: master_fd, pid, child_alive, closed }, reader))
+        }
+    }
+
+    /// Program, argv, environment and cwd for the PTY child, as C strings built in
+    /// the parent so the child never allocates between fork and exec.
+    pub(super) struct PreparedExec {
+        pub(super) program: CString,
+        pub(super) _argv:   Vec<CString>,
+        pub(super) argv_ptrs: Vec<*const libc::c_char>,
+        pub(super) _envp:   Vec<CString>,
+        envp_ptrs: Vec<*const libc::c_char>,
+        cwd:       Option<CString>,
+    }
+
+    impl PreparedExec {
+        pub(super) fn new(argv: &[String], cwd: Option<&std::path::Path>) -> Option<Self> {
+            use std::os::unix::ffi::OsStrExt;
+            // execve doesn't search PATH, so resolve a bare program name ourselves.
+            let program = crate::os::find_executable(argv.first()?)?;
+            let program = CString::new(program.as_os_str().as_bytes()).ok()?;
+            let argv: Vec<CString> = argv.iter().map(|a| CString::new(a.as_str()).ok()).collect::<Option<_>>()?;
+            let mut envp: Vec<CString> = std::env::vars_os()
+                .filter(|(k, _)| k.as_bytes() != b"TERM")
+                .filter_map(|(k, v)| {
+                    let mut entry = k.as_bytes().to_vec();
+                    entry.push(b'=');
+                    entry.extend_from_slice(v.as_bytes());
+                    CString::new(entry).ok()
+                })
+                .collect();
+            envp.push(CString::new("TERM=xterm-256color").ok()?);
+            let cwd = cwd.and_then(|d| CString::new(d.as_os_str().as_bytes()).ok());
+            let argv_ptrs = argv.iter().map(|a| a.as_ptr()).chain(std::iter::once(std::ptr::null())).collect();
+            let envp_ptrs = envp.iter().map(|e| e.as_ptr()).chain(std::iter::once(std::ptr::null())).collect();
+            Some(PreparedExec { program, _argv: argv, argv_ptrs, _envp: envp, envp_ptrs, cwd })
+        }
+    }
+}
+
+// ── PTY backend: Windows (ConPTY) ─────────────────────────────────────────────
+//
+// A pseudoconsole (Windows 10 1809+) translates between the console API used by
+// cmd/PowerShell/native tools and a VT byte stream on two pipes — the same bytes
+// a Unix PTY master carries, so the grid, key encoding and reader are shared.
+//
+// Shutdown: unlike a Unix PTY, the output pipe does not reach EOF when the shell
+// exits — only when the pseudoconsole is closed. A waiter thread therefore closes
+// it as soon as the child exits (so the reader finishes), and dropping the pane
+// closes it too (which also ends the programs attached to it, like SIGHUP).
+// ClosePseudoConsole can block until pending output is drained, so the reader
+// keeps draining until EOF even after the pane is gone, and the pane's Drop
+// closes on a helper thread rather than the UI thread.
+#[cfg(windows)]
+mod sys {
+    use std::ffi::c_void;
+    use std::os::windows::ffi::OsStrExt;
+    use std::sync::{Arc, Mutex};
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
+    use windows_sys::Win32::System::Console::{
+        ClosePseudoConsole, CreatePseudoConsole, ResizePseudoConsole, COORD, HPCON,
+    };
+    use windows_sys::Win32::System::Pipes::CreatePipe;
+    use windows_sys::Win32::System::Threading::{
+        CreateProcessW, DeleteProcThreadAttributeList, InitializeProcThreadAttributeList,
+        UpdateProcThreadAttribute, WaitForSingleObject, CREATE_UNICODE_ENVIRONMENT,
+        EXTENDED_STARTUPINFO_PRESENT, INFINITE, PROCESS_INFORMATION,
+        PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    };
+
+    pub use super::OutputSink;
+
+    /// The input pipe's write handle, as an integer so `PtyInput` stays `Copy + Send`.
+    pub type RawInput = isize;
+    pub const NO_INPUT: RawInput = 0;
+
+    pub fn write_input(handle: RawInput, bytes: &[u8]) {
+        if handle == NO_INPUT { return; }
+        let mut rest = bytes;
+        while !rest.is_empty() {
+            let mut written = 0u32;
+            let len = rest.len().min(u32::MAX as usize) as u32;
+            // SAFETY: `handle` is the input pipe owned by a live TermPane (see
+            // PtyInput); `rest` is valid for `len` bytes.
+            let ok = unsafe { WriteFile(handle as HANDLE, rest.as_ptr(), len, &mut written, std::ptr::null_mut()) };
+            if ok == 0 || written == 0 { return; }
+            rest = &rest[written as usize..];
+        }
+    }
+
+    /// An owned kernel handle, closed on drop.
+    struct OwnedHandle(HANDLE);
+    // SAFETY: kernel handles are process-wide and may be used from any thread.
+    unsafe impl Send for OwnedHandle {}
+    unsafe impl Sync for OwnedHandle {}
+    impl Drop for OwnedHandle {
+        fn drop(&mut self) {
+            if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
+                unsafe { CloseHandle(self.0); }
+            }
+        }
+    }
+
+    /// The pseudoconsole, closable exactly once by whichever of the waiter thread
+    /// and the pane's Drop gets there first.
+    struct Console(Mutex<Option<HPCON>>);
+    impl Console {
+        fn close(&self) {
+            let hpc = self.0.lock().unwrap_or_else(|p| p.into_inner()).take();
+            if let Some(hpc) = hpc {
+                unsafe { ClosePseudoConsole(hpc); }
+            }
+        }
+    }
+
+    pub struct Pty {
+        console: Arc<Console>,
+        input:   Option<OwnedHandle>,
+        pid:     u32,
+    }
+
+    impl Drop for Pty {
+        fn drop(&mut self) {
+            let console = Arc::clone(&self.console);
+            let input = self.input.take();
+            std::thread::spawn(move || {
+                console.close();
+                drop(input);
+            });
+        }
+    }
+
+    fn coord(cols: usize, rows: usize) -> COORD {
+        COORD { X: cols.clamp(1, i16::MAX as usize) as i16, Y: rows.clamp(1, i16::MAX as usize) as i16 }
+    }
+
+    fn wide(s: &std::ffi::OsStr) -> Vec<u16> {
+        s.encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    /// The child's environment block (sorted `KEY=value\0…\0`), with
+    /// TERM=xterm-256color like the Unix backend sets.
+    fn environment_block() -> Vec<u16> {
+        let mut vars: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os()
+            .filter(|(k, _)| !k.eq_ignore_ascii_case("TERM"))
+            .collect();
+        vars.push(("TERM".into(), "xterm-256color".into()));
+        vars.sort_by_cached_key(|(k, _)| k.to_string_lossy().to_uppercase());
+        let mut block = Vec::new();
+        for (k, v) in vars {
+            block.extend(k.encode_wide());
+            block.push(b'=' as u16);
+            block.extend(v.encode_wide());
+            block.push(0);
+        }
+        block.push(0);
+        block
+    }
+
+    impl Pty {
+        pub fn child_pid(&self) -> u32 { self.pid }
+        pub fn raw_input(&self) -> RawInput {
+            self.input.as_ref().map_or(NO_INPUT, |h| h.0 as RawInput)
+        }
+
+        pub fn resize(&self, cols: usize, rows: usize) {
+            let guard = self.console.0.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(hpc) = *guard {
+                unsafe { ResizePseudoConsole(hpc, coord(cols, rows)); }
+            }
+        }
+
+        /// Start `argv` attached to a new pseudoconsole, with a reader thread feeding `sink`.
+        pub fn spawn(argv: &[String], cwd: Option<&std::path::Path>, cols: usize, rows: usize,
+            mut sink: OutputSink)
+            -> Result<(Pty, std::thread::JoinHandle<()>), String> {
+            let program = argv.first().ok_or("no program to run")?;
+            // Resolve the program ourselves: CreateProcessW only appends ".exe", so
+            // a script shim like "foo.cmd" would otherwise not be found.
+            let resolved = crate::os::find_executable(program)
+                .ok_or_else(|| format!("cannot start {program:?}: not found"))?;
+            let mut full_argv = argv.to_vec();
+            full_argv[0] = resolved.to_string_lossy().into_owned();
+            let mut cmdline: Vec<u16> = wide(crate::os::windows_command_line(&full_argv).as_ref());
+            let app_name = wide(resolved.as_os_str());
+            // A directory that no longer exists would fail the whole spawn; start in
+            // the default directory instead (Unix ignores a failed chdir the same way).
+            let cwd_w = cwd.filter(|d| d.is_dir()).map(|d| wide(d.as_os_str()));
+            let env = environment_block();
+
+            unsafe {
+                // Pipes: we write keystrokes into `in_write`; the console reads `in_read`.
+                // The console writes VT output into `out_write`; we read `out_read`.
+                let (mut in_read, mut in_write): (HANDLE, HANDLE) = (std::ptr::null_mut(), std::ptr::null_mut());
+                let (mut out_read, mut out_write): (HANDLE, HANDLE) = (std::ptr::null_mut(), std::ptr::null_mut());
+                if CreatePipe(&mut in_read, &mut in_write, std::ptr::null(), 0) == 0 {
+                    return Err(format!("CreatePipe failed: {}", std::io::Error::last_os_error()));
+                }
+                let (in_read, in_write) = (OwnedHandle(in_read), OwnedHandle(in_write));
+                if CreatePipe(&mut out_read, &mut out_write, std::ptr::null(), 0) == 0 {
+                    return Err(format!("CreatePipe failed: {}", std::io::Error::last_os_error()));
+                }
+                let (out_read, out_write) = (OwnedHandle(out_read), OwnedHandle(out_write));
+
+                let mut hpc: HPCON = 0;
+                let hr = CreatePseudoConsole(coord(cols, rows), in_read.0, out_write.0, 0, &mut hpc);
+                if hr != 0 {
+                    return Err(format!(
+                        "CreatePseudoConsole failed (0x{hr:08x}); terminals need Windows 10 1809 or later",
+                    ));
+                }
+                // The console holds its own duplicates; ours must close so EOF can arrive.
+                drop(in_read);
+                drop(out_write);
+                let console = Arc::new(Console(Mutex::new(Some(hpc))));
+
+                // Attribute list attaching the child to the pseudoconsole (backed by a
+                // Vec<usize> for pointer alignment).
+                let mut size = 0usize;
+                InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut size);
+                let mut attr_buf = vec![0usize; size.div_ceil(std::mem::size_of::<usize>()).max(1)];
+                let attrs = attr_buf.as_mut_ptr().cast::<c_void>();
+                if InitializeProcThreadAttributeList(attrs, 1, 0, &mut size) == 0 {
+                    console.close();
+                    return Err(format!("InitializeProcThreadAttributeList failed: {}", std::io::Error::last_os_error()));
+                }
+                let attached = UpdateProcThreadAttribute(
+                    attrs, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
+                    hpc as *const c_void, std::mem::size_of::<HPCON>(),
+                    std::ptr::null_mut(), std::ptr::null(),
+                );
+                if attached == 0 {
+                    DeleteProcThreadAttributeList(attrs);
+                    console.close();
+                    return Err(format!("UpdateProcThreadAttribute failed: {}", std::io::Error::last_os_error()));
+                }
+
+                let mut si: STARTUPINFOEXW = std::mem::zeroed();
+                si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+                // Don't let the child inherit our own (possibly redirected) stdio in
+                // place of the pseudoconsole.
+                si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+                si.StartupInfo.hStdInput = INVALID_HANDLE_VALUE;
+                si.StartupInfo.hStdOutput = INVALID_HANDLE_VALUE;
+                si.StartupInfo.hStdError = INVALID_HANDLE_VALUE;
+                si.lpAttributeList = attrs;
+                let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
+                let created = CreateProcessW(
+                    app_name.as_ptr(),
+                    cmdline.as_mut_ptr(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                    EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+                    env.as_ptr().cast(),
+                    cwd_w.as_ref().map_or(std::ptr::null(), |d| d.as_ptr()),
+                    &si.StartupInfo,
+                    &mut pi,
+                );
+                let create_err = std::io::Error::last_os_error();
+                DeleteProcThreadAttributeList(attrs);
+                drop(attr_buf);
+                if created == 0 {
+                    console.close();
+                    return Err(format!("cannot start {program:?}: {create_err}"));
+                }
+                drop(OwnedHandle(pi.hThread));
+                let process = OwnedHandle(pi.hProcess);
+
+                // Waiter: when the child exits, close the console so the reader sees EOF.
+                let waiter_console = Arc::clone(&console);
+                std::thread::spawn(move || {
+                    WaitForSingleObject(process.0, INFINITE);
+                    drop(process);
+                    waiter_console.close();
+                });
+
+                let reader = std::thread::spawn(move || {
+                    let out_read = out_read;
+                    let mut buf = [0u8; 4096];
+                    let mut forwarding = true;
+                    loop {
+                        let mut n = 0u32;
+                        let ok = ReadFile(out_read.0, buf.as_mut_ptr(), buf.len() as u32, &mut n, std::ptr::null_mut());
+                        if ok == 0 || n == 0 { break; } // console closed (broken pipe)
+                        if !forwarding { continue; } // keep draining so the close can finish
+                        let data: Box<[u8]> = buf[..n as usize].into();
+                        forwarding = sink(Some(data));
+                    }
+                    sink(None);
+                });
+
+                Ok((Pty { console, input: Some(in_write), pid: pi.dwProcessId }, reader))
+            }
+        }
     }
 }
 
@@ -1061,6 +1421,15 @@ mod tests {
     }
 
     #[test]
+    fn osc9_9_reports_cwd() {
+        let mut g = TermGrid::new(8, 2);
+        drive(&mut g, b"\x1b]9;9;\"/home/me/a;b\"\x1b\\");
+        assert_eq!(g.cwd.as_deref(), Some(std::path::Path::new("/home/me/a;b")));
+        assert_eq!(parse_osc9_9_path("relative"), None);
+        assert_eq!(parse_osc9_9_path("\"/x\u{1b}\""), None);
+    }
+
+    #[test]
     fn osc7_decodes_utf8_paths() {
         assert_eq!(
             parse_osc7_path("file://host/home/me/caf%C3%A9 dir"),
@@ -1073,15 +1442,71 @@ mod tests {
         assert!(parse_osc7_path("file:///bad/%FF%FE").is_none());
     }
 
+    #[cfg(unix)]
     #[test]
-    fn prepared_exec_resolves_shell_and_sets_term() {
-        let exec = PreparedExec::new("sh", false, None).unwrap();
+    fn prepared_exec_resolves_program_and_sets_term() {
+        let exec = sys::PreparedExec::new(&["sh".to_owned()], None).unwrap();
         assert!(exec.program.to_bytes().ends_with(b"/sh"));
         assert!(exec._envp.iter().any(|e| e.to_bytes() == b"TERM=xterm-256color"));
         assert_eq!(exec.argv_ptrs.last().copied(), Some(std::ptr::null()));
-        let ov = PreparedExec::new("echo hi", true, None).unwrap();
-        assert_eq!(ov.program.to_bytes(), b"/bin/sh");
-        assert_eq!(ov._argv.len(), 3);
+        // An argv runs directly (no `sh -c`), keeping each argument intact.
+        let ov = sys::PreparedExec::new(&["echo".to_owned(), "a b".to_owned()], None).unwrap();
+        assert!(ov.program.to_bytes().ends_with(b"/echo"));
+        assert_eq!(ov._argv.len(), 2);
+        assert_eq!(ov._argv[1].to_bytes(), b"a b");
+        assert!(sys::PreparedExec::new(&["no-such-program-lt".to_owned()], None).is_none());
+    }
+
+    /// Run `argv` in a real PTY, type `input`, and collect everything it prints
+    /// until it exits (or 10 s pass).
+    fn run_in_pty(argv: &[&str], input: &[u8]) -> String {
+        let (tx, rx) = std::sync::mpsc::channel::<Option<Box<[u8]>>>();
+        let argv: Vec<String> = argv.iter().map(|a| (*a).to_owned()).collect();
+        let (pty, _reader) = sys::Pty::spawn(&argv, None, 80, 24, Box::new(move |chunk| {
+            tx.send(chunk).is_ok()
+        })).expect("spawn");
+        pty.resize(100, 30);
+        if !input.is_empty() { PtyInput(pty.raw_input()).write(input); }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut out = Vec::new();
+        while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
+            match rx.recv_timeout(left) {
+                Ok(Some(data)) => out.extend_from_slice(&data),
+                Ok(None) | Err(_) => break,
+            }
+        }
+        drop(pty);
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pty_runs_argv_with_term_and_takes_input() {
+        // argv is exec'd directly: the space stays inside one argument.
+        let out = run_in_pty(&["sh", "-c", "printf 'term=%s\\n' \"$TERM\"; read l; echo \"got:$l\""], b"a b\r");
+        assert!(out.contains("term=xterm-256color"), "{out:?}");
+        assert!(out.contains("got:a b"), "{out:?}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pty_runs_argv_with_term_and_takes_input() {
+        let out = run_in_pty(&["cmd.exe", "/d", "/q", "/k", "echo term=%TERM%"], b"echo got:a b\rexit\r");
+        assert!(out.contains("term=xterm-256color"), "{out:?}");
+        assert!(out.contains("got:a b"), "{out:?}");
+    }
+
+    #[test]
+    fn missing_program_is_reported_not_spawned() {
+        let r = sys::Pty::spawn(&["no-such-program-lt".to_owned()], None, 80, 24, Box::new(|_| true));
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn configured_shell_overrides_default() {
+        assert_eq!(TermCommand::shell(&[]).argv().len(), 1);
+        let cmd = TermCommand::shell(&["bash".to_owned(), "--login".to_owned()]);
+        assert_eq!(cmd.argv(), vec!["bash".to_owned(), "--login".to_owned()]);
     }
 
     #[test]

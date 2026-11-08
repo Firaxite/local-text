@@ -794,6 +794,7 @@ dependencies = [
  "serde_json",
  "softbuffer",
  "vte",
+ "windows-sys 0.61.2",
  "winit",
 ]
 

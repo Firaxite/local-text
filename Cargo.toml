@@ -29,8 +29,25 @@ objc2-metal       = { version = "0.3", features = ["MTLCommandBuffer", "MTLComma
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 softbuffer = "0.4"
-# System clipboard (X11, plus Wayland compositors with data-control); macOS uses pbcopy/pbpaste.
+# System clipboard (X11, plus Wayland compositors with data-control, and Windows);
+# macOS uses pbcopy/pbpaste.
 arboard    = { version = "3.7", default-features = false, features = ["wayland-data-control"] }
+
+# Windows: ConPTY terminals, native file/message dialogs, process liveness,
+# ShellExecute (MIT/Apache-2.0; already pulled in by winit).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+    "Win32_UI_Controls_Dialogs",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [profile.release]
 strip = true

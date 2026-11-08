@@ -10,7 +10,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
@@ -321,7 +321,10 @@ pub fn start_server(
             .stderr(Stdio::piped());
         ssh_cmd.spawn().ok()?
     } else {
-        let mut local_cmd = Command::new(&bin);
+        // Resolve through PATH ourselves: on Windows npm-installed servers are
+        // `.cmd` shims, which `Command` (it only tries `.exe`) wouldn't find.
+        let program = crate::os::find_executable(&bin).unwrap_or_else(|| bin.clone().into());
+        let mut local_cmd = crate::os::command(&program);
         local_cmd.args(&args);
         for (k, v) in &overrides.env {
             local_cmd.env(k, v);

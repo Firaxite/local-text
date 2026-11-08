@@ -86,6 +86,11 @@ pub struct Settings {
     pub organize_imports_on_save: String,  // comma-separated globs
     #[serde(default)]
     pub format_command:           String,  // e.g. "rustfmt" or "prettier --write {file}"
+    /// Program (+ arguments) a new terminal runs, e.g. `["bash", "--login"]` or on
+    /// Windows `["C:\\Program Files\\Git\\bin\\bash.exe", "--login"]`, `["wsl.exe"]`.
+    /// Empty = `$SHELL` (macOS/Linux) or PowerShell (Windows).
+    #[serde(default)]
+    pub terminal_shell:           Vec<String>,
     #[serde(default)]
     pub glyph_cache_limit: GlyphCacheLimit,
     #[serde(default = "Settings::default_cpu_double_buffer")]
@@ -140,6 +145,7 @@ impl Default for Settings {
             format_on_save:           String::new(),
             organize_imports_on_save: String::new(),
             format_command:           String::new(),
+            terminal_shell:           Vec::new(),
             glyph_cache_limit:        GlyphCacheLimit::Unlimited,
             cpu_double_buffer:        Self::default_cpu_double_buffer(),
             gpu_drawable_count:       Self::default_gpu_drawable_count(),
@@ -162,9 +168,9 @@ impl Settings {
     pub fn default_gpu_drawable_count() -> u8 { 2 }
     pub fn default_collab_port() -> u16 { 7777 }
 
+    /// `config.json` in the platform config directory (see `os::config_dir`).
     fn config_path() -> Option<PathBuf> {
-        let home = std::env::var("HOME").ok()?;
-        let dir  = PathBuf::from(home).join(".config").join("local-text");
+        let dir = crate::os::config_dir()?;
         fs::create_dir_all(&dir).ok()?;
         Some(dir.join("config.json"))
     }

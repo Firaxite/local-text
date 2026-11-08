@@ -10,12 +10,16 @@
 //   <runtime>/lsp/<pid>-<op_id>.json   one tiny entry per running server
 //   <runtime>/ctl/p-<pid>.sock         one Unix control socket per process
 //
+// On Windows (no Unix sockets in std) the control channel is a loopback TCP
+// listener instead, and `ctl/p-<pid>.port` holds "<port> <token>": loopback is
+// reachable by every local user, so each request must start with the token,
+// which only the owner can read from its private runtime dir.
+//
 // The mechanism is best-effort and self-healing, not a correctness lock: dead
-// processes are detected (kill(0) + socket connect) and their entries GC'd by
-// whichever process next scans, so a crash never permanently holds a slot.
+// processes are detected (pid liveness + control connect) and their entries GC'd
+// by whichever process next scans, so a crash never permanently holds a slot.
 
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
@@ -78,7 +82,93 @@ fn ctl_dir() -> Option<PathBuf> {
 }
 
 fn ctl_socket_path(pid: u32) -> PathBuf {
-    crate::vpath::control_socket_dir().join("ctl").join(format!("p-{pid}.sock"))
+    let name = if cfg!(windows) { format!("p-{pid}.port") } else { format!("p-{pid}.sock") };
+    crate::vpath::control_socket_dir().join("ctl").join(name)
+}
+
+// ── Control channel transport ────────────────────────────────────────────────
+
+/// Unix-domain sockets: the 0700 runtime dir is the access control.
+#[cfg(unix)]
+mod transport {
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::path::Path;
+
+    pub type Stream = UnixStream;
+
+    pub struct Listener(UnixListener);
+
+    impl Listener {
+        pub fn bind(path: &Path) -> Option<Self> {
+            let _ = std::fs::remove_file(path); // clear any stale socket from a prior same-pid run
+            UnixListener::bind(path).ok().map(Listener)
+        }
+        pub fn accept(&self) -> std::io::Result<Stream> { self.0.accept().map(|(s, _)| s) }
+    }
+
+    pub fn connect(path: &Path) -> std::io::Result<Stream> { UnixStream::connect(path) }
+    /// Read and check the connection's credentials line (none on Unix).
+    pub fn authenticate<R: std::io::BufRead>(_reader: &mut R, _path: &Path) -> bool { true }
+    pub fn send_credentials<W: std::io::Write>(_w: &mut W, _path: &Path) -> std::io::Result<()> { Ok(()) }
+}
+
+/// Loopback TCP + a random token published in the private runtime dir.
+#[cfg(not(unix))]
+mod transport {
+    use std::net::{Ipv4Addr, TcpListener, TcpStream};
+    use std::path::Path;
+    use std::time::Duration;
+
+    pub type Stream = TcpStream;
+
+    pub struct Listener(TcpListener);
+
+    impl Listener {
+        pub fn bind(path: &Path) -> Option<Self> {
+            use rand::RngCore;
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).ok()?;
+            let port = listener.local_addr().ok()?.port();
+            let mut raw = [0u8; 16];
+            rand::thread_rng().fill_bytes(&mut raw);
+            let token: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+            // Write atomically so a reader never sees a half-written token.
+            let tmp = path.with_extension("tmp");
+            std::fs::write(&tmp, format!("{port} {token}")).ok()?;
+            std::fs::rename(&tmp, path).ok()?;
+            Some(Listener(listener))
+        }
+        pub fn accept(&self) -> std::io::Result<Stream> { self.0.accept().map(|(s, _)| s) }
+    }
+
+    fn read_endpoint(path: &Path) -> std::io::Result<(u16, String)> {
+        let text = std::fs::read_to_string(path)?;
+        let (port, token) = text.trim().split_once(' ')
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad endpoint file"))?;
+        let port = port.parse::<u16>()
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad port"))?;
+        Ok((port, token.to_owned()))
+    }
+
+    pub fn connect(path: &Path) -> std::io::Result<Stream> {
+        let (port, _) = read_endpoint(path)?;
+        TcpStream::connect_timeout(&(Ipv4Addr::LOCALHOST, port).into(), Duration::from_secs(2))
+    }
+
+    /// The first line of every request must be our token.
+    pub fn authenticate<R: std::io::BufRead>(reader: &mut R, path: &Path) -> bool {
+        let Ok((_, token)) = read_endpoint(path) else { return false };
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 { return false; }
+        let got = line.trim().as_bytes();
+        // Compare without an early exit so timing doesn't leak the prefix.
+        got.len() == token.len()
+            && got.iter().zip(token.as_bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+    }
+
+    pub fn send_credentials<W: std::io::Write>(w: &mut W, path: &Path) -> std::io::Result<()> {
+        let (_, token) = read_endpoint(path)?;
+        w.write_all(format!("{token}\n").as_bytes())
+    }
 }
 
 fn entry_path(dir: &std::path::Path, pid: u32, op_id: usize) -> PathBuf {
@@ -134,17 +224,17 @@ pub fn cleanup_self() {
 
 // ── Discovery + liveness ─────────────────────────────────────────────────────
 
-/// `kill(pid, 0) == 0` — process exists and is signalable. All registry entries
-/// belong to our uid (the dir is per-uid 0700), so EPERM cannot occur here.
+/// The process exists. All registry entries belong to this user (the runtime dir
+/// is private), so a permission error can't hide a live process here.
 fn pid_alive(pid: u32) -> bool {
-    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    crate::os::pid_alive(pid)
 }
 
 /// A live local-text process holds a connectable control socket. This guards
 /// against PID reuse: a recycled pid running some unrelated program won't have
 /// our socket. A stale socket file with no listener yields ECONNREFUSED.
 fn ctl_socket_responsive(pid: u32) -> bool {
-    UnixStream::connect(ctl_socket_path(pid)).is_ok()
+    transport::connect(&ctl_socket_path(pid)).is_ok()
 }
 
 fn is_live(entry: &LspRegistryEntry) -> bool {
@@ -204,23 +294,25 @@ pub fn start_control_listener(proxy: EventLoopProxy<UserEvent>) -> Option<Contro
     let _ = ctl_dir()?; // ensure dir exists
     let pid = std::process::id();
     let path = ctl_socket_path(pid);
-    let _ = std::fs::remove_file(&path); // clear any stale socket from a prior same-pid run
-    let listener = UnixListener::bind(&path).ok()?;
+    let listener = transport::Listener::bind(&path)?;
+    let conn_path = path.clone();
     thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(stream) = stream else { continue };
+        loop {
+            let Ok(stream) = listener.accept() else { continue };
             let proxy = proxy.clone();
-            thread::spawn(move || handle_conn(stream, &proxy));
+            let path = conn_path.clone();
+            thread::spawn(move || handle_conn(stream, &path, &proxy));
         }
     });
     Some(ControlListener { path })
 }
 
-fn handle_conn(stream: UnixStream, proxy: &EventLoopProxy<UserEvent>) {
+fn handle_conn(stream: transport::Stream, path: &std::path::Path, proxy: &EventLoopProxy<UserEvent>) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
     let mut writer = match stream.try_clone() { Ok(s) => s, Err(_) => return };
     let mut reader = BufReader::new(stream);
+    if !transport::authenticate(&mut reader, path) { return; }
     let mut line = String::new();
     // 0 bytes = bare connect (a liveness probe) or EOF — nothing to answer.
     if reader.read_line(&mut line).unwrap_or(0) == 0 { return; }
@@ -253,10 +345,12 @@ fn handle_conn(stream: UnixStream, proxy: &EventLoopProxy<UserEvent>) {
 // ── Control socket: client side ──────────────────────────────────────────────
 
 fn send_request(pid: u32, req: &CtlRequest) -> std::io::Result<CtlResponse> {
-    let stream = UnixStream::connect(ctl_socket_path(pid))?;
+    let path = ctl_socket_path(pid);
+    let stream = transport::connect(&path)?;
     stream.set_read_timeout(Some(Duration::from_secs(6)))?;
     stream.set_write_timeout(Some(Duration::from_secs(6)))?;
     let mut writer = stream.try_clone()?;
+    transport::send_credentials(&mut writer, &path)?;
     let mut line = serde_json::to_string(req).unwrap_or_default();
     line.push('\n');
     writer.write_all(line.as_bytes())?;

@@ -1,3 +1,7 @@
+// Release builds on Windows are GUI programs: no console window behind the editor.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
+mod os;
 mod platform;
 mod settings;
 mod terminal;
@@ -179,18 +183,78 @@ const SB_THUMB:   u32 = 0x414868;
 
 // ── Glyph cache ───────────────────────────────────────────────────────────────
 
-// Fallback font paths tried in order when a character isn't in the primary font.
+// Fallback fonts tried in order when a character isn't in the primary font: a
+// symbols font, then a math font. Each slot lists alternative locations (distros
+// install the same font in different places); the first that exists is used.
 // Fonts are loaded lazily on first use to avoid paying ~43 MiB of heap at startup
 // for font outlines (fontdue parses all glyphs eagerly in Font::from_bytes).
-const FALLBACK_PATHS: &[&str] = &[
-    "/System/Library/Fonts/Apple Symbols.ttf",
-    "/System/Library/Fonts/Symbol.ttf",
-    "/System/Library/Fonts/Supplemental/STIXTwoMath.otf",
+#[cfg(target_os = "macos")]
+const FALLBACK_FONTS: &[&[&str]] = &[
+    &["/System/Library/Fonts/Apple Symbols.ttf"],
+    &["/System/Library/Fonts/Symbol.ttf"],
+    &["/System/Library/Fonts/Supplemental/STIXTwoMath.otf"],
 ];
+#[cfg(windows)]
+const FALLBACK_FONTS: &[&[&str]] = &[
+    &[r"%WINDIR%\Fonts\seguisym.ttf"],  // Segoe UI Symbol
+    &[r"%WINDIR%\Fonts\symbol.ttf"],
+    &[r"%WINDIR%\Fonts\cambria.ttc"],   // Cambria Math
+];
+#[cfg(all(unix, not(target_os = "macos")))]
+const FALLBACK_FONTS: &[&[&str]] = &[
+    &[
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",                      // Arch
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",          // Debian/Ubuntu
+        "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",        // Fedora
+        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+    ],
+    &[
+        "/usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf",
+        "/usr/share/fonts/google-noto/NotoSansSymbols2-Regular.ttf",
+    ],
+    &[
+        "/usr/share/fonts/noto/NotoSansMath-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSansMath-Regular.ttf",
+        "/usr/share/fonts/google-noto/NotoSansMath-Regular.ttf",
+    ],
+];
+
+/// A fallback font slot: not looked at yet, absent on this system, or loaded.
+#[derive(Clone)]
+enum FallbackFont { Unloaded, Missing, Loaded(Font) }
+
+impl FallbackFont {
+    fn load(candidates: &[&str]) -> Self {
+        candidates.iter()
+            .filter_map(|p| std::fs::read(expand_env_vars(p)).ok())
+            .find_map(|bytes| Font::from_bytes(bytes, FontSettings::default()).ok())
+            .map_or(FallbackFont::Missing, FallbackFont::Loaded)
+    }
+}
+
+/// Expand `%NAME%` (Windows-style) environment references in a font path.
+fn expand_env_vars(path: &str) -> PathBuf {
+    let mut out = String::new();
+    let mut rest = path;
+    while let Some(start) = rest.find('%') {
+        let Some(len) = rest[start + 1..].find('%') else { break };
+        let name = &rest[start + 1..start + 1 + len];
+        out.push_str(&rest[..start]);
+        match std::env::var(name) {
+            Ok(v) => out.push_str(&v),
+            Err(_) if name.eq_ignore_ascii_case("WINDIR") => out.push_str(r"C:\Windows"),
+            Err(_) => { out.push('%'); out.push_str(name); out.push('%'); }
+        }
+        rest = &rest[start + 2 + len..];
+    }
+    out.push_str(rest);
+    PathBuf::from(out)
+}
 
 struct Glyphs {
     font:       Font,
-    fallbacks:  Vec<Option<Font>>,  // None = not yet loaded; indexed parallel to FALLBACK_PATHS
+    fallbacks:  Vec<FallbackFont>,  // indexed parallel to FALLBACK_FONTS
     px:         f32,
     map:        HashMap<char, (Metrics, Vec<u8>)>,
     pub cw:     i32,
@@ -202,7 +266,7 @@ struct Glyphs {
 impl Glyphs {
     fn new(bytes: &[u8], px: f32) -> Self {
         let font = Font::from_bytes(bytes, FontSettings::default()).unwrap();
-        let mut s = Self { font, fallbacks: vec![None; FALLBACK_PATHS.len()],
+        let mut s = Self { font, fallbacks: vec![FallbackFont::Unloaded; FALLBACK_FONTS.len()],
                            px, map: HashMap::new(), cw: 0, lh: 0, asc: 0, max_entries: None };
         s.rebuild_cache(px);
         s
@@ -232,20 +296,19 @@ impl Glyphs {
             self.evict_if_over_cap();
             return;
         }
-        // Try fallback fonts; load lazily on first use
-        for i in 0..FALLBACK_PATHS.len() {
-            if self.fallbacks[i].is_none() {
-                self.fallbacks[i] = std::fs::read(FALLBACK_PATHS[i]).ok()
-                    .and_then(|b| Font::from_bytes(b, FontSettings::default()).ok());
+        // Try fallback fonts; load lazily on first use (and only once: a font
+        // that isn't installed is remembered as missing, not re-read every frame)
+        for i in 0..FALLBACK_FONTS.len() {
+            if matches!(self.fallbacks[i], FallbackFont::Unloaded) {
+                self.fallbacks[i] = FallbackFont::load(FALLBACK_FONTS[i]);
             }
-            let has_glyph = self.fallbacks[i].as_ref()
-                .map(|f| f.lookup_glyph_index(ch) != 0)
-                .unwrap_or(false);
-            if has_glyph {
-                let (m, b) = self.fallbacks[i].as_ref().unwrap().rasterize(ch, self.px);
-                self.map.insert(ch, (m, b));
-                self.evict_if_over_cap();
-                return;
+            if let FallbackFont::Loaded(f) = &self.fallbacks[i] {
+                if f.lookup_glyph_index(ch) != 0 {
+                    let (m, b) = f.rasterize(ch, self.px);
+                    self.map.insert(ch, (m, b));
+                    self.evict_if_over_cap();
+                    return;
+                }
             }
         }
         // Character not found in any font — leave absent so render skips it
@@ -810,15 +873,22 @@ impl LoadError {
 /// target. Symlinks are resolved so the link's target is updated (the link stays a
 /// link), and the original permissions are kept. Files with several hard links,
 /// or that belong to another user, are rewritten in place instead, since a rename
-/// would split the links or change the owner.
+/// would split the links or change the owner. On Windows, a rename that the OS
+/// refuses (the file is open elsewhere without delete sharing) also falls back to
+/// rewriting in place.
 fn write_file_atomically(path: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::MetadataExt;
-    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let target = os::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let meta = std::fs::metadata(&target).ok();
+    #[cfg(unix)]
     let in_place = meta.as_ref().map_or(false, |m| {
+        use std::os::unix::fs::MetadataExt;
         m.nlink() > 1 || m.uid() != unsafe { libc::geteuid() }
     });
+    // Windows: a read-only file can't be replaced by rename, and a read-only temp
+    // copy couldn't even be cleaned up — write in place (which reports the error).
+    #[cfg(not(unix))]
+    let in_place = meta.as_ref().is_some_and(|m| m.permissions().readonly());
     if in_place {
         return std::fs::write(&target, content);
     }
@@ -827,13 +897,16 @@ fn write_file_atomically(path: &std::path::Path, content: &[u8]) -> std::io::Res
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = dir.join(format!(".{name}.lt-save-{}-{n}", std::process::id()));
+    let mut renaming = false;
     let attempt = (|| -> std::io::Result<()> {
         let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
         f.write_all(content)?;
         f.sync_all()?;
+        drop(f); // Windows can't rename a file that is still open
         if let Some(m) = &meta {
             std::fs::set_permissions(&tmp, m.permissions())?;
         }
+        renaming = true;
         std::fs::rename(&tmp, &target)
     })();
     match attempt {
@@ -841,7 +914,7 @@ fn write_file_atomically(path: &std::path::Path, content: &[u8]) -> std::io::Res
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);
             // e.g. the directory isn't writable but the file is: fall back to in place.
-            if e.kind() == std::io::ErrorKind::PermissionDenied {
+            if e.kind() == std::io::ErrorKind::PermissionDenied || (cfg!(windows) && renaming) {
                 std::fs::write(&target, content)
             } else {
                 Err(e)
@@ -1473,13 +1546,12 @@ fn close_editor_tab(s: &mut State, pane_id: usize, tab_idx: usize) -> bool {
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // no dialog offers "Save" there
 enum UnsavedChoice { Save, Discard, Cancel }
 
-/// Ask what to do with unsaved changes. On macOS this is a native dialog. Other
-/// platforms have no dialog available, so the first attempt is refused with a
-/// status-bar explanation and repeating the same action within 5 s discards.
-#[cfg_attr(target_os = "macos", allow(unused_variables))] // `s`/`key` drive the non-macOS fallback
+/// Ask what to do with unsaved changes: a native dialog on macOS and Windows, and
+/// zenity / kdialog on Linux. Without either of those, the first attempt is refused
+/// with a status-bar explanation and repeating the same action within 5 s discards.
+#[cfg_attr(not(all(unix, not(target_os = "macos"))), allow(unused_variables))] // `s`/`key` drive the Linux fallback
 fn ask_unsaved(s: &mut State, key: &str, message: &str, can_save: bool) -> UnsavedChoice {
     #[cfg(target_os = "macos")]
     {
@@ -1502,9 +1574,25 @@ end run
             _ => UnsavedChoice::Cancel,
         }
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
     {
-        let _ = can_save;
+        if can_save {
+            match os::dialogs::yes_no_cancel(&format!("{message}\n\nYes: Save    No: Don't Save"), "local-text") {
+                Some(true) => UnsavedChoice::Save,
+                Some(false) => UnsavedChoice::Discard,
+                None => UnsavedChoice::Cancel,
+            }
+        } else if os::dialogs::ok_cancel(&format!("{message}\n\nOK: Don't Save"), "local-text") {
+            UnsavedChoice::Discard
+        } else {
+            UnsavedChoice::Cancel
+        }
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if let Some(choice) = linux_unsaved_dialog(message, can_save) {
+            return choice;
+        }
         let now = Instant::now();
         if let Some((armed, at)) = &s.discard_armed {
             if armed == key && now.duration_since(*at) < Duration::from_secs(5) {
@@ -1516,6 +1604,50 @@ end run
         s.status_msg = Some(format!("{message} Save first (Ctrl+S), or repeat within 5 s to discard."));
         UnsavedChoice::Cancel
     }
+}
+
+/// zenity / kdialog Save / Don't Save / Cancel question. None when neither is
+/// installed (the caller then falls back to the repeat-to-discard prompt).
+#[cfg(all(unix, not(target_os = "macos")))]
+fn linux_unsaved_dialog(message: &str, can_save: bool) -> Option<UnsavedChoice> {
+    let run = |bin: &str, args: &[&str]| {
+        os::command(bin).args(args)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output().ok()
+    };
+    // zenity renders --text as Pango markup: a file name with & or < must be escaped.
+    let text = format!("--text={}", message.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;"));
+    let mut zenity: Vec<&str> = vec!["--question", "--title=local-text", "--no-wrap", &text, "--cancel-label=Cancel"];
+    if can_save {
+        zenity.extend(["--ok-label=Save", "--extra-button=Don't Save"]);
+    } else {
+        zenity.push("--ok-label=Don't Save");
+    }
+    if let Some(out) = run("zenity", &zenity) {
+        // Save/OK → exit 0; the extra button prints its label and exits 1; Cancel or
+        // closing the window exits 1 with no output.
+        return Some(if out.status.success() {
+            if can_save { UnsavedChoice::Save } else { UnsavedChoice::Discard }
+        } else if String::from_utf8_lossy(&out.stdout).trim() == "Don't Save" {
+            UnsavedChoice::Discard
+        } else {
+            UnsavedChoice::Cancel
+        });
+    }
+    let out = if can_save {
+        run("kdialog", &["--title", "local-text", "--warningyesnocancel", message,
+            "--yes-label", "Save", "--no-label", "Don't Save"])
+    } else {
+        run("kdialog", &["--title", "local-text", "--warningcontinuecancel", message,
+            "--continue-label", "Don't Save"])
+    }?;
+    // kdialog: 0 = yes/continue, 1 = no, 2 = cancel.
+    Some(match (out.status.code(), can_save) {
+        (Some(0), true) => UnsavedChoice::Save,
+        (Some(0), false) | (Some(1), true) => UnsavedChoice::Discard,
+        _ => UnsavedChoice::Cancel,
+    })
 }
 
 /// True if another tab shares this tab's buffer (closing one view loses nothing).
@@ -1600,7 +1732,7 @@ fn request_quit(s: &mut State) -> bool {
 }
 
 /// Last-resort safety net: copy every unsaved buffer to
-/// `~/.local/share/local-text/recovery/<time>-<pid>/` (used when the app exits
+/// `<data dir>/recovery/<time>-<pid>/` (see `os::data_dir`; used when the app exits
 /// without our prompt — e.g. Cmd+Q from the menu — or after a crash).
 fn write_recovery_files(s: &State) -> Option<PathBuf> {
     let dirty = dirty_buffers(s);
@@ -1611,7 +1743,8 @@ fn write_recovery_files(s: &State) -> Option<PathBuf> {
     let mut index = String::new();
     for (n, (pid, ti)) in dirty.into_iter().enumerate() {
         let tab = &s.panes[&pid].tabs[ti];
-        let name = format!("{n}-{}", tab.display_name().replace('/', "_"));
+        // Strip characters that aren't allowed in file names on any platform.
+        let name = format!("{n}-{}", tab.display_name().replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_"));
         let content: String = tab.text.chunks().collect();
         if std::fs::write(dir.join(&name), content).is_ok() {
             let original = tab.path.as_ref().map(|p| p.to_string()).unwrap_or_else(|| "(untitled)".to_owned());
@@ -1624,8 +1757,7 @@ fn write_recovery_files(s: &State) -> Option<PathBuf> {
 }
 
 fn recovery_base_dir() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".local/share/local-text/recovery"))
+    Some(os::data_dir()?.join("recovery"))
 }
 
 fn close_terminal_tab(s: &mut State, pane_id: usize, tab_idx: usize) -> bool {
@@ -1901,69 +2033,20 @@ fn open_terminal_pane_at(s: &mut State, cwd: Option<VPath>) {
     let proxy = s.proxy.clone();
     // If we're in a remote workspace, open an SSH session instead of a local shell.
     let tp = if let Some(host) = active_workspace_ssh_host(s) {
-        // Build the SSH command. ControlMaster=no so this child never tries to become
-        // a new master (the master is managed separately by ensure_control_master).
-        // Include -p PORT when the host uses a non-standard port.
-        // If a remote cwd was requested, prepend `cd '/path' &&` to the remote command so
-        // the SSH session starts in the right directory.
-        let port_part = host.port.map(|p| format!(" -p {p}")).unwrap_or_default();
-        // Extract the remote path component if a remote cwd was provided.
-        let remote_cwd: Option<String> = cwd.as_ref().and_then(|v| match v {
-            VPath::Remote { path, .. } => Some(path.to_string_lossy().into_owned()),
+        // `ssh … host`, or with a remote cwd `ssh -t … host -- cd <dir> && exec $SHELL -l`
+        // (see ssh::terminal_argv). Run directly as an argv, so no local shell
+        // re-parses the path or the host.
+        let remote_cwd = cwd.as_ref().and_then(|v| match v {
+            VPath::Remote { path, .. } => Some(path.as_path()),
             _ => None,
         });
-        let ssh_cmd = if let Some(ref rdir) = remote_cwd {
-            // Build `ssh ... host "cd '<path>' && exec \$SHELL"`.
-            // \$SHELL prevents local sh from expanding $SHELL; the remote shell does it.
-            //
-            // Tilde handling: single-quotes prevent ~ from expanding on the remote.
-            // If the path starts with ~, replace it with \$HOME (which the local sh
-            // leaves as literal $HOME, allowing the remote shell to expand it to the
-            // remote user's home directory). Use double-quoting on the remote side so
-            // spaces in the rest of the path work too.
-            // -t: force PTY allocation on the remote side. Without -t, SSH doesn't
-            // allocate a remote PTY when a command is given, so $TERM is unknown,
-            // ncurses/nano/htop fail, Ctrl+D doesn't work, and closing the tab hangs
-            // the app (reader thread blocks waiting for a PTY that never sends EOF).
-            // -l: start the replacement shell as a login shell so ~/.bash_profile /
-            // ~/.zprofile are sourced and PATH is complete.
-            if rdir.starts_with('~') {
-                let after_tilde = &rdir[1..]; // "" for "~", "/rest" for "~/rest"
-                // Escape \ and " for the inner double-quoted path on the remote.
-                let rest_esc = after_tilde
-                    .replace('\\', "\\\\\\\\") // \ → \\\\ (4 chars → remote sees \)
-                    .replace('"', "\\\\\"");    // " → \\\" (remote sees \")
-                format!(
-                    "ssh -t -o ControlPath={} -o ControlMaster=no{} {} \"cd \\\"\\$HOME{}\\\" && exec \\$SHELL -l\"",
-                    host.control_path().display(),
-                    port_part,
-                    host.host_arg(),
-                    rest_esc,
-                )
-            } else {
-                // Absolute path — single-quote with standard ' → '\'' escaping.
-                let escaped = rdir.replace('\'', r"'\''");
-                format!(
-                    "ssh -t -o ControlPath={} -o ControlMaster=no{} {} \"cd '{}' && exec \\$SHELL -l\"",
-                    host.control_path().display(),
-                    port_part,
-                    host.host_arg(),
-                    escaped,
-                )
-            }
-        } else {
-            format!(
-                "ssh -o ControlPath={} -o ControlMaster=no{} {}",
-                host.control_path().display(),
-                port_part,
-                host.host_arg(),
-            )
-        };
-        terminal::spawn_terminal_with_shell(term_id, cols, rows, proxy, Some(ssh_cmd), None)
+        let ssh_argv = ssh::terminal_argv(&host, remote_cwd);
+        terminal::spawn_terminal(term_id, cols, rows, proxy, terminal::TermCommand::Argv(ssh_argv), None)
     } else {
-        // Local terminal — pass the local cwd directly to the child via chdir.
+        // Local terminal — pass the local cwd directly to the child.
         let local_cwd = cwd.and_then(|v| v.as_local_path().map(|p| p.to_path_buf()));
-        terminal::spawn_terminal(term_id, cols, rows, proxy, local_cwd)
+        let shell = terminal::TermCommand::shell(&s.settings.terminal_shell);
+        terminal::spawn_terminal(term_id, cols, rows, proxy, shell, local_cwd)
     };
     s.term_panes.insert(term_id, tp);
     let pane = Pane { id: pane_id, kind: PaneKind::Terminal, tabs: vec![],
@@ -2030,11 +2113,13 @@ fn lsp_required_binaries(lang: Lang) -> &'static [&'static str] {
     }
 }
 
+/// Command typed into a new terminal to install a language server. Ends in `\r`
+/// (the Enter key) — PowerShell under ConPTY reads a bare `\n` as Ctrl+J.
 fn lsp_install_command(lang: Lang) -> Option<&'static str> {
     match lang {
-        Lang::TypeScript => Some("npm install -g typescript-language-server typescript\n"),
-        Lang::Rust       => Some("rustup component add rust-analyzer\n"),
-        Lang::Python     => Some("pip install python-lsp-server\n"),
+        Lang::TypeScript => Some("npm install -g typescript-language-server typescript\r"),
+        Lang::Rust       => Some("rustup component add rust-analyzer\r"),
+        Lang::Python     => Some("pip install python-lsp-server\r"),
         Lang::None | Lang::Json | Lang::Jsonc | Lang::Markdown | Lang::Css | Lang::Html => None,
     }
 }
@@ -2103,10 +2188,7 @@ fn check_lsp_binaries(s: &mut State) {
 
     for lang in langs {
         let bins = lsp_required_binaries(lang);
-        let installed = !bins.is_empty() && bins.iter().all(|bin| {
-            std::process::Command::new("which").arg(bin).output()
-                .map(|o| o.status.success()).unwrap_or(false)
-        });
+        let installed = !bins.is_empty() && bins.iter().all(|bin| os::find_executable(bin).is_some());
         s.lsp_installed.insert(lang, installed);
     }
 }
@@ -2292,8 +2374,9 @@ struct State {
     collab: Option<collab::CollabSession>,
     /// Before-snapshot captured in push_undo when collab is active, consumed by notify_collab_change.
     collab_before: Option<(usize, ropey::Rope)>, // (buf_id, text before the local edit)
-    /// Non-macOS "close again to discard" confirmation: what was armed and when.
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    /// Linux without zenity/kdialog: "close again to discard" confirmation —
+    /// what was armed and when.
+    #[cfg_attr(not(all(unix, not(target_os = "macos"))), allow(dead_code))]
     discard_armed: Option<(String, Instant)>,
     /// File list sent by the host (guest-side only); empty when hosting or not in a session.
     collab_file_list: Vec<String>,
@@ -3548,9 +3631,11 @@ fn term_word_bounds(row: &[terminal::Cell], col: usize) -> (usize, usize) {
     (lo, hi)
 }
 
-// Get CWD of a running process by PID.
-fn term_cwd(pid: libc::pid_t) -> Option<std::path::PathBuf> {
-    if pid <= 0 { return None; }
+// Get CWD of a running process by PID. Not available on Windows, where the
+// terminal relies on the shell reporting it (OSC 7 / OSC 9;9).
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(unused_variables))]
+fn term_cwd(pid: Option<u32>) -> Option<std::path::PathBuf> {
+    let pid = pid.filter(|&p| p > 0)?;
     #[cfg(target_os = "linux")]
     { std::fs::read_link(format!("/proc/{}/cwd", pid)).ok() }
     #[cfg(target_os = "macos")]
@@ -3564,7 +3649,7 @@ fn term_cwd(pid: libc::pid_t) -> Option<std::path::PathBuf> {
         const PATH_MAX: usize = 1024;
         let mut buf = vec![0u8; STRUCT_SIZE];
         let ret = unsafe {
-            libc::proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0,
+            libc::proc_pidinfo(pid as libc::c_int, PROC_PIDVNODEPATHINFO, 0,
                 buf.as_mut_ptr() as *mut libc::c_void, STRUCT_SIZE as libc::c_int)
         };
         if ret <= 0 { return None; }
@@ -3578,10 +3663,12 @@ fn term_cwd(pid: libc::pid_t) -> Option<std::path::PathBuf> {
     { None }
 }
 
-fn open_token(s: &mut State, token: &str, child_pid: libc::pid_t, osc_cwd: Option<std::path::PathBuf>) {
+fn open_token(s: &mut State, token: &str, child_pid: Option<u32>, osc_cwd: Option<std::path::PathBuf>) {
     if token.is_empty() { return; }
     if token.starts_with("http://") || token.starts_with("https://") {
-        let _ = std::process::Command::new("open").arg(token).spawn();
+        if let Err(e) = os::open_url(token) {
+            s.status_msg = Some(format!("Can't open {token}: {e}"));
+        }
         return;
     }
     // Parse optional :line:col suffix
@@ -3589,12 +3676,7 @@ fn open_token(s: &mut State, token: &str, child_pid: libc::pid_t, osc_cwd: Optio
     let line = line.unwrap_or(0);
     let col  = col.unwrap_or(0);
     // Expand ~
-    let expanded = if let Some(rest) = path_part.strip_prefix("~/") {
-        std::env::var("HOME").map(|h| format!("{}/{}", h, rest)).unwrap_or_else(|_| path_part.to_owned())
-    } else {
-        path_part.to_owned()
-    };
-    let pb = std::path::PathBuf::from(&expanded);
+    let pb = os::expand_home(path_part).unwrap_or_else(|| std::path::PathBuf::from(path_part));
     // Try as absolute path
     if pb.is_absolute() {
         if pb.exists() {
@@ -3880,9 +3962,17 @@ fn propagate_to_siblings(s: &mut State, pane_id: usize, tab_idx: usize) {
 
 /// Get the username from the environment for the collab peer name.
 fn whoami_or_default() -> String {
-    std::env::var("USER")
-        .or_else(|_| std::env::var("USERNAME"))
-        .unwrap_or_else(|_| "Guest".to_owned())
+    os::user_name().unwrap_or_else(|| "Guest".to_owned())
+}
+
+/// `\` → `/` on Windows (path display strings), unchanged elsewhere.
+fn to_slashes(s: &str) -> std::borrow::Cow<'_, str> {
+    if cfg!(windows) && s.contains('\\') { s.replace('\\', "/").into() } else { s.into() }
+}
+
+/// The last component of a path string (either separator on Windows).
+fn path_basename(s: &str) -> &str {
+    s.rsplit(|c| c == '/' || (cfg!(windows) && c == '\\')).next().unwrap_or(s)
 }
 
 // ── Syntax highlighter ────────────────────────────────────────────────────────
@@ -5102,7 +5192,9 @@ fn open_file_dialog() -> Option<PathBuf> {
         let path = String::from_utf8(out.stdout).ok()?;
         Some(PathBuf::from(path.trim()))
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    { os::dialogs::open_file(Some(&dialog_start_dir())) }
+    #[cfg(all(unix, not(target_os = "macos")))]
     {
         let dir = dialog_start_dir();
         linux_dialog(&["--file-selection", "--title=Open File"], &["--getopenfilename", &dir])
@@ -5120,7 +5212,9 @@ fn save_file_dialog() -> Option<PathBuf> {
         let path = path.trim();
         (!path.is_empty()).then(|| PathBuf::from(path))
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    { os::dialogs::save_file(Some(&dialog_start_dir())) }
+    #[cfg(all(unix, not(target_os = "macos")))]
     {
         let dir = dialog_start_dir();
         linux_dialog(&["--file-selection", "--save", "--title=Save As"], &["--getsavefilename", &dir])
@@ -5142,7 +5236,9 @@ end run
         if !out.status.success() { return None; }
         String::from_utf8(out.stdout).ok()?.trim().to_owned()
     };
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    let name = os::dialogs::prompt(prompt, default)?.trim().to_owned();
+    #[cfg(all(unix, not(target_os = "macos")))]
     let name = linux_dialog(
         &["--entry", "--title=local-text", &format!("--text={prompt}"), &format!("--entry-text={default}")],
         &["--inputbox", prompt, default],
@@ -5160,10 +5256,10 @@ end run
 /// Linux has no built-in dialog API: use zenity (GNOME) or else kdialog (KDE).
 /// Returns what the tool printed; `None` when the user cancelled or neither
 /// tool is installed (see `dialog_tool_missing`).
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn linux_dialog(zenity: &[&str], kdialog: &[&str]) -> Option<String> {
     for (bin, args) in [("zenity", zenity), ("kdialog", kdialog)] {
-        let Ok(out) = std::process::Command::new(bin).args(args)
+        let Ok(out) = os::command(bin).args(args)
             .stdin(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .output()
@@ -5183,9 +5279,8 @@ fn dialog_start_dir() -> String {
 
 /// File/name dialogs can't be shown at all (Linux without zenity or kdialog).
 fn dialog_tool_missing() -> bool {
-    if MACOS { return false; }
-    let Some(path) = std::env::var_os("PATH") else { return true };
-    !std::env::split_paths(&path).any(|dir| dir.join("zenity").is_file() || dir.join("kdialog").is_file())
+    if MACOS || cfg!(windows) { return false; }
+    os::find_executable("zenity").is_none() && os::find_executable("kdialog").is_none()
 }
 
 fn unique_copy_destination(parent: &std::path::Path, source: &std::path::Path) -> PathBuf {
@@ -5221,7 +5316,17 @@ fn copy_path_recursively(source: &std::path::Path, destination: &std::path::Path
             std::os::unix::fs::symlink(std::fs::read_link(source)?, destination)?;
             return Ok(());
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            // Windows symlinks are typed; creating one needs Developer Mode or admin.
+            let link = std::fs::read_link(source)?;
+            return if std::fs::metadata(source).map_or(false, |m| m.is_dir()) {
+                std::os::windows::fs::symlink_dir(link, destination)
+            } else {
+                std::os::windows::fs::symlink_file(link, destination)
+            };
+        }
+        #[cfg(not(any(unix, windows)))]
         return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "symlink copy is unsupported"));
     }
     if metadata.is_file() {
@@ -5470,13 +5575,16 @@ fn fuzzy_score(query: &str, candidate: &str) -> Option<i32> {
 }
 
 fn fuzzy_score_path(query: &str, path_str: &str) -> Option<i32> {
+    // Windows paths use `\`; match on `/` throughout (queries may use either).
+    let (query, path_str) = (to_slashes(query), to_slashes(path_str));
+    let (query, path_str) = (query.as_ref(), path_str.as_ref());
     let depth = path_str.chars().filter(|&c| c == '/').count() as i32;
 
     // Absolute or home-relative queries: match against full path string
-    let abs_query = if query.starts_with('/') {
+    let abs_query = if query.starts_with('/') || std::path::Path::new(query).is_absolute() {
         Some(query.to_owned())
-    } else if let Some(rest) = query.strip_prefix("~/") {
-        std::env::var("HOME").ok().map(|h| format!("{}/{}", h, rest))
+    } else if query.starts_with("~/") {
+        os::expand_home(query).map(|p| to_slashes(&p.to_string_lossy()).into_owned())
     } else {
         None
     };
@@ -6053,15 +6161,14 @@ fn refilter_quick_finder(s: &mut State) {
                 path: std::path::PathBuf::from(p),
             })
         } else {
-            let expanded = if let Some(rest) = path_part.strip_prefix("~/") {
-                std::env::var("HOME").ok().map(|h| format!("{}/{}", h, rest))
-            } else if path_part.starts_with('/') {
-                Some(path_part.to_owned())
+            let expanded = if let Some(home_rel) = os::expand_home(path_part) {
+                Some(home_rel)
+            } else if path_part.starts_with('/') || std::path::Path::new(path_part).is_absolute() {
+                Some(std::path::PathBuf::from(path_part))
             } else {
                 None
             };
-            expanded.and_then(|p| {
-                let pb = std::path::PathBuf::from(&p);
+            expanded.and_then(|pb| {
                 if pb.exists() { Some(VPath::Local(pb)) } else { None }
             })
         };
@@ -6114,7 +6221,7 @@ fn refilter_tree_search(ex: &mut FileExplorer) {
             let sc = if ex.tree_search_fuzzy {
                 fuzzy_score_path(&q, &path_str)?
             } else {
-                let name = path_str.rsplit('/').next().unwrap_or(&path_str);
+                let name = path_basename(&path_str);
                 if name.to_lowercase().contains(&q as &str) { 0i32 } else { return None; }
             };
             Some((i, sc))
@@ -6733,13 +6840,13 @@ fn commit_settings_field(s: &mut State) {
 const MACOS: bool = cfg!(target_os = "macos");
 
 /// The app-shortcut modifier ("cmd" throughout the key handling): Command on
-/// macOS, Control on Linux.
+/// macOS, Control on Linux and Windows.
 fn primary_mod(m: ModifiersState) -> bool {
     if MACOS { m.super_key() } else { m.control_key() }
 }
 
 /// Shortcut labels are written macOS-style ("Cmd+S", "Opt+Shift+F"); show the
-/// Linux names there.
+/// Linux/Windows names there.
 fn key_label(label: &str) -> std::borrow::Cow<'_, str> {
     if MACOS || !(label.contains("Cmd") || label.contains("Opt+")) {
         return std::borrow::Cow::Borrowed(label);
@@ -6765,6 +6872,22 @@ fn terminal_has_keyboard(s: &State) -> bool {
         && !s.quick_finder.open && s.context_menu.is_none() && s.lsp_panel.is_none()
         && !sidebar_text_field_focused(s)
 }
+
+/// Windows has no AltGr modifier: it arrives as Ctrl+Alt. A key that, with both
+/// held, produces a different character than the bare key (AltGr+Q → "@" on a
+/// German layout) is typing, not a Ctrl+Alt shortcut.
+#[cfg(windows)]
+fn is_altgr_text(event: &winit::event::KeyEvent, mods: ModifiersState) -> bool {
+    use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
+    if !(mods.control_key() && mods.alt_key()) { return false; }
+    let Key::Character(c) = &event.logical_key else { return false };
+    let printable = event.text.as_deref().map_or(false, |t| !t.is_empty() && !t.chars().any(char::is_control));
+    printable && !matches!(event.key_without_modifiers(), Key::Character(ref b) if b.eq_ignore_ascii_case(c))
+}
+
+/// Other platforms report AltGr as its own modifier, never as Ctrl+Alt.
+#[cfg(not(windows))]
+fn is_altgr_text(_event: &winit::event::KeyEvent, _mods: ModifiersState) -> bool { false }
 
 /// A key event that only reports a modifier going down.
 fn is_modifier_key(key: &Key) -> bool {
@@ -6956,7 +7079,11 @@ fn execute_command(s: &mut State, action: CommandAction) {
                         let proxy = s.proxy.clone();
                         let cmd_str = build_format_command(&fmt_cmd, &local_str);
                         std::thread::spawn(move || {
-                            let _ = std::process::Command::new("sh").arg("-c").arg(&cmd_str).status();
+                            let _ = os::shell_command(&cmd_str)
+                                .stdin(std::process::Stdio::null())
+                                .stdout(std::process::Stdio::null())
+                                .stderr(std::process::Stdio::null())
+                                .status();
                             let _ = proxy.send_event(UserEvent::FormatterDone { path: path_clone, generation });
                         });
                     }
@@ -7311,11 +7438,12 @@ fn apply_delta(pos: usize, delta: isize, len: usize) -> usize {
 }
 
 /// Build the shell command line for the external formatter. `format_command` is the user's
-/// own setting, but the file path is interpolated into `sh -c`, so it MUST be shell-quoted:
-/// otherwise a maliciously-named file (e.g. `$(...).rs` from a cloned repo) would inject
-/// commands. `{file}` is substituted if present, otherwise the quoted path is appended.
+/// own setting, but the file path is interpolated into the platform shell (`sh -c`, or
+/// `cmd /c` on Windows — see `os::shell_command`), so it MUST be quoted: otherwise a
+/// maliciously-named file (e.g. `$(...).rs` from a cloned repo) would inject commands.
+/// `{file}` is substituted if present, otherwise the quoted path is appended.
 fn build_format_command(fmt_cmd: &str, file: &str) -> String {
-    let quoted = ssh::shell_quote(file);
+    let quoted = os::shell_quote_path(file);
     if fmt_cmd.contains("{file}") {
         fmt_cmd.replace("{file}", &quoted)
     } else {
@@ -7383,7 +7511,7 @@ fn run_git_op(s: &mut State, args: Vec<String>) {
     let proxy = s.proxy.clone();
     std::thread::spawn(move || {
         let error = match &root {
-            VPath::Local(dir) => match std::process::Command::new("git").args(&args).current_dir(dir).output() {
+            VPath::Local(dir) => match os::command("git").args(&args).current_dir(dir).stdin(std::process::Stdio::null()).output() {
                 Ok(o) if o.status.success() => None,
                 Ok(o) => Some(String::from_utf8_lossy(&o.stderr).trim().to_owned()),
                 Err(e) => Some(e.to_string()),
@@ -7447,11 +7575,7 @@ fn refresh_git_status(proxy: winit::event_loop::EventLoopProxy<UserEvent>, root:
         // paths are relative to the top level, not to a subdirectory we opened).
         const SCRIPT: &str = "top=$(git rev-parse --show-toplevel) || exit 128\nprintf '%s\\0' \"$top\"\ncd \"$top\" && git status --porcelain=v1 -z";
         let (output, error) = match &root {
-            VPath::Local(dir) => match std::process::Command::new("sh").args(["-c", SCRIPT]).current_dir(dir).output() {
-                Ok(o) if o.status.success() => (Some(String::from_utf8_lossy(&o.stdout).into_owned()), None),
-                Ok(_) => (None, None), // not a git repository
-                Err(e) => (None, Some(e.to_string())),
-            },
+            VPath::Local(dir) => local_git_status(dir),
             VPath::Remote { host, path } => {
                 let cmd = format!("cd {} || exit 1\n{SCRIPT}", remote_dir_expr(path));
                 match ssh::run_ssh_capture(host, &["sh", "-c", &cmd]) {
@@ -7477,6 +7601,26 @@ fn refresh_git_status(proxy: winit::event_loop::EventLoopProxy<UserEvent>, root:
     });
 }
 
+/// Local equivalent of the status SCRIPT above, without needing `sh` (Windows):
+/// "<toplevel>\0<porcelain -z status>", or (None, None) outside a repository.
+fn local_git_status(dir: &std::path::Path) -> (Option<String>, Option<String>) {
+    let git = |args: &[&str], cwd: &std::path::Path| {
+        os::command("git").args(args).current_dir(cwd).stdin(std::process::Stdio::null()).output()
+    };
+    let top = match git(&["rev-parse", "--show-toplevel"], dir) {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim_end_matches(['\r', '\n']).to_owned(),
+        Ok(_) => return (None, None), // not a git repository
+        Err(e) => return (None, Some(e.to_string())),
+    };
+    // git prints `C:/x` on Windows; make it a native path for comparisons.
+    let top = if cfg!(windows) { top.replace('/', "\\") } else { top };
+    match git(&["status", "--porcelain=v1", "-z"], std::path::Path::new(&top)) {
+        Ok(o) if o.status.success() => (Some(format!("{top}\0{}", String::from_utf8_lossy(&o.stdout))), None),
+        Ok(o) => (None, Some(String::from_utf8_lossy(&o.stderr).trim().to_owned())),
+        Err(e) => (None, Some(e.to_string())),
+    }
+}
+
 fn refresh_git_diff(
     proxy:  winit::event_loop::EventLoopProxy<UserEvent>,
     root:   VPath,
@@ -7490,9 +7634,10 @@ fn refresh_git_diff(
         args.push("--");
         args.push(&path);
         let text = match &root {
-            VPath::Local(dir) => std::process::Command::new("git")
+            VPath::Local(dir) => os::command("git")
                 .args(&args)
                 .current_dir(dir)
+                .stdin(std::process::Stdio::null())
                 .output()
                 .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
                 .unwrap_or_default(),
@@ -7830,9 +7975,9 @@ impl App {
     }
 
     fn handle_resumed(&mut self, el: &ActiveEventLoop) {
-        let mut attrs = WindowAttributes::default().with_title("local-text");
+        let attrs = WindowAttributes::default().with_title("local-text");
         #[cfg(target_os = "macos")]
-        { attrs = attrs.with_title_hidden(true).with_titlebar_transparent(true); }
+        let attrs = attrs.with_title_hidden(true).with_titlebar_transparent(true);
 
         let loaded_settings = settings::Settings::load();
 
@@ -8235,10 +8380,9 @@ impl App {
                                     let cb = if s.term_buttons_held & 1 != 0 { 32u8 | mod_bits }
                                              else { 35u8 | mod_bits };
                                     let sgr = tp.grid.mouse_sgr;
-                                    let pty_fd = tp.pty_fd;
+                                    let pty = tp.input();
                                     let bytes = terminal::encode_mouse(term_col, term_row, cb, true, sgr);
-                                    // SAFETY: pty_fd is valid (>= 0 checked); bytes slice lives for this synchronous call.
-                                    if pty_fd >= 0 { let _ = unsafe { libc::write(pty_fd, bytes.as_ptr().cast(), bytes.len()) }; }
+                                    pty.write(&bytes);
                                 }
                             }
                         }
@@ -8295,11 +8439,10 @@ impl App {
                                     if s.mods.alt_key()     { mod_bits |= 8; }
                                     if s.mods.control_key() { mod_bits |= 16; }
                                     let sgr = tp.grid.mouse_sgr;
-                                    let pty_fd = tp.pty_fd;
+                                    let pty = tp.input();
                                     let bytes = terminal::encode_mouse(term_col, term_row,
                                         if sgr { mod_bits } else { 3 | mod_bits }, false, sgr);
-                                    // SAFETY: pty_fd is valid (>= 0 checked); bytes slice lives for this synchronous call.
-                                    if pty_fd >= 0 { let _ = unsafe { libc::write(pty_fd, bytes.as_ptr().cast(), bytes.len()) }; }
+                                    pty.write(&bytes);
                                 }
                             }
                         }
@@ -9349,10 +9492,9 @@ impl App {
                                     if s.mods.alt_key()     { mod_bits |= 8; }
                                     if s.mods.control_key() { mod_bits |= 16; }
                                     let sgr = tp.grid.mouse_sgr;
-                                    let pty_fd = tp.pty_fd;
+                                    let pty = tp.input();
                                     let bytes = terminal::encode_mouse(term_col, term_row, mod_bits, true, sgr);
-                                    // SAFETY: pty_fd is valid (>= 0 checked); bytes slice lives for this synchronous call.
-                                    if pty_fd >= 0 { let _ = unsafe { libc::write(pty_fd, bytes.as_ptr().cast(), bytes.len()) }; }
+                                    pty.write(&bytes);
                                     s.term_buttons_held |= 1;
                                 } else {
                                     // Track click count for double-click detection
@@ -9542,8 +9684,7 @@ impl App {
                                     if let Some(&tid) = s.panes.get(&pane_id).and_then(|p| p.term_ids.get(p.active)) {
                                         if let Some(tp) = s.term_panes.get(&tid) {
                                             let bytes = cmd.as_bytes();
-                                            // SAFETY: pty_fd is valid (>= 0 checked); bytes slice lives for this synchronous call.
-                                            if tp.pty_fd >= 0 { unsafe { libc::write(tp.pty_fd, bytes.as_ptr().cast(), bytes.len()); } }
+                                            tp.write_input(bytes);
                                         }
                                     }
                                 }
@@ -9775,7 +9916,7 @@ impl App {
                             let mut hi = pos + 1;
                             while hi < len && !s.tab().text.char(hi).is_whitespace() { hi += 1; }
                             let token: String = s.tab().text.slice(lo..hi).chars().collect();
-                            open_token(s, &token, 0, None);
+                            open_token(s, &token, None, None);
                         }
                     }
                 } else if alt {
@@ -9909,15 +10050,14 @@ impl App {
                                 let n = (dy.unsigned_abs() as usize).min(3);
                                 let tp = s.term_panes.get(&tid).unwrap();
                                 let sgr = tp.grid.mouse_sgr;
-                                let pty_fd = tp.pty_fd;
+                                let pty = tp.input();
                                 let term_col = ((mx - pane_rect.x) / cw)
                                     .clamp(0, tp.grid.cols as i32 - 1) as usize;
                                 let term_row = ((my - content_y) / lh)
                                     .clamp(0, tp.grid.rows as i32 - 1) as usize;
                                 for _ in 0..n {
                                     let bytes = terminal::encode_mouse(term_col, term_row, cb, true, sgr);
-                                    // SAFETY: pty_fd is valid (>= 0 checked); bytes slice lives for this synchronous call.
-                                    if pty_fd >= 0 { let _ = unsafe { libc::write(pty_fd, bytes.as_ptr().cast(), bytes.len()) }; }
+                                    pty.write(&bytes);
                                 }
                             } else {
                                 let tp = s.term_panes.get_mut(&tid).unwrap();
@@ -9981,8 +10121,14 @@ impl App {
             WindowEvent::KeyboardInput { mut event, .. } if event.state == ElementState::Pressed => {
                 dlog!("[input] {:?}", event.logical_key);
                 s.status_msg = None;
+                // Windows reports AltGr as Ctrl+Alt: a character typed with it is text,
+                // not a Ctrl/Alt shortcut (nor a control code for the terminal). The
+                // next ModifiersChanged (releasing AltGr) restores the real state.
+                if is_altgr_text(&event, s.mods) {
+                    s.mods.remove(ModifiersState::CONTROL | ModifiersState::ALT);
+                }
                 let ctrl  = s.mods.control_key();
-                // App shortcuts use `cmd`: Command on macOS, Control on Linux (where
+                // App shortcuts use `cmd`: Command on macOS, Control on Linux/Windows (where
                 // `cmd` and `ctrl` are then both set; the places where Linux and
                 // macOS conventions differ check MACOS).
                 let cmd   = primary_mod(s.mods);
@@ -10552,16 +10698,13 @@ impl App {
                     if ctrl && shift && matches!(&event.logical_key, Key::Character(c) if matches!(c.as_str(), "5" | "%")) {
                         // If in a remote workspace, prefer SSH over duplicating the local shell.
                         let shell = if let Some(host) = active_workspace_ssh_host(s) {
-                            format!(
-                                "ssh -o ControlPath={} {}",
-                                host.control_path().display(),
-                                host.host_arg(),
-                            )
+                            terminal::TermCommand::Argv(ssh::terminal_argv(&host, None))
                         } else {
                             let p = &s.panes[&s.active_pane];
                             p.term_ids.get(p.active)
-                                .and_then(|&tid| s.term_panes.get(&tid).map(|tp| tp.shell.clone()))
-                                .unwrap_or_else(|| std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned()))
+                                .and_then(|&tid| s.term_panes.get(&tid).map(|tp| tp.command.clone()))
+                                .filter(|c| *c != terminal::TermCommand::Argv(Vec::new())) // not an LSP log
+                                .unwrap_or_else(|| terminal::TermCommand::shell(&s.settings.terminal_shell))
                         };
                         let pane_id = s.next_pane_id; s.next_pane_id += 1;
                         let term_id = s.next_pane_id; s.next_pane_id += 1;
@@ -10569,7 +10712,7 @@ impl App {
                         let cols = (area.w / s.glyphs.cw).max(1) as usize;
                         let rows = ((area.h / 2) / s.glyphs.lh).max(1) as usize;
                         let proxy = s.proxy.clone();
-                        let tp = terminal::spawn_terminal_with_shell(term_id, cols, rows, proxy, Some(shell), None);
+                        let tp = terminal::spawn_terminal(term_id, cols, rows, proxy, shell, None);
                         s.term_panes.insert(term_id, tp);
                         let new_pane = Pane { id: pane_id, kind: PaneKind::Terminal, tabs: vec![],
                                               term_ids: vec![term_id], active: 0, find: FindBar::new() };
@@ -10633,8 +10776,7 @@ impl App {
                             if let Some(&tid) = p.term_ids.get(p.active) {
                                 if let Some(tp) = s.term_panes.get(&tid) {
                                     let bytes = text.as_bytes();
-                                    // SAFETY: pty_fd is valid (>= 0 checked); bytes slice lives for this synchronous call.
-                                    if tp.pty_fd >= 0 { let _ = unsafe { libc::write(tp.pty_fd, bytes.as_ptr().cast(), bytes.len()) }; }
+                                    tp.write_input(bytes);
                                 }
                             }
                         }
@@ -10645,8 +10787,7 @@ impl App {
                         let p = &s.panes[&s.active_pane];
                         if let Some(&tid) = p.term_ids.get(p.active) {
                             if let Some(tp) = s.term_panes.get(&tid) {
-                                // SAFETY: pty_fd is valid (>= 0 checked); byte literal lives for this synchronous call.
-                                if tp.pty_fd >= 0 { let _ = unsafe { libc::write(tp.pty_fd, b"\x15".as_ptr().cast(), 1) }; }
+                                tp.write_input(b"\x15");
                             }
                         }
                         return;
@@ -10657,8 +10798,7 @@ impl App {
                         let p = &s.panes[&s.active_pane];
                         if let Some(&tid) = p.term_ids.get(p.active) {
                             if let Some(tp) = s.term_panes.get(&tid) {
-                                // SAFETY: pty_fd is valid (>= 0 checked); byte literal lives for this synchronous call.
-                                if tp.pty_fd >= 0 { let _ = unsafe { libc::write(tp.pty_fd, b"\x17".as_ptr().cast(), 1) }; }
+                                tp.write_input(b"\x17");
                             }
                         }
                         return;
@@ -10681,7 +10821,7 @@ impl App {
                         let pane = &s.panes[&s.active_pane];
                         pane.term_ids.get(pane.active).and_then(|tid| {
                             s.term_panes.get(tid)
-                                .map(|term| (term.pty_fd, term.grid.application_cursor))
+                                .map(|term| (term.input(), term.grid.application_cursor))
                         })
                     };
                     let application_cursor = target.map_or(false, |(_, mode)| mode);
@@ -10703,9 +10843,8 @@ impl App {
                         if meta { [b"\x1b".as_slice(), &b].concat() } else { b }
                     });
                     if let Some(bytes) = bytes {
-                        if let Some((pty_fd, _)) = target {
-                            // SAFETY: pty_fd is valid (>= 0 checked); bytes slice lives for this synchronous call.
-                            if pty_fd >= 0 { let _ = unsafe { libc::write(pty_fd, bytes.as_ptr().cast(), bytes.len()) }; }
+                        if let Some((pty, _)) = target {
+                            pty.write(&bytes);
                         }
                     }
                     return;
@@ -14174,14 +14313,14 @@ fn main() {
                     // Canonicalize to an absolute path so the LSP workspace root is a
                     // valid `file:///abs/path` URI. A relative arg like `.` would otherwise
                     // be sent as `rootUri: file://.`, which servers reject.
-                    let dir = std::fs::canonicalize(p).map(VPath::Local).unwrap_or(vp);
+                    let dir = os::canonicalize(p).map(VPath::Local).unwrap_or(vp);
                     (None, Some(dir))
                 }
                 VPath::Remote { .. }           => (None, Some(vp)),
                 // Files get an absolute path too (LSP URIs, matching explorer paths);
                 // a file that doesn't exist yet is made absolute against the cwd.
                 VPath::Local(p) => {
-                    let abs = std::fs::canonicalize(p).ok()
+                    let abs = os::canonicalize(p).ok()
                         .or_else(|| std::env::current_dir().ok().map(|cwd| cwd.join(p)))
                         .unwrap_or_else(|| p.clone());
                     (Some(VPath::Local(abs)), None)
@@ -14303,6 +14442,42 @@ mod tests {
         assert_eq!(apply_delta(0, -1, 0), 0);
     }
 
+    #[test]
+    fn local_save_replaces_contents_without_leftovers() {
+        let dir = test_dir("atomic-save-basic");
+        let target = dir.join("file with space.txt");
+        std::fs::write(&target, "old contents that are longer").unwrap();
+        write_file_atomically(&target, b"new").unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+        write_file_atomically(&dir.join("created.txt"), b"fresh").unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("created.txt")).unwrap(), "fresh");
+        let leftovers = std::fs::read_dir(&dir).unwrap().flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains("lt-save")).count();
+        assert_eq!(leftovers, 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn format_command_quotes_filename_for_cmd() {
+        assert_eq!(
+            build_format_command("prettier --write {file}", r"C:\My Docs\a&b.ts"),
+            r#"prettier --write "C:\My Docs\a&b.ts""#,
+        );
+        assert_eq!(build_format_command("rustfmt", r"C:\x.rs"), r#"rustfmt "C:\x.rs""#);
+    }
+
+    #[test]
+    fn fuzzy_path_matching_accepts_either_separator() {
+        assert!(fuzzy_score_path("src/main", "src/main.rs").is_some());
+        assert_eq!(path_basename("a/b/c.rs"), "c.rs");
+        if cfg!(windows) {
+            assert!(fuzzy_score_path("src/main", r"src\main.rs").is_some());
+            assert_eq!(path_basename(r"a\b\c.rs"), "c.rs");
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn format_command_shell_quotes_filename() {
         // A maliciously-named file must be quoted, not interpolated raw into `sh -c`.
@@ -14474,6 +14649,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[cfg(unix)]
     #[test]
     fn local_save_is_atomic_and_keeps_links_and_mode() {
         use std::os::unix::fs::PermissionsExt;

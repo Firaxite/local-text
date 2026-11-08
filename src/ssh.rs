@@ -7,6 +7,10 @@
 // This reuses the user's ~/.ssh/config, agent, jump hosts, and FIDO/Keychain
 // auth without pulling in any SSH library (russh is AGPL; ssh2 bypasses config).
 //
+// Windows' OpenSSH can't multiplex (ControlMaster needs Unix-domain sockets), so
+// there "connecting" is a one-off probe that checks auth and reads $HOME, and
+// every later command opens its own connection (see `MULTIPLEX`).
+//
 // Setup manifest: ~/.local/share/local-text/setup-manifest.json on each remote.
 // Bumping REQUIRED_SETUP_VERSION triggers a re-run of the structural bootstrap
 // script the next time that host is connected to.
@@ -14,6 +18,8 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+
+use crate::os::command as new_command;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -28,20 +34,96 @@ pub const REQUIRED_SETUP_VERSION: u32 = 1;
 
 // ── Public async entry points ─────────────────────────────────────────────────
 
+/// Whether commands share one connection per host through a ControlMaster socket.
+/// False on Windows, whose OpenSSH has no multiplexing.
+const MULTIPLEX: bool = cfg!(unix);
+
+/// Hosts verified reachable this session (Windows, where there is no socket file
+/// to show that a connection is up).
+fn verified_hosts() -> &'static std::sync::Mutex<std::collections::HashSet<SshHost>> {
+    static HOSTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<SshHost>>> =
+        std::sync::OnceLock::new();
+    HOSTS.get_or_init(Default::default)
+}
+
+/// A connection to `host` is up (its ControlMaster socket exists, or on Windows
+/// the host answered the connect probe).
+fn is_connected(host: &SshHost) -> bool {
+    if MULTIPLEX {
+        host.control_path().exists()
+    } else {
+        verified_hosts().lock().unwrap_or_else(|p| p.into_inner()).contains(host)
+    }
+}
+
+/// `ssh` options shared by every command for `host`: reuse the ControlMaster
+/// (never become a new one), and the port. Without multiplexing, a connect
+/// timeout so an unreachable host can't hang a command forever.
+pub fn base_args(host: &SshHost) -> Vec<String> {
+    let mut args = Vec::new();
+    if MULTIPLEX {
+        args.push("-o".to_owned());
+        args.push(format!("ControlPath={}", host.control_path().display()));
+        args.push("-o".to_owned());
+        args.push("ControlMaster=no".to_owned());
+    } else {
+        args.push("-o".to_owned());
+        args.push("ConnectTimeout=20".to_owned());
+    }
+    if let Some(port) = host.port {
+        args.push("-p".to_owned());
+        args.push(port.to_string());
+    }
+    args
+}
+
+/// A non-interactive `ssh` command for `host` (BatchMode: never prompt) running
+/// the already-quoted `remote_command`.
+fn batch_command(host: &SshHost, remote_command: String) -> Command {
+    let mut cmd = new_command("ssh");
+    cmd.args(base_args(host))
+       .arg("-o").arg("BatchMode=yes")
+       .arg(host.host_arg())
+       .arg("--")
+       .arg(remote_command);
+    cmd
+}
+
+/// argv for an interactive `ssh` session in a terminal pane, optionally starting
+/// in `remote_dir` (a login shell, so the remote PATH is complete).
+pub fn terminal_argv(host: &SshHost, remote_dir: Option<&Path>) -> Vec<String> {
+    let mut argv = vec!["ssh".to_owned()];
+    argv.extend(base_args(host));
+    match remote_dir {
+        Some(dir) => {
+            // -t: a command is given, so ask for a remote PTY explicitly. Without it
+            // $TERM is unknown, ncurses programs fail and Ctrl+D doesn't work. The
+            // command is parsed by the remote login shell (whatever it is), so it
+            // stays to syntax every common shell accepts.
+            argv.push("-t".to_owned());
+            argv.push(host.host_arg());
+            argv.push("--".to_owned());
+            argv.push(format!("cd {} && exec $SHELL -l", remote_path_expr(dir)));
+        }
+        None => argv.push(host.host_arg()),
+    }
+    argv
+}
+
 /// Ensure the SSH ControlMaster socket for `host` exists (creating it if
 /// needed).  Sends `SshConnected` on success or `SshError` on failure.
 /// If the socket already exists, this returns immediately via `SshConnected`.
 pub fn ensure_control_master(host: SshHost, proxy: EventLoopProxy<UserEvent>) {
-    let socket = host.control_path();
-    // Fast path: socket already exists and we know the remote home — no new thread needed.
-    if socket.exists() && crate::vpath::remote_home(&host).is_some() {
+    // Fast path: already connected and we know the remote home — no new thread needed.
+    if is_connected(&host) && crate::vpath::remote_home(&host).is_some() {
         let _ = proxy.send_event(UserEvent::SshConnected { host });
         return;
     }
     thread::spawn(move || {
-        if !socket.exists() {
+        if !is_connected(&host) {
             let _ = proxy.send_event(UserEvent::SshConnecting { host: host.clone() });
-            if let Err(msg) = open_control_master(&host) {
+            let opened = if MULTIPLEX { open_control_master(&host) } else { probe_host(&host) };
+            if let Err(msg) = opened {
                 let _ = proxy.send_event(UserEvent::SshError { host, msg });
                 return;
             }
@@ -52,13 +134,26 @@ pub fn ensure_control_master(host: SshHost, proxy: EventLoopProxy<UserEvent>) {
         }
         // Learn the real home directory so `~` paths can be made absolute (it is
         // `/root` for root and `/Users/<name>` on macOS, not always `/home/<user>`).
-        if let Ok(home) = run_ssh_capture(&host, &["sh", "-c", "printf '%s' \"$HOME\""]) {
-            if home.starts_with('/') && !home.contains('\n') {
-                crate::vpath::set_remote_home(&host, PathBuf::from(home));
+        if crate::vpath::remote_home(&host).is_none() {
+            if let Ok(home) = run_ssh_capture(&host, &["sh", "-c", "printf '%s' \"$HOME\""]) {
+                if home.starts_with('/') && !home.contains('\n') {
+                    crate::vpath::set_remote_home(&host, PathBuf::from(home));
+                }
             }
         }
         let _ = proxy.send_event(UserEvent::SshConnected { host });
     });
+}
+
+/// Without multiplexing: check that `host` accepts a non-interactive login, and
+/// remember it as connected.
+fn probe_host(host: &SshHost) -> Result<(), String> {
+    let home = run_ssh_capture(host, &["sh", "-c", "printf '%s' \"$HOME\""])?;
+    if home.starts_with('/') && !home.contains('\n') {
+        crate::vpath::set_remote_home(host, PathBuf::from(home));
+    }
+    verified_hosts().lock().unwrap_or_else(|p| p.into_inner()).insert(host.clone());
+    Ok(())
 }
 
 /// Read a file from a remote host.  Sends `RemoteFileContent` on success or
@@ -325,7 +420,6 @@ pub fn ssh_lsp_command(
     cwd: Option<&Path>,
     env: &[(String, String)],
 ) -> Command {
-    let mut cmd = Command::new("ssh");
     let remote_command = if path_dirs.is_empty() && cwd.is_none() && env.is_empty() {
         let mut remote_argv = Vec::with_capacity(args.len() + 1);
         remote_argv.push(bin);
@@ -351,16 +445,7 @@ pub fn ssh_lsp_command(
         }
         remote_command(&["sh", "-c", &script])
     };
-    cmd.arg("-o").arg(format!("ControlPath={}", host.control_path().display()))
-       .arg("-o").arg("ControlMaster=no")  // reuse existing master only
-       .arg("-o").arg("BatchMode=yes");
-    if let Some(port) = host.port {
-        cmd.arg("-p").arg(port.to_string());
-    }
-    cmd.arg(host.host_arg())
-       .arg("--")
-       .arg(remote_command);
-    cmd
+    batch_command(host, remote_command)
 }
 
 /// Read a small remote file synchronously over the warm ControlMaster, bounded
@@ -368,22 +453,18 @@ pub fn ssh_lsp_command(
 /// None on any error, non-zero exit, or timeout. Used to load a remote project's
 /// `.vscode/local-text.json` just before launching an LSP server.
 pub fn read_remote_file_sync(host: &SshHost, remote_path: &str) -> Option<String> {
-    let mut cmd = Command::new("ssh");
-    cmd.arg("-o").arg(format!("ControlPath={}", host.control_path().display()))
-       .arg("-o").arg("ControlMaster=no")  // reuse existing master only; fails fast if none
-       .arg("-o").arg("BatchMode=yes");
-    if let Some(port) = host.port {
-        cmd.arg("-p").arg(port.to_string());
-    }
-    cmd.arg(host.host_arg())
-       .arg("--")
-       .arg(remote_command(&["sh", "-c", &format!("cat -- {}", remote_path_expr(Path::new(remote_path)))]))
-       .stdin(Stdio::null())
+    let mut cmd = batch_command(
+        host,
+        remote_command(&["sh", "-c", &format!("cat -- {}", remote_path_expr(Path::new(remote_path)))]),
+    );
+    cmd.stdin(Stdio::null())
        .stdout(Stdio::piped())
        .stderr(Stdio::null());
     let (tx, rx) = std::sync::mpsc::channel();
     thread::spawn(move || { let _ = tx.send(cmd.output()); });
-    match rx.recv_timeout(Duration::from_millis(1200)) {
+    // Without multiplexing this is a fresh connection, so allow for the handshake.
+    let limit = if MULTIPLEX { Duration::from_millis(1200) } else { Duration::from_secs(5) };
+    match rx.recv_timeout(limit) {
         Ok(Ok(output)) if output.status.success() => String::from_utf8(output.stdout).ok(),
         _ => None,
     }
@@ -436,7 +517,7 @@ fn run_bootstrap(host: &SshHost, proxy: &EventLoopProxy<UserEvent>) {
 /// Blocks until the socket appears (up to 30 s) or the ssh process exits.
 fn open_control_master(host: &SshHost) -> Result<(), String> {
     let socket = host.control_path();
-    let mut cmd = Command::new("ssh");
+    let mut cmd = new_command("ssh");
     cmd.arg("-o").arg("ControlMaster=auto")
        .arg("-o").arg(format!("ControlPath={}", socket.display()))
        .arg("-o").arg("ControlPersist=600")  // keep alive 10 min after last use
@@ -485,18 +566,8 @@ pub fn run_ssh_capture(host: &SshHost, remote_argv: &[&str]) -> Result<String, S
     // OpenSSH sends the remote command as one shell string. Quote argv ourselves
     // so `sh -c <script>` remains one script instead of leaking lines into the
     // remote login shell with unset variables.
-    let remote_command = remote_command(remote_argv);
-    let mut cmd = Command::new("ssh");
-    cmd.arg("-o").arg(format!("ControlPath={}", host.control_path().display()))
-       .arg("-o").arg("ControlMaster=no")
-       .arg("-o").arg("BatchMode=yes");
-    if let Some(port) = host.port {
-        cmd.arg("-p").arg(port.to_string());
-    }
-    cmd.arg(host.host_arg())
-       .arg("--")
-       .arg(remote_command)
-       .stdin(Stdio::null())
+    let mut cmd = batch_command(host, remote_command(remote_argv));
+    cmd.stdin(Stdio::null())
        .stdout(Stdio::piped())
        .stderr(Stdio::piped());
 
@@ -548,18 +619,8 @@ fi"#,
 /// Write `content` to `remote_path` on `host` (see `remote_save_script`).
 fn write_remote_file(host: &SshHost, remote_path: &Path, content: &str) -> Result<(), String> {
     let script = remote_save_script(remote_path, content.len());
-    let remote_command = remote_command(&["sh", "-c", &script]);
-    let mut cmd = Command::new("ssh");
-    cmd.arg("-o").arg(format!("ControlPath={}", host.control_path().display()))
-       .arg("-o").arg("ControlMaster=no")
-       .arg("-o").arg("BatchMode=yes");
-    if let Some(port) = host.port {
-        cmd.arg("-p").arg(port.to_string());
-    }
-    cmd.arg(host.host_arg())
-       .arg("--")
-       .arg(remote_command)
-       .stdin(Stdio::piped())
+    let mut cmd = batch_command(host, remote_command(&["sh", "-c", &script]));
+    cmd.stdin(Stdio::piped())
        .stdout(Stdio::null())
        .stderr(Stdio::piped());
     let mut child = cmd.spawn()
@@ -783,6 +844,7 @@ mod tests {
         assert!(script.contains("cp -R -- \"$source\" \"$destination\""));
     }
 
+    #[cfg(unix)]
     #[test]
     fn remote_copy_script_runs_and_avoids_existing_names() {
         let nonce = std::time::SystemTime::now()
@@ -817,6 +879,7 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn remote_save_script_replaces_atomically_and_rejects_short_input() {
         use std::os::unix::fs::PermissionsExt;
@@ -876,6 +939,22 @@ mod tests {
         assert!(remote.contains("exec "));
         assert!(remote.contains("typescript-language-server"));
         assert!(remote.contains("--stdio"));
+    }
+
+    #[test]
+    fn terminal_argv_keeps_paths_as_single_arguments() {
+        let host = SshHost { user: Some("me".to_owned()), host: "example.com".to_owned(), port: Some(2222) };
+        let plain = terminal_argv(&host, None);
+        assert_eq!(plain.first().map(String::as_str), Some("ssh"));
+        assert_eq!(plain.last().map(String::as_str), Some("me@example.com"));
+        assert!(plain.windows(2).any(|w| w[0] == "-p" && w[1] == "2222"));
+        assert!(!plain.iter().any(|a| a == "-t"));
+
+        let in_dir = terminal_argv(&host, Some(Path::new("/srv/it's here")));
+        assert!(in_dir.iter().any(|a| a == "-t"));
+        assert_eq!(in_dir.last().unwrap(), "cd '/srv/it'\\''s here' && exec $SHELL -l");
+        let home = terminal_argv(&host, Some(Path::new("~/src app")));
+        assert_eq!(home.last().unwrap(), "cd ~/'src app' && exec $SHELL -l");
     }
 
     #[test]

@@ -23,13 +23,20 @@ pub struct SshHost {
     pub port: Option<u16>,
 }
 
-/// A per-user directory for SSH ControlMaster sockets, created 0700 on demand. Prefers
-/// `$XDG_RUNTIME_DIR` (already private on Linux); otherwise a uid-scoped directory under
-/// the system temp dir (macOS's `$TMPDIR` is itself per-user and private). Kept short to
-/// respect the ~104-byte `sun_path` limit for Unix-domain sockets: macOS's `$TMPDIR`
-/// (`/var/folders/…/T/`) is ~49 bytes and can be longer still under an app sandbox, so if a
-/// preferred location would leave too little room for the socket filename we fall back to a
-/// short `/tmp/lt-<uid>` directory (still created 0700 and ownership-checked).
+/// A per-user directory for SSH ControlMaster sockets and the cross-process LSP
+/// registry, created 0700 on demand.
+///
+/// Unix: prefers `$XDG_RUNTIME_DIR` (already private on Linux); otherwise a uid-scoped
+/// directory under the system temp dir (macOS's `$TMPDIR` is itself per-user and private).
+/// Kept short to respect the ~104-byte `sun_path` limit for Unix-domain sockets: macOS's
+/// `$TMPDIR` (`/var/folders/…/T/`) is ~49 bytes and can be longer still under an app
+/// sandbox, so if a preferred location would leave too little room for the socket filename
+/// we fall back to a short `/tmp/lt-<uid>` directory (still created 0700 and
+/// ownership-checked).
+///
+/// Windows: `%LOCALAPPDATA%\local-text\run`, which the user profile's ACL already keeps
+/// private (and Windows has no world-writable temp dir to squat in).
+#[cfg(unix)]
 pub(crate) fn control_socket_dir() -> PathBuf {
     let uid = unsafe { libc::getuid() };
     // The socket filename is a fixed "ssh-" + 16 hex digits = 21 bytes (incl. separator),
@@ -54,6 +61,16 @@ pub(crate) fn control_socket_dir() -> PathBuf {
     dir
 }
 
+#[cfg(windows)]
+pub(crate) fn control_socket_dir() -> PathBuf {
+    let dir = crate::os::local_app_data()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("local-text")
+        .join("run");
+    let _ = ensure_private_dir(&dir);
+    dir
+}
+
 /// FNV-1a 64-bit hash — deterministic across runs (so a reconnect reuses the same
 /// ControlMaster socket) and dependency-free. Used only to derive a short, fixed-length
 /// socket filename from the (user, host, port) tag; not for security.
@@ -69,6 +86,7 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 /// Ensure `dir` exists as a 0700 directory owned by the current user. Refuses (Err) if it
 /// already exists as a symlink or is owned by someone else, so a pre-created path can't
 /// redirect our sockets. Best-effort hardening against a local same-host attacker.
+#[cfg(unix)]
 pub(crate) fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
     match std::fs::symlink_metadata(dir) {
@@ -87,6 +105,34 @@ pub(crate) fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Windows: the directory lives in the user's own profile (see `control_socket_dir`),
+/// whose ACL already keeps other users out; refuse only a symlink/junction in its place.
+#[cfg(windows)]
+pub(crate) fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(md) if md.is_dir() && !md.file_type().is_symlink() => Ok(()),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "runtime dir is not a plain directory",
+        )),
+        Err(_) => std::fs::create_dir_all(dir),
+    }
+}
+
+/// Append `component` to a remote (always POSIX) path with `/`. `Path::join`
+/// would insert the *local* separator, i.e. `\` on Windows.
+pub(crate) fn posix_join(base: &Path, component: impl AsRef<Path>) -> PathBuf {
+    let comp = component.as_ref().to_string_lossy();
+    // A Windows client can produce `a\b` for nested components; the remote wants `/`.
+    let comp = if cfg!(windows) { comp.replace('\\', "/") } else { comp.into_owned() };
+    if comp.starts_with('/') { return PathBuf::from(comp); }
+    if comp.is_empty() { return base.to_path_buf(); }
+    let base = base.to_string_lossy();
+    if base.is_empty() { return PathBuf::from(comp); }
+    let sep = if base.ends_with('/') { "" } else { "/" };
+    PathBuf::from(format!("{base}{sep}{comp}"))
 }
 
 impl SshHost {
@@ -230,7 +276,7 @@ impl VPath {
             VPath::Local(p) => VPath::Local(p.join(component)),
             VPath::Remote { host, path } => VPath::Remote {
                 host: host.clone(),
-                path: path.join(component),
+                path: posix_join(path, component),
             },
         }
     }
@@ -289,7 +335,7 @@ impl VPath {
     pub fn to_lsp_uri(&self) -> String {
         match self {
             VPath::Local(p) => path_to_file_uri(p),
-            VPath::Remote { host, path } => path_to_file_uri(&expand_tilde(host, path)),
+            VPath::Remote { host, path } => posix_path_to_file_uri(&expand_tilde(host, path)),
         }
     }
 
@@ -301,7 +347,7 @@ impl VPath {
         if raw != "~" && !raw.starts_with("~/") { return None; }
         let home = remote_home(host)?;
         let rest = raw.strip_prefix('~').unwrap_or("").trim_start_matches('/');
-        let abs = if rest.is_empty() { home } else { home.join(rest) };
+        let abs = if rest.is_empty() { home } else { posix_join(&home, rest) };
         Some(VPath::Remote { host: host.clone(), path: abs })
     }
 
@@ -371,7 +417,7 @@ fn expand_tilde(host: &SshHost, path: &Path) -> PathBuf {
             None         => return path.to_path_buf(),
         },
     };
-    if rest.is_empty() { home } else { home.join(rest) }
+    if rest.is_empty() { home } else { posix_join(&home, rest) }
 }
 
 // ── file:// URIs ──────────────────────────────────────────────────────────────
@@ -379,26 +425,59 @@ fn expand_tilde(host: &SshHost, path: &Path) -> PathBuf {
 /// Percent-encode a path into a `file://` URI. Everything outside the RFC 3986
 /// unreserved set (plus `/`) is escaped, so spaces, `#`, `%`, `?` and non-ASCII
 /// names survive the round trip through a language server.
-pub fn path_to_file_uri(path: &Path) -> String {
-    use std::os::unix::ffi::OsStrExt;
-    let mut out = String::from("file://");
-    for &b in path.as_os_str().as_bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'.' | b'_' | b'~') {
+fn percent_encode_path(out: &mut String, bytes: &[u8], keep_colon: bool) {
+    for &b in bytes {
+        if b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'.' | b'_' | b'~') || (keep_colon && b == b':') {
             out.push(b as char);
         } else {
             out.push_str(&format!("%{b:02X}"));
         }
     }
+}
+
+/// `file://` URI for a POSIX path (a remote path, or a local one on macOS/Linux).
+pub fn posix_path_to_file_uri(path: &Path) -> String {
+    let mut out = String::from("file://");
+    percent_encode_path(&mut out, path.as_os_str().as_encoded_bytes(), false);
     out
 }
 
-/// Decode a `file://` URI (as sent by a language server) back into a path.
-/// Accepts `file:///abs` and `file://localhost/abs`; returns None for anything else.
-pub fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
-    use std::os::unix::ffi::OsStringExt;
+/// `file://` URI for a local path. On Windows `C:\dir\a b.rs` becomes
+/// `file:///C:/dir/a%20b.rs` and `\\server\share\x` becomes `file://server/share/x`.
+pub fn path_to_file_uri(path: &Path) -> String {
+    #[cfg(windows)]
+    {
+        let s = path.to_string_lossy().replace('\\', "/");
+        let mut out = String::from("file://");
+        if let Some(unc) = s.strip_prefix("//") {
+            // UNC: the server is the URI authority.
+            percent_encode_path(&mut out, unc.as_bytes(), false);
+        } else {
+            let b = s.as_bytes();
+            let drive = b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':';
+            if drive { out.push('/'); }
+            percent_encode_path(&mut out, s.as_bytes(), drive);
+        }
+        out
+    }
+    #[cfg(not(windows))]
+    { posix_path_to_file_uri(path) }
+}
+
+/// Percent-decode the path part of a `file://` URI into bytes. Accepts
+/// `file:///abs` and `file://localhost/abs`; with `allow_authority`, any other
+/// host is kept as a leading `//host` (a Windows UNC share).
+fn decode_file_uri(uri: &str, allow_authority: bool) -> Option<Vec<u8>> {
     let rest = uri.strip_prefix("file://")?;
     let rest = rest.strip_prefix("localhost").unwrap_or(rest);
-    if !rest.starts_with('/') { return None; }
+    let rest = if rest.starts_with('/') {
+        rest
+    } else if allow_authority && !rest.is_empty() {
+        // keep "server/share/…" and mark it UNC below
+        return decode_file_uri(&format!("file:////{rest}"), false);
+    } else {
+        return None;
+    };
     // Drop any query/fragment (not part of a file path once decoded).
     let rest = rest.split(['?', '#']).next().unwrap_or(rest);
     let bytes = rest.as_bytes();
@@ -417,17 +496,52 @@ pub fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
         i += 1;
     }
     if out.contains(&0) { return None; }
-    Some(PathBuf::from(std::ffi::OsString::from_vec(out)))
+    Some(out)
+}
+
+#[cfg(unix)]
+fn bytes_to_path(bytes: Vec<u8>) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    Some(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+}
+
+#[cfg(not(unix))]
+fn bytes_to_path(bytes: Vec<u8>) -> Option<PathBuf> {
+    String::from_utf8(bytes).ok().map(PathBuf::from)
+}
+
+/// Decode a `file://` URI naming a POSIX path (what a remote language server sends).
+pub fn file_uri_to_posix_path(uri: &str) -> Option<PathBuf> {
+    bytes_to_path(decode_file_uri(uri, false)?)
+}
+
+/// Decode a `file://` URI (as sent by a local language server) back into a local
+/// path. On Windows `file:///c%3A/dir/x` and `file:///C:/dir/x` both give
+/// `C:\dir\x`, and `file://server/share/x` gives `\\server\share\x`.
+pub fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        let decoded = String::from_utf8(decode_file_uri(uri, true)?).ok()?;
+        let b = decoded.as_bytes();
+        let native = if b.len() >= 3 && b[0] == b'/' && b[1].is_ascii_alphabetic() && b[2] == b':' {
+            // "/c:/dir" → "C:\dir" (servers vary in drive-letter case)
+            format!("{}{}", (b[1] as char).to_ascii_uppercase(), &decoded[2..]).replace('/', "\\")
+        } else {
+            decoded.replace('/', "\\")
+        };
+        Some(PathBuf::from(native))
+    }
+    #[cfg(not(windows))]
+    { file_uri_to_posix_path(uri) }
 }
 
 /// Map a URI reported by a language server back to a VPath. For remote servers the
 /// server sees absolute paths; if the matching open path uses `~`, the caller
 /// compares via `VPath::same_file`.
 pub fn lsp_uri_to_vpath(uri: &str, ssh_host: Option<&SshHost>) -> Option<VPath> {
-    let path = file_uri_to_path(uri)?;
     Some(match ssh_host {
-        Some(host) => VPath::Remote { host: host.clone(), path },
-        None       => VPath::Local(path),
+        Some(host) => VPath::Remote { host: host.clone(), path: file_uri_to_posix_path(uri)? },
+        None       => VPath::Local(file_uri_to_path(uri)?),
     })
 }
 
@@ -567,11 +681,42 @@ mod tests {
     #[test]
     fn file_uris_round_trip_special_characters() {
         let p = Path::new("/tmp/My Project/a#b%c/é.rs");
-        let uri = path_to_file_uri(p);
+        let uri = posix_path_to_file_uri(p);
         assert_eq!(uri, "file:///tmp/My%20Project/a%23b%25c/%C3%A9.rs");
-        assert_eq!(file_uri_to_path(&uri).as_deref(), Some(p));
-        assert_eq!(file_uri_to_path("file://localhost/x/y").as_deref(), Some(Path::new("/x/y")));
-        assert_eq!(file_uri_to_path("file://relative"), None);
+        assert_eq!(file_uri_to_posix_path(&uri).as_deref(), Some(p));
+        assert_eq!(file_uri_to_posix_path("file://localhost/x/y").as_deref(), Some(Path::new("/x/y")));
+        assert_eq!(file_uri_to_posix_path("file://relative"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_file_uris_are_posix_on_unix() {
+        let p = Path::new("/home/me/a b.rs");
+        assert_eq!(path_to_file_uri(p), "file:///home/me/a%20b.rs");
+        assert_eq!(file_uri_to_path("file:///home/me/a%20b.rs").as_deref(), Some(p));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn local_file_uris_use_drive_letters_on_windows() {
+        let p = Path::new(r"C:\Users\me\a b.rs");
+        assert_eq!(path_to_file_uri(p), "file:///C:/Users/me/a%20b.rs");
+        assert_eq!(file_uri_to_path("file:///C:/Users/me/a%20b.rs").as_deref(), Some(p));
+        assert_eq!(file_uri_to_path("file:///c%3A/Users/me/a%20b.rs").as_deref(), Some(p));
+        assert_eq!(path_to_file_uri(Path::new(r"\\srv\share\x.rs")), "file://srv/share/x.rs");
+        assert_eq!(file_uri_to_path("file://srv/share/x.rs").as_deref(), Some(Path::new(r"\\srv\share\x.rs")));
+    }
+
+    #[test]
+    fn remote_joins_always_use_forward_slashes() {
+        let host = SshHost { user: None, host: "h".into(), port: None };
+        let dir = VPath::Remote { host: host.clone(), path: PathBuf::from("/srv/app") };
+        assert_eq!(dir.join("src").join("main.rs"),
+                   VPath::Remote { host: host.clone(), path: PathBuf::from("/srv/app/src/main.rs") });
+        assert_eq!(posix_join(Path::new("/"), "etc"), PathBuf::from("/etc"));
+        assert_eq!(posix_join(Path::new("/a"), "/abs"), PathBuf::from("/abs"));
+        assert_eq!(posix_join(Path::new("/a"), ""), PathBuf::from("/a"));
+        assert_eq!(posix_join(Path::new("~"), "x/y").to_string_lossy(), "~/x/y");
     }
 
     #[test]
@@ -594,7 +739,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod control_path_len_tests {
     use super::*;
     fn h(user: &str, host: &str) -> SshHost {
