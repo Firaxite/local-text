@@ -439,7 +439,6 @@ struct QuickFinder {
     filtered:           Vec<usize>,
     filtered_commands:  Vec<QfCommand>,
     selected:           usize,
-    restore_tree_focus: bool,
     walk_token:         u64,   // incremented on each open; stale QuickFinderFiles events are dropped
     loading:            bool,  // true while background walk_files is in progress
     remote_directory_mode: bool,
@@ -1893,6 +1892,7 @@ fn open_terminal_pane(s: &mut State) {
 }
 
 fn open_terminal_pane_at(s: &mut State, cwd: Option<VPath>) {
+    blur_sidebar(s); // the new terminal gets the keyboard
     let pane_id = s.next_pane_id; s.next_pane_id += 1;
     let term_id = s.next_pane_id; s.next_pane_id += 1;
     let area = s.pane_area();
@@ -2266,6 +2266,9 @@ struct State {
 
     left_view:          LeftView,
     left_panel_visible: bool,
+    /// The visible sidebar list (Diagnostics, or Search results while no search
+    /// field is focused) owns the navigation keys (Up/Down/Enter/Escape).
+    sidebar_list_focused: bool,
     diag_panel_sel: usize,
     context_menu: Option<ContextMenu>,
     explorer_clipboard: Option<VPath>,
@@ -3449,7 +3452,14 @@ fn apply_references(s: &mut State, result: &serde_json::Value, ssh_host: Option<
     s.global_find.selected = 0;
     s.global_find.scroll   = 0;
     s.global_find.focus    = GlobalFindFocus::Results;
-    if s.explorer.is_some() { s.left_view = LeftView::GlobalSearch; }
+    if s.explorer.is_some() {
+        // Show the references and let Up/Down/Enter walk them (Escape or typing
+        // returns to the editor).
+        blur_sidebar(s);
+        s.left_view = LeftView::GlobalSearch;
+        s.left_panel_visible = true;
+        s.sidebar_list_focused = true;
+    }
 }
 
 /// Pick the organize-imports edits for `path` out of a CodeAction[] result.
@@ -5681,7 +5691,6 @@ fn walk_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>, depth: u
 }
 
 fn open_quick_finder(s: &mut State, proxy: EventLoopProxy<UserEvent>) {
-    let had_tree_focus = s.explorer.as_ref().map(|e| e.tree_search_focused).unwrap_or(false);
     let remote_root = s.explorer.as_ref().and_then(|e| {
         if let VPath::Remote { host, path } = &e.root {
             Some((host.clone(), path.clone()))
@@ -5706,13 +5715,11 @@ fn open_quick_finder(s: &mut State, proxy: EventLoopProxy<UserEvent>) {
     s.quick_finder.cursor              = 0;
     s.quick_finder.sel_anchor          = None;
     s.quick_finder.selected            = 0;
-    s.quick_finder.restore_tree_focus  = had_tree_focus;
     s.quick_finder.loading             = true;
     s.quick_finder.remote_directory_mode = false;
+    // The finder is modal and sees keys before any sidebar field, so whatever had
+    // focus keeps it and gets it back if the finder is dismissed.
     s.quick_finder.open                = true;
-    // Unfocus tree search and global find so they don't swallow subsequent keystrokes
-    if let Some(ex) = s.explorer.as_mut() { ex.tree_search_focused = false; }
-    s.global_find.focus = GlobalFindFocus::Results;
 
     s.quick_finder.collab_mode = false;
     // A collab guest picks from the host's shared files.
@@ -5733,6 +5740,135 @@ fn open_quick_finder(s: &mut State, proxy: EventLoopProxy<UserEvent>) {
             let _ = proxy.send_event(UserEvent::QuickFinderFiles { token, entries });
         });
     }
+}
+
+/// Dismiss the quick finder / palette without acting (Escape, click outside it).
+/// A ':' go-to-line preview puts the cursor back where it was.
+fn quick_finder_cancel(s: &mut State) {
+    let qf = &mut s.quick_finder;
+    if qf.query.starts_with(':') {
+        if let (Some(saved), Some(pid), Some(tidx)) = (qf.preview_saved_char, qf.preview_pane_id, qf.preview_tab_idx) {
+            if let Some(tab) = s.panes.get_mut(&pid).and_then(|p| p.tabs.get_mut(tidx)) {
+                tab.cursors = vec![Cursor::new(saved)];
+                tab.clamp_cursors();
+            }
+        }
+    }
+    let qf = &mut s.quick_finder;
+    qf.preview_pane_id    = None;
+    qf.preview_tab_idx    = None;
+    qf.preview_saved_char = None;
+    qf.open = false;
+    qf.remote_directory_mode = false;
+}
+
+/// Act on the quick finder's selected entry (Enter, or a click on a row).
+/// Returns true when that closed the last pane and the app should exit.
+fn quick_finder_accept(s: &mut State) -> bool {
+    let idx = s.quick_finder.selected;
+    if s.quick_finder.query.starts_with('>') {
+        let picked = match s.quick_finder.filtered_commands.get(idx) {
+            Some(QfCommand::Static(fi)) => Some(Ok(COMMANDS[*fi].action)),
+            Some(QfCommand::LspOutput { pane_id, .. }) => Some(Err(*pane_id)),
+            None => None,
+        };
+        match picked {
+            Some(Ok(action)) => {
+                s.quick_finder.open = false;
+                if matches!(action, CommandAction::CloseTab) { return close_active_tab(s); }
+                execute_command(s, action);
+            }
+            Some(Err(pane_id)) => {
+                s.quick_finder.open = false;
+                show_lsp_output_pane(s, pane_id);
+                blur_sidebar(s);
+            }
+            None => {}
+        }
+        return false;
+    }
+    if s.quick_finder.query.starts_with(':') {
+        // ':' go-to-line mode: the live preview already moved the cursor.
+        if let Some((line, col)) = parse_goto_line_query(&s.quick_finder.query.clone()) {
+            s.quick_finder.preview_saved_char = None; // keep position on Enter
+            s.quick_finder.open = false;
+            s.quick_finder.preview_pane_id    = None;
+            s.quick_finder.preview_tab_idx    = None;
+            blur_sidebar(s);
+            // Re-apply jump in case preview_pane_id was unset
+            goto_line_preview(s, line, col.unwrap_or(0));
+            s.ensure_visible();
+        }
+        return false;
+    }
+
+    let query = s.quick_finder.query.trim().to_owned();
+    let typed_remote = if query.starts_with("ssh://") {
+        Some(parse_remote_directory_query(&query))
+    } else {
+        None
+    };
+    // After opening a file, jump to the parsed line:col if present.
+    fn maybe_jump(s: &mut State, path: VPath) {
+        if let Some(line) = s.quick_finder.parsed_line {
+            let col = s.quick_finder.parsed_col.unwrap_or(0);
+            jump_to_path_line_col(s, path, line, col);
+        }
+    }
+    if s.quick_finder.remote_directory_mode {
+        s.quick_finder.open = false;
+        s.quick_finder.remote_directory_mode = false;
+        if let Some(result) = typed_remote {
+            match result {
+                Ok((vpath, uri)) => open_remote_directory(s, vpath, uri),
+                Err(msg) => s.status_msg = Some(msg),
+            }
+        } else if let Some(&fi) = s.quick_finder.filtered.get(idx) {
+            let path = s.quick_finder.entries[fi].clone();
+            if let Some(uri) = remote_uri(&path) {
+                open_remote_directory(s, path, uri);
+            }
+        } else {
+            s.status_msg = Some("Enter a remote URI like ssh://host:~/devel".to_owned());
+        }
+    } else if query.starts_with("lt-collab://") {
+        // "Join Collab Session…" pre-fills this prefix; joining reads the
+        // invite from the query and closes the finder.
+        execute_command(s, CommandAction::JoinCollab);
+    } else if let Some(result) = typed_remote {
+        s.quick_finder.open = false;
+        match result {
+            Ok((vpath, uri)) => open_remote_directory(s, vpath, uri),
+            Err(msg) => s.status_msg = Some(msg),
+        }
+    } else if let Some(direct) = s.quick_finder.direct_path.clone().filter(|_| idx == 0 && s.quick_finder.filtered.is_empty()) {
+        // Direct absolute/~ path with no fuzzy results
+        s.quick_finder.open = false;
+        push_cursor_history(s);
+        open_or_reuse_tab(s, direct.clone());
+        maybe_jump(s, direct);
+    } else if let Some(&fi) = s.quick_finder.filtered.get(idx) {
+        let path = s.quick_finder.entries[fi].clone();
+        s.quick_finder.open = false;
+        // If the selected entry is a remote path shown from "Open Remote Directory",
+        // open it as a workspace root rather than a file tab.
+        let is_remote_dir_mode = query.starts_with("ssh://")
+            && matches!(&path, VPath::Remote { .. });
+        if is_remote_dir_mode {
+            if let Some(uri) = remote_uri(&path) {
+                open_remote_directory(s, path, uri);
+            }
+        } else if s.quick_finder.collab_mode {
+            open_collab_file(s, path.as_path().to_string_lossy().into_owned());
+        } else {
+            push_cursor_history(s);
+            open_or_reuse_tab(s, path.clone());
+            maybe_jump(s, path);
+        }
+    }
+    // Whatever was opened gets the keyboard, not a sidebar field focused before.
+    if !s.quick_finder.open { blur_sidebar(s); }
+    false
 }
 
 // Split "path/file.rs:42:5" into ("path/file.rs", Some(41), Some(4)) (0-indexed).
@@ -6513,6 +6649,148 @@ fn active_editor_tab(s: &State) -> Option<usize> {
     (tab.kind == TabKind::Editor).then_some(pane.active)
 }
 
+/// The active tab is a text buffer this user may edit (not settings, a git
+/// diff, or a shared file their collab role can only view).
+fn active_tab_editable(s: &State) -> bool {
+    active_editor_tab(s).is_some() && !collab_tab_read_only(s, s.tab())
+}
+
+fn settings_tab_active(s: &State) -> bool {
+    s.panes.get(&s.active_pane)
+        .filter(|p| p.kind == PaneKind::Editor)
+        .and_then(|p| p.tabs.get(p.active))
+        .map_or(false, |t| t.kind == TabKind::Settings)
+}
+
+/// Take keyboard focus away from every sidebar input and list so keys go to
+/// the active pane again.
+fn blur_sidebar(s: &mut State) {
+    if let Some(ex) = s.explorer.as_mut() { ex.tree_search_focused = false; }
+    s.git_panel.commit_focused = false;
+    s.global_find.focus = GlobalFindFocus::Results;
+    s.sidebar_list_focused = false;
+}
+
+/// Store the settings text field being edited (if any) and stop editing it.
+fn commit_settings_field(s: &mut State) {
+    let Some(field_id) = s.settings_edit_field.take() else { return };
+    let text = std::mem::take(&mut s.settings_edit_text);
+    s.settings_edit_cursor = 0;
+    let globs = |text: &str| -> Vec<String> {
+        text.split(',').map(|g| g.trim().to_owned()).filter(|g| !g.is_empty()).collect()
+    };
+    match field_id {
+        SettingsFieldId::FormatOnSave          => s.settings.format_on_save = text,
+        SettingsFieldId::OrganizeImportsOnSave => s.settings.organize_imports_on_save = text,
+        SettingsFieldId::FormatCommand         => s.settings.format_command = text,
+        SettingsFieldId::CollabPort            => {
+            if let Ok(p) = text.trim().parse::<u16>() { s.settings.collab_port = p; }
+        }
+        SettingsFieldId::CollabIncludeGlobs    => s.settings.collab_include_globs = globs(&text),
+        SettingsFieldId::CollabExcludeGlobs    => s.settings.collab_exclude_globs = globs(&text),
+    }
+    s.settings.save();
+    sync_collab_settings(s);
+}
+
+/// A key event that only reports a modifier going down.
+fn is_modifier_key(key: &Key) -> bool {
+    matches!(key, Key::Named(k) if matches!(k,
+        NamedKey::Super | NamedKey::Hyper | NamedKey::Meta
+        | NamedKey::Control | NamedKey::Alt | NamedKey::AltGraph | NamedKey::Shift
+        | NamedKey::CapsLock | NamedKey::Fn | NamedKey::FnLock))
+}
+
+/// App-level shortcuts (save, close, new/open/switch tab, split, find/find next) that must
+/// keep working while a sidebar or settings field has keyboard focus. Mirrors
+/// the matchers in the pane key handlers. Note that with Cmd held winit reports
+/// the shifted character, e.g. "}" for Cmd+Shift+].
+fn is_app_shortcut(key: &Key, cmd: bool, ctrl: bool, shift: bool) -> bool {
+    match key {
+        Key::Named(NamedKey::Tab) => ctrl,
+        Key::Character(c) => {
+            let c = c.as_str();
+            ((cmd || ctrl) && c == "s")
+                || (cmd && matches!(c, "w" | "t" | "n" | "N" | "o" | "f" | "h" | "g" | "G"
+                    | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"))
+                || (cmd && !shift && c == "\\")
+                || (cmd && shift && matches!(c, "_" | "]" | "}" | "[" | "{"))
+        }
+        _ => false,
+    }
+}
+
+/// Whether a sidebar input/list should let this key through to the pane
+/// handlers. Shortcuts that switch to another tab or pane also move keyboard
+/// focus there; save and close leave it in the sidebar.
+fn sidebar_lets_through(s: &mut State, key: &Key, cmd: bool, ctrl: bool, shift: bool) -> bool {
+    if !is_app_shortcut(key, cmd, ctrl, shift) { return false; }
+    let keeps_focus = matches!(key, Key::Character(c) if matches!(c.as_str(), "s" | "w"));
+    if !keeps_focus { blur_sidebar(s); }
+    true
+}
+
+/// Rows of global-search results that fit below the search fields (same
+/// geometry as the click handler and renderer).
+fn global_find_visible_rows(s: &State) -> usize {
+    let lh = s.glyphs.lh.max(1);
+    let row_h = lh + 2;
+    let results_start_y = 4 + 4 * row_h + 2 + row_h + 4 + lh;
+    ((s.h as i32 - s.status_h() - results_start_y) / lh).max(1) as usize
+}
+
+fn global_find_reveal_selected(s: &mut State) {
+    let vis = global_find_visible_rows(s);
+    let gf = &mut s.global_find;
+    if gf.selected < gf.scroll {
+        gf.scroll = gf.selected;
+    } else if gf.selected >= gf.scroll + vis {
+        gf.scroll = gf.selected + 1 - vis;
+    }
+}
+
+/// Change the UI font size (Cmd+= / Cmd+- / Cmd+0 and the palette commands).
+fn set_font_size(s: &mut State, size: f32) {
+    let size = size.clamp(8.0, 36.0);
+    if size == s.font_size { return; }
+    let ratio = size / s.font_size;
+    s.font_size = size;
+    s.explorer_w = ((s.explorer_w as f32 * ratio).round() as i32).clamp(80, 600);
+    s.settings.font_size = size;
+    s.settings.save();
+    s.rebuild_glyphs();
+    // Cell size changed: terminals must be told their new grid size.
+    resize_terminal_panes(s);
+}
+
+/// Close the active tab of whatever pane has focus (Cmd+W, palette "Close Tab").
+/// LSP output panes are hidden rather than closed. Returns true when the last
+/// pane went away and the app should exit.
+fn close_active_tab(s: &mut State) -> bool {
+    let pane_id = s.active_pane;
+    let Some((kind, tab_idx)) = s.panes.get(&pane_id).map(|p| (p.kind.clone(), p.active)) else { return false };
+    match kind {
+        PaneKind::Terminal if s.lsp.servers.contains_key(&pane_id) => {
+            if hide_lsp_output_pane(s, pane_id) {
+                // That was the only visible pane: show an editor instead of nothing.
+                ensure_editor_pane(s);
+            }
+            false
+        }
+        PaneKind::Terminal => {
+            let exit = close_terminal_tab(s, pane_id, tab_idx);
+            if !exit { check_lsp_binaries_if_settings_open(s); }
+            exit
+        }
+        PaneKind::MarkdownPreview => {
+            s.md_panes.remove(&pane_id);
+            s.panes.remove(&pane_id);
+            remove_pane_from_layout(s, pane_id)
+        }
+        PaneKind::Editor => request_close_editor_tab(s, pane_id, tab_idx) == Some(true),
+    }
+}
+
 /// Write one tab to disk (asking for a file name for an untitled tab where a
 /// dialog is available). Failures are reported in the status bar.
 fn save_tab(s: &mut State, pane_id: usize, tab_idx: usize) -> bool {
@@ -6608,7 +6886,7 @@ fn execute_command(s: &mut State, action: CommandAction) {
                 }
             }
         }
-        CommandAction::CloseTab       => { /* handled by Cmd+W */ }
+        CommandAction::CloseTab       => { /* needs the event loop to exit: see quick_finder_accept */ }
         CommandAction::GoToSettings   => open_settings_tab(s),
         CommandAction::OpenTerminal   => open_terminal_pane(s),
         CommandAction::SplitRight     => split_active_editor(s, DropZone::Right),
@@ -6617,6 +6895,7 @@ fn execute_command(s: &mut State, action: CommandAction) {
         CommandAction::SplitUp        => split_active_editor(s, DropZone::Top),
         CommandAction::ToggleFind     => {
             if active_editor_tab(s).is_none() { return; }
+            blur_sidebar(s);
             let open = !s.find().open;
             let f = s.find_mut();
             f.open = open;
@@ -6626,6 +6905,7 @@ fn execute_command(s: &mut State, action: CommandAction) {
         }
         CommandAction::ToggleReplace  => {
             if active_editor_tab(s).is_none() { return; }
+            blur_sidebar(s);
             let open = s.find().open;
             s.find_mut().open = true;
             s.find_mut().input_focused = true;
@@ -6644,20 +6924,11 @@ fn execute_command(s: &mut State, action: CommandAction) {
         CommandAction::ToggleSidebar => {
             if s.explorer.is_some() {
                 s.left_panel_visible = !s.left_panel_visible;
+                if !s.left_panel_visible { blur_sidebar(s); }
             }
         }
-        CommandAction::IncreaseFontSize => {
-            s.font_size = (s.font_size + 1.0).min(40.0);
-            s.glyphs.resize(s.font_size);
-            s.settings.font_size = s.font_size;
-            s.settings.save();
-        }
-        CommandAction::DecreaseFontSize => {
-            s.font_size = (s.font_size - 1.0).max(6.0);
-            s.glyphs.resize(s.font_size);
-            s.settings.font_size = s.font_size;
-            s.settings.save();
-        }
+        CommandAction::IncreaseFontSize => set_font_size(s, s.font_size + 2.0),
+        CommandAction::DecreaseFontSize => set_font_size(s, s.font_size - 2.0),
         CommandAction::GotoDefinition | CommandAction::FindReferences => {
             let Some(ti) = active_editor_tab(s) else { return };
             let pid = s.active_pane;
@@ -6687,7 +6958,7 @@ fn execute_command(s: &mut State, action: CommandAction) {
             if !texts.is_empty() { clipboard_set(&texts.join("\n")); }
         }
         CommandAction::Cut => {
-            if active_editor_tab(s).is_none() { return; }
+            if !active_tab_editable(s) { return; }
             let order = s.cursor_order_ltr();
             let texts: Vec<String> = order.iter()
                 .filter(|&&i| s.tab().cursors[i].has_sel())
@@ -6712,7 +6983,7 @@ fn execute_command(s: &mut State, action: CommandAction) {
             }
         }
         CommandAction::Paste => {
-            if active_editor_tab(s).is_none() { return; }
+            if !active_tab_editable(s) { return; }
             if let Some(text) = clipboard_get() {
                 for ch in text.chars() { s.glyphs.load(ch); }
                 paste_text(s, &text);
@@ -7596,6 +7867,7 @@ impl App {
 
             left_view:          LeftView::FileTree,
             left_panel_visible: true,
+            sidebar_list_focused: false,
             diag_panel_sel: 0,
             context_menu: None,
             explorer_clipboard: None,
@@ -7603,7 +7875,7 @@ impl App {
             quick_finder: QuickFinder {
                 open: false, query: String::new(), cursor: 0, sel_anchor: None,
                 entries: vec![], filtered: vec![], filtered_commands: vec![], selected: 0,
-                restore_tree_focus: false, walk_token: 0, loading: false,
+                walk_token: 0, loading: false,
                 remote_directory_mode: false,
                 collab_mode: false,
                 parsed_line: None, parsed_col: None, direct_path: None,
@@ -8202,11 +8474,45 @@ impl App {
                     let ow = (s.w as i32 * 2 / 3).min(s.w as i32 - 40).max(360);
                     let ox = (s.w as i32 - ow) / 2;
                     let oy = s.h as i32 / 4;
-                    let item_count = if s.quick_finder.query.starts_with('>') {
-                        s.quick_finder.filtered_commands.len()
-                    } else { s.quick_finder.filtered.len() };
+                    // Same rows as the renderer draws: at most 10, scrolled to keep the
+                    // selection in view (plus a placeholder row in some modes).
+                    let qf = &s.quick_finder;
+                    let is_cmd  = qf.query.starts_with('>');
+                    let is_goto = qf.query.starts_with(':');
+                    let n = if is_cmd { qf.filtered_commands.len() } else { qf.filtered.len() };
+                    let view_start = qf.selected.saturating_sub(4).min(n.saturating_sub(10));
+                    let visible = n.saturating_sub(view_start).min(10);
+                    let direct_row = !is_cmd && !is_goto && visible == 0 && !qf.loading && qf.direct_path.is_some();
+                    let item_count = if is_cmd { visible }
+                        else if is_goto { 1 }
+                        else { visible.max(direct_row as usize).max(qf.loading as usize) };
                     let oh = lh * (item_count as i32 + 2) + 8;
-                    if mx >= ox && mx < ox + ow && my >= oy && my < oy + oh {
+                    if !(mx >= ox && mx < ox + ow && my >= oy && my < oy + oh) {
+                        // Click outside: dismiss (like Escape) instead of leaving the
+                        // finder open and capturing keys while the click edits behind it.
+                        quick_finder_cancel(s);
+                        { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                        return;
+                    }
+                    let rows_y = oy + 4 + lh + 4;
+                    if my >= rows_y && !is_goto {
+                        // Click on a result row: select and open it (like Enter)
+                        let row = ((my - rows_y) / lh) as usize;
+                        let target = if direct_row { (row == 0).then_some(0) }
+                            else if row < visible && !(qf.loading && !is_cmd) { Some(view_start + row) }
+                            else { None };
+                        if let Some(sel) = target {
+                            s.quick_finder.selected = sel;
+                            if quick_finder_accept(s) {
+                                s.panes.clear();
+                                el.exit();
+                                return;
+                            }
+                        }
+                        { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                        return;
+                    }
+                    {
                         // Click in input row
                         if my < oy + 4 + lh {
                             let is_cmd = s.quick_finder.query.starts_with('>');
@@ -8553,19 +8859,22 @@ impl App {
                         None
                     };
                     if let Some(view) = clicked_view {
+                        commit_settings_field(s);
+                        blur_sidebar(s);
                         if s.left_panel_visible && s.left_view == view {
                             s.left_panel_visible = false;
                         } else {
                             s.left_view = view;
                             s.left_panel_visible = true;
-                            if view == LeftView::GlobalSearch {
-                                s.global_find.focus = GlobalFindFocus::Query;
-                            }
-                            if view == LeftView::Git {
-                                s.git_panel.loading = true;
-                                trigger_git_status_refresh(s);
-                            } else {
-                                s.git_panel.commit_focused = false;
+                            match view {
+                                LeftView::GlobalSearch => s.global_find.focus = GlobalFindFocus::Query,
+                                // Arrow keys walk the problems list (Escape returns to the editor).
+                                LeftView::Diagnostics  => s.sidebar_list_focused = true,
+                                LeftView::Git => {
+                                    s.git_panel.loading = true;
+                                    trigger_git_status_refresh(s);
+                                }
+                                _ => {}
                             }
                         }
                     } else if my >= gear_y && my < gear_y + lh {
@@ -8603,6 +8912,7 @@ impl App {
                 // Left panel click (file tree or global search)
                 let explorer_w = s.explorer_w();
                 if s.explorer.is_some() && mx >= act_w && mx < act_w + explorer_w {
+                    commit_settings_field(s);
                     let lh  = s.glyphs.lh;
                     if s.left_view == LeftView::FileTree {
                         let cw  = s.glyphs.cw;
@@ -8672,9 +8982,12 @@ impl App {
                             }
                         }
                     } else if s.left_view == LeftView::Diagnostics {
-                        // Diagnostics panel click — open file and jump to line
+                        // Diagnostics panel click — a row opens the file at that line
+                        // (and the editor gets the keyboard); anywhere else in the panel
+                        // focuses the list for Up/Down/Enter.
                         let header_rows = 2; // header label + separator
                         let first_item_y = header_rows * lh + 2 + 4;
+                        s.sidebar_list_focused = true;
                         if my >= first_item_y {
                             let idx = ((my - first_item_y) / lh) as usize;
                             // Re-sort by severity (errors first) — same as diag_panel_snap
@@ -8687,6 +9000,7 @@ impl App {
                             sev_items.sort();
                             if idx < sev_items.len() {
                                 s.diag_panel_sel = idx;
+                                s.sidebar_list_focused = false;
                                 let (_, path, line) = sev_items[idx].clone();
                                 jump_to_path_line_col(s, path, line, 0);
                             }
@@ -8709,6 +9023,7 @@ impl App {
                         if my >= staged_start_y && my < staged_start_y + staged_count as i32 * lh && staged_count > 0 {
                             let i = ((my - staged_start_y) / lh) as usize;
                             if i < staged_count {
+                                s.git_panel.commit_focused = false;
                                 s.git_panel.sel = GitSel::Staged(i);
                                 let path = s.git_panel.staged[i].path.clone();
                                 run_git_op(s, vec!["restore".into(), "--staged".into(), "--".into(), path]);
@@ -8717,6 +9032,7 @@ impl App {
                             let unstaged_count = s.git_panel.unstaged.len();
                             let i = ((my - unstaged_start_y) / lh) as usize;
                             if i < unstaged_count {
+                                s.git_panel.commit_focused = false;
                                 s.git_panel.sel = GitSel::Unstaged(i);
                                 let path = s.git_panel.unstaged[i].path.clone();
                                 open_diff_tab(s, path, false);
@@ -8760,6 +9076,7 @@ impl App {
                                 let cw_g       = s.glyphs.cw;
                                 let vis = ((gf_field_w - 4) / cw_g).max(0) as usize;
                                 s.global_find.focus = fields[fi];
+                                s.sidebar_list_focused = false;
                                 // Compute new cursor position from click (need field text + prev cursor)
                                 let (field_text, prev_cursor) = match fields[fi] {
                                     GlobalFindFocus::Query   => (s.global_find.query.clone(),        s.global_find.cursor_query),
@@ -8811,16 +9128,22 @@ impl App {
                                 if !s.global_find.query.is_empty() {
                                     spawn_search(&mut s.global_find, root, s.proxy.clone());
                                     s.global_find.focus = GlobalFindFocus::Results;
+                                    s.sidebar_list_focused = true;
                                 }
                             }
                             } // end else (not live toggle)
                         } else if my >= results_start_y {
+                            // A result row opens it (the editor gets the keyboard); empty
+                            // space below the results focuses the list.
                             let ri = ((my - results_start_y) / lh) as usize + s.global_find.scroll;
+                            s.global_find.focus = GlobalFindFocus::Results;
                             if ri < s.global_find.results.len() {
                                 s.global_find.selected = ri;
-                                s.global_find.focus    = GlobalFindFocus::Results;
+                                s.sidebar_list_focused = false;
                                 let r = s.global_find.results[ri].clone();
                                 jump_to_path_line_col(s, r.path, r.line_num, r.match_col);
+                            } else {
+                                s.sidebar_list_focused = true;
                             }
                         }
                     }
@@ -8837,9 +9160,10 @@ impl App {
                 if let Some(pane) = s.panes.get_mut(&clicked_pane_id) {
                     pane.find.input_focused = false;
                 }
-                // Clicking any content pane removes left-panel focus
-                if let Some(ex) = s.explorer.as_mut() { ex.tree_search_focused = false; }
-                s.global_find.focus = GlobalFindFocus::Results;
+                // Clicking any content pane takes the keyboard from the sidebar (search
+                // fields, commit message, lists) and finishes a settings-field edit.
+                blur_sidebar(s);
+                commit_settings_field(s);
                 let pane_rect = layout_tree(&s.pane_tree, area).into_iter()
                     .find(|(id, _)| *id == clicked_pane_id).map(|(_, r)| r).unwrap_or(area);
 
@@ -9266,33 +9590,9 @@ impl App {
                             }
 
                             if !clicked_field {
-                                // Click outside fields — commit and close any open field
-                                if let Some(fid) = s.settings_edit_field {
-                                    let text = s.settings_edit_text.clone();
-                                    match fid {
-                                        SettingsFieldId::FormatOnSave          => s.settings.format_on_save = text,
-                                        SettingsFieldId::OrganizeImportsOnSave => s.settings.organize_imports_on_save = text,
-                                        SettingsFieldId::FormatCommand         => s.settings.format_command = text,
-                                        SettingsFieldId::CollabPort            => {
-                                            if let Ok(p) = text.trim().parse::<u16>() {
-                                                s.settings.collab_port = p;
-                                            }
-                                        }
-                                        SettingsFieldId::CollabIncludeGlobs    => {
-                                            s.settings.collab_include_globs =
-                                                text.split(',').map(|g| g.trim().to_owned())
-                                                    .filter(|g| !g.is_empty()).collect();
-                                        }
-                                        SettingsFieldId::CollabExcludeGlobs    => {
-                                            s.settings.collab_exclude_globs =
-                                                text.split(',').map(|g| g.trim().to_owned())
-                                                    .filter(|g| !g.is_empty()).collect();
-                                        }
-                                    }
-                                    s.settings.save();
-                                    sync_collab_settings(s);
-                                    s.settings_edit_field = None;
-                                }
+                                // Click outside the fields (normally already committed when the
+                                // pane click took focus).
+                                commit_settings_field(s);
                             }
                         }
                     }
@@ -9316,7 +9616,8 @@ impl App {
                         let aa_len   = 4usize;
                         let w_len    = 3usize;
                         let toggle_w = (aa_len + 1 + w_len) as i32 * cw + 8;
-                        let aa_x     = s.w as i32 - toggle_w;
+                        // Drawn at the pane's right edge, not the window's (split panes).
+                        let aa_x     = pane_rect.x + pane_rect.w - toggle_w;
                         let wl_x     = aa_x + (aa_len + 1) as i32 * cw;
                         if mx >= aa_x && mx < wl_x { s.find_mut().case_sensitive = !s.find().case_sensitive; }
                         else if mx >= wl_x         { s.find_mut().whole_word     = !s.find().whole_word; }
@@ -9339,7 +9640,7 @@ impl App {
                         let repl_len = 6usize;
                         let all_len  = 5usize;
                         let btn_w    = (repl_len + 1 + all_len) as i32 * cw + 8;
-                        let btn_x    = s.w as i32 - btn_w;
+                        let btn_x    = pane_rect.x + pane_rect.w - btn_w;
                         let all_x    = btn_x + (repl_len + 1) as i32 * cw;
                         if mx >= btn_x && mx < all_x { replace_current(s); }
                         else if mx >= all_x          { replace_all(s); }
@@ -9623,9 +9924,9 @@ impl App {
                         }
                         Key::Named(NamedKey::Enter) => lsp_panel_go_to_window(s),
                         Key::Named(NamedKey::Delete) | Key::Named(NamedKey::Backspace) => lsp_panel_stop(s),
-                        Key::Character(c) if c.as_str() == "g" => lsp_panel_go_to_window(s),
-                        Key::Character(c) if c.as_str() == "m" => lsp_panel_move_here(s),
-                        Key::Character(c) if c.as_str() == "x" => lsp_panel_stop(s),
+                        Key::Character(c) if !cmd && !ctrl && c.as_str() == "g" => lsp_panel_go_to_window(s),
+                        Key::Character(c) if !cmd && !ctrl && c.as_str() == "m" => lsp_panel_move_here(s),
+                        Key::Character(c) if !cmd && !ctrl && c.as_str() == "x" => lsp_panel_stop(s),
                         _ => {}
                     }
                     { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
@@ -9668,8 +9969,13 @@ impl App {
                     return;
                 }
 
-                // Cmd+G — go to line in current file
-                if cmd && !shift && matches!(&event.logical_key, Key::Character(c) if matches!(c.as_str(), "g" | "G")) {
+                // Cmd+G — go to line in current file. While the editor's find bar is
+                // open with a query it means "next match" instead (editor handler).
+                let find_next = !s.quick_finder.open && active_editor_tab(s).is_some()
+                    && s.find().open && !s.find().query.is_empty();
+                if cmd && !shift && !find_next
+                    && matches!(&event.logical_key, Key::Character(c) if matches!(c.as_str(), "g" | "G"))
+                {
                     let pane_id = s.active_pane;
                     let (preview_pane_id, preview_tab_idx, preview_saved_char) =
                         if let Some(pane) = s.panes.get(&pane_id) {
@@ -9696,6 +10002,8 @@ impl App {
                 if cmd && !shift && matches!(&event.logical_key, Key::Character(c) if matches!(c.as_str(), "b" | "B")) {
                     if s.explorer.is_some() {
                         s.left_panel_visible = !s.left_panel_visible;
+                        // A hidden sidebar must not keep the keyboard.
+                        if !s.left_panel_visible { blur_sidebar(s); }
                         { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                         return;
                     }
@@ -9717,91 +10025,34 @@ impl App {
                         s.explorer_w = ((200.0 * s.font_size / FONT_PX).round() as i32).clamp(80, 600);
                         start_lsp_for_project(s, &root_vpath);
                     }
+                    blur_sidebar(s);
                     s.left_view = LeftView::GlobalSearch;
+                    s.left_panel_visible = true; // typing into a hidden field went nowhere
                     s.global_find.focus = GlobalFindFocus::Query;
                     { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                     return;
                 }
 
-                // Tree search input routing
-                if s.explorer.as_ref().map_or(false, |ex| ex.tree_search_focused)
-                    && s.left_view == LeftView::FileTree
-                {
-                    match &event.logical_key {
-                        Key::Named(NamedKey::Escape) => {
-                            if let Some(ex) = s.explorer.as_mut() {
-                                ex.tree_search.clear();
-                                ex.tree_search_focused = false;
-                            }
-                        }
-                        Key::Named(NamedKey::ArrowUp) => {
-                            if let Some(ex) = s.explorer.as_mut() {
-                                ex.tree_search_sel = ex.tree_search_sel.saturating_sub(1);
-                            }
-                        }
-                        Key::Named(NamedKey::ArrowDown) => {
-                            if let Some(ex) = s.explorer.as_mut() {
-                                let n = ex.tree_search_results.len();
-                                if n > 0 { ex.tree_search_sel = (ex.tree_search_sel + 1).min(n - 1); }
-                            }
-                        }
-                        Key::Named(NamedKey::Enter) => {
-                            let path = s.explorer.as_ref()
-                                .and_then(|ex| ex.tree_search_results.get(ex.tree_search_sel).cloned());
-                            if let Some(path) = path {
-                                if let Some(ex) = s.explorer.as_mut() { ex.tree_search_focused = false; }
-                                push_cursor_history(s);
-                                open_or_reuse_tab(s, VPath::Local(path));
-                            }
-                        }
-                        key => {
-                            if let Key::Character(c) = key {
-                                if !cmd && !ctrl { for ch in c.chars() { s.glyphs.load(ch); } }
-                            }
-                            if let Some(ex) = s.explorer.as_mut() {
-                                let prev = ex.tree_search.clone();
-                                input_field_edit(
-                                    &mut ex.tree_search, &mut ex.tree_search_cursor,
-                                    &mut ex.tree_search_sel_anchor,
-                                    key, cmd, alt, ctrl, shift);
-                                if ex.tree_search != prev { refilter_tree_search(ex); }
-                            }
-                        }
+                // Cmd+= / Cmd++ / Cmd+- / Cmd+0 — font size, from any pane
+                if cmd && !alt {
+                    let size = match &event.logical_key {
+                        Key::Character(c) if matches!(c.as_str(), "=" | "+") => Some(s.font_size + 2.0),
+                        Key::Character(c) if !shift && c.as_str() == "-" => Some(s.font_size - 2.0),
+                        Key::Character(c) if !shift && c.as_str() == "0" => Some(FONT_PX),
+                        _ => None,
+                    };
+                    if let Some(size) = size {
+                        set_font_size(s, size);
+                        { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                        return;
                     }
-                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
-                    return;
                 }
 
                 // Quick finder / command palette input routing (unified)
                 if s.quick_finder.open {
                     let is_cmd_mode  = s.quick_finder.query.starts_with('>');
-                    let is_goto_mode = s.quick_finder.query.starts_with(':');
                     match &event.logical_key {
-                        Key::Named(NamedKey::Escape) => {
-                            // Restore cursor if we were in ':' goto live-preview mode
-                            if is_goto_mode {
-                                if let Some(saved) = s.quick_finder.preview_saved_char {
-                                    let pid = s.quick_finder.preview_pane_id;
-                                    let tidx = s.quick_finder.preview_tab_idx;
-                                    if let (Some(pid), Some(tidx)) = (pid, tidx) {
-                                        if let Some(pane) = s.panes.get_mut(&pid) {
-                                            if let Some(tab) = pane.tabs.get_mut(tidx) {
-                                                tab.cursors = vec![Cursor::new(saved)];
-                                            }
-                                        }
-                                    }
-                                }
-                                s.quick_finder.preview_pane_id    = None;
-                                s.quick_finder.preview_tab_idx    = None;
-                                s.quick_finder.preview_saved_char = None;
-                            }
-                            s.quick_finder.open = false;
-                            s.quick_finder.remote_directory_mode = false;
-                            if s.quick_finder.restore_tree_focus {
-                                s.quick_finder.restore_tree_focus = false;
-                                if let Some(ex) = s.explorer.as_mut() { ex.tree_search_focused = true; }
-                            }
-                        }
+                        Key::Named(NamedKey::Escape) => quick_finder_cancel(s),
                         Key::Named(NamedKey::ArrowUp) => {
                             s.quick_finder.selected = s.quick_finder.selected.saturating_sub(1);
                         }
@@ -9814,123 +10065,10 @@ impl App {
                             if n > 0 { s.quick_finder.selected = (s.quick_finder.selected + 1).min(n - 1); }
                         }
                         Key::Named(NamedKey::Enter) => {
-                            let idx = s.quick_finder.selected;
-                            if is_cmd_mode {
-                                match s.quick_finder.filtered_commands.get(idx) {
-                                    Some(QfCommand::Static(fi)) => {
-                                        let action = COMMANDS[*fi].action;
-                                        s.quick_finder.open = false;
-                                        if s.quick_finder.restore_tree_focus {
-                                            s.quick_finder.restore_tree_focus = false;
-                                            if let Some(ex) = s.explorer.as_mut() { ex.tree_search_focused = true; }
-                                        }
-                                        execute_command(s, action);
-                                    }
-                                    Some(QfCommand::LspOutput { pane_id, .. }) => {
-                                        let pid = *pane_id;
-                                        s.quick_finder.open = false;
-                                        if s.quick_finder.restore_tree_focus {
-                                            s.quick_finder.restore_tree_focus = false;
-                                            if let Some(ex) = s.explorer.as_mut() { ex.tree_search_focused = true; }
-                                        }
-                                        show_lsp_output_pane(s, pid);
-                                    }
-                                    None => {}
-                                }
-                            } else if is_goto_mode {
-                                // ':' go-to-line mode: cursor already moved by live preview
-                                if let Some((line, col)) = parse_goto_line_query(&s.quick_finder.query.clone()) {
-                                    s.quick_finder.preview_saved_char = None; // keep position on Enter
-                                    s.quick_finder.open = false;
-                                    s.quick_finder.preview_pane_id    = None;
-                                    s.quick_finder.preview_tab_idx    = None;
-                                    if s.quick_finder.restore_tree_focus {
-                                        s.quick_finder.restore_tree_focus = false;
-                                        if let Some(ex) = s.explorer.as_mut() { ex.tree_search_focused = true; }
-                                    }
-                                    // Re-apply jump in case preview_pane_id was unset
-                                    goto_line_preview(s, line, col.unwrap_or(0));
-                                    s.ensure_visible();
-                                }
-                            } else {
-                                let query = s.quick_finder.query.trim().to_owned();
-                                let typed_remote = if query.starts_with("ssh://") {
-                                    Some(parse_remote_directory_query(&query))
-                                } else {
-                                    None
-                                };
-                                // Helper: after opening a file, jump to parsed line:col if present
-                                macro_rules! maybe_jump {
-                                    ($path:expr) => {
-                                        if let Some(line) = s.quick_finder.parsed_line {
-                                            let col = s.quick_finder.parsed_col.unwrap_or(0);
-                                            jump_to_path_line_col(s, $path, line, col);
-                                        }
-                                    };
-                                }
-                                if s.quick_finder.remote_directory_mode {
-                                    s.quick_finder.open = false;
-                                    s.quick_finder.remote_directory_mode = false;
-                                    if s.quick_finder.restore_tree_focus {
-                                        s.quick_finder.restore_tree_focus = false;
-                                        if let Some(ex) = s.explorer.as_mut() { ex.tree_search_focused = true; }
-                                    }
-                                    if let Some(result) = typed_remote {
-                                        match result {
-                                            Ok((vpath, uri)) => open_remote_directory(s, vpath, uri),
-                                            Err(msg) => s.status_msg = Some(msg),
-                                        }
-                                    } else if let Some(&fi) = s.quick_finder.filtered.get(idx) {
-                                        let path = s.quick_finder.entries[fi].clone();
-                                        if let Some(uri) = remote_uri(&path) {
-                                            open_remote_directory(s, path, uri);
-                                        }
-                                    } else {
-                                        s.status_msg = Some("Enter a remote URI like ssh://host:~/devel".to_owned());
-                                    }
-                                } else if let Some(result) = typed_remote {
-                                    s.quick_finder.open = false;
-                                    if s.quick_finder.restore_tree_focus {
-                                        s.quick_finder.restore_tree_focus = false;
-                                        if let Some(ex) = s.explorer.as_mut() { ex.tree_search_focused = true; }
-                                    }
-                                    match result {
-                                        Ok((vpath, uri)) => open_remote_directory(s, vpath, uri),
-                                        Err(msg) => s.status_msg = Some(msg),
-                                    }
-                                } else if let Some(direct) = s.quick_finder.direct_path.clone().filter(|_| idx == 0 && s.quick_finder.filtered.is_empty()) {
-                                    // Direct absolute/~ path with no fuzzy results
-                                    s.quick_finder.open = false;
-                                    if s.quick_finder.restore_tree_focus {
-                                        s.quick_finder.restore_tree_focus = false;
-                                        if let Some(ex) = s.explorer.as_mut() { ex.tree_search_focused = true; }
-                                    }
-                                    push_cursor_history(s);
-                                    open_or_reuse_tab(s, direct.clone());
-                                    maybe_jump!(direct);
-                                } else if let Some(&fi) = s.quick_finder.filtered.get(idx) {
-                                    let path = s.quick_finder.entries[fi].clone();
-                                    s.quick_finder.open = false;
-                                    if s.quick_finder.restore_tree_focus {
-                                        s.quick_finder.restore_tree_focus = false;
-                                        if let Some(ex) = s.explorer.as_mut() { ex.tree_search_focused = true; }
-                                    }
-                                    // If the selected entry is a remote path shown from "Open Remote Directory",
-                                    // open it as a workspace root rather than a file tab.
-                                    let is_remote_dir_mode = query.starts_with("ssh://")
-                                        && matches!(&path, VPath::Remote { .. });
-                                    if is_remote_dir_mode {
-                                        if let Some(uri) = remote_uri(&path) {
-                                            open_remote_directory(s, path, uri);
-                                        }
-                                    } else if s.quick_finder.collab_mode {
-                                        open_collab_file(s, path.as_path().to_string_lossy().into_owned());
-                                    } else {
-                                        push_cursor_history(s);
-                                        open_or_reuse_tab(s, path.clone());
-                                        maybe_jump!(path);
-                                    }
-                                }
+                            if quick_finder_accept(s) {
+                                s.panes.clear();
+                                el.exit();
+                                return;
                             }
                         }
                         key => {
@@ -9993,8 +10131,65 @@ impl App {
                     return;
                 }
 
+                // ── Sidebar inputs ──────────────────────────────────────────────────
+                // Each only owns the keyboard while its view is on screen; app-level
+                // shortcuts (save, close, switch tab…) still reach the pane handlers.
+
+                // Tree search input routing
+                if s.explorer.as_ref().map_or(false, |ex| ex.tree_search_focused)
+                    && s.left_panel_visible && s.left_view == LeftView::FileTree
+                    && !sidebar_lets_through(s, &event.logical_key, cmd, ctrl, shift)
+                {
+                    match &event.logical_key {
+                        Key::Named(NamedKey::Escape) => {
+                            if let Some(ex) = s.explorer.as_mut() {
+                                ex.tree_search.clear();
+                                ex.tree_search_focused = false;
+                            }
+                        }
+                        Key::Named(NamedKey::ArrowUp) => {
+                            if let Some(ex) = s.explorer.as_mut() {
+                                ex.tree_search_sel = ex.tree_search_sel.saturating_sub(1);
+                            }
+                        }
+                        Key::Named(NamedKey::ArrowDown) => {
+                            if let Some(ex) = s.explorer.as_mut() {
+                                let n = ex.tree_search_results.len();
+                                if n > 0 { ex.tree_search_sel = (ex.tree_search_sel + 1).min(n - 1); }
+                            }
+                        }
+                        Key::Named(NamedKey::Enter) => {
+                            let path = s.explorer.as_ref()
+                                .and_then(|ex| ex.tree_search_results.get(ex.tree_search_sel).cloned());
+                            if let Some(path) = path {
+                                if let Some(ex) = s.explorer.as_mut() { ex.tree_search_focused = false; }
+                                push_cursor_history(s);
+                                open_or_reuse_tab(s, VPath::Local(path));
+                            }
+                        }
+                        key => {
+                            if let Key::Character(c) = key {
+                                if !cmd && !ctrl { for ch in c.chars() { s.glyphs.load(ch); } }
+                            }
+                            if let Some(ex) = s.explorer.as_mut() {
+                                let prev = ex.tree_search.clone();
+                                input_field_edit(
+                                    &mut ex.tree_search, &mut ex.tree_search_cursor,
+                                    &mut ex.tree_search_sel_anchor,
+                                    key, cmd, alt, ctrl, shift);
+                                if ex.tree_search != prev { refilter_tree_search(ex); }
+                            }
+                        }
+                    }
+                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                    return;
+                }
+
                 // Git panel commit field input routing
-                if s.explorer.is_some() && s.left_view == LeftView::Git && s.git_panel.commit_focused {
+                if s.explorer.is_some() && s.left_panel_visible && s.left_view == LeftView::Git
+                    && s.git_panel.commit_focused
+                    && !sidebar_lets_through(s, &event.logical_key, cmd, ctrl, shift)
+                {
                     match &event.logical_key {
                         Key::Named(NamedKey::Escape) => {
                             s.git_panel.commit_focused = false;
@@ -10030,12 +10225,13 @@ impl App {
                 }
 
                 // Global find panel input routing (when a field has focus)
-                if s.explorer.is_some() && s.left_view == LeftView::GlobalSearch
+                if s.explorer.is_some() && s.left_panel_visible && s.left_view == LeftView::GlobalSearch
                     && !matches!(s.global_find.focus, GlobalFindFocus::Results)
+                    && !sidebar_lets_through(s, &event.logical_key, cmd, ctrl, shift)
                 {
                     let focus = s.global_find.focus;
                     match &event.logical_key {
-                        Key::Named(NamedKey::Escape) => { s.global_find.focus = GlobalFindFocus::Results; }
+                        Key::Named(NamedKey::Escape) => blur_sidebar(s),
                         Key::Named(NamedKey::Tab) => {
                             let nf = match focus {
                                 GlobalFindFocus::Query   => if shift { GlobalFindFocus::Exclude } else { GlobalFindFocus::Replace },
@@ -10061,13 +10257,17 @@ impl App {
                                 GlobalFindFocus::Results => &mut s.global_find.cursor_query,
                             } = new_len;
                         }
-                        Key::Named(NamedKey::Enter) if focus == GlobalFindFocus::Query => {
+                        Key::Named(NamedKey::Enter)
+                            if matches!(focus, GlobalFindFocus::Query | GlobalFindFocus::Include | GlobalFindFocus::Exclude) =>
+                        {
                             let root = s.explorer.as_ref()
                                 .and_then(|e| e.root.as_local_path().map(|p| p.to_path_buf()))
                                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
                             if !s.global_find.query.is_empty() {
                                 spawn_search(&mut s.global_find, root, s.proxy.clone());
+                                // Up/Down/Enter now walk the results.
                                 s.global_find.focus = GlobalFindFocus::Results;
+                                s.sidebar_list_focused = true;
                             }
                         }
                         key => {
@@ -10097,98 +10297,92 @@ impl App {
                     return;
                 }
 
-                // Diagnostics panel keyboard navigation
-                if s.explorer.is_some() && s.left_view == LeftView::Diagnostics {
-                    let total: usize = s.diagnostics.values().map(|v| v.len()).sum();
-                    match &event.logical_key {
-                        Key::Named(NamedKey::ArrowUp) => {
-                            s.diag_panel_sel = s.diag_panel_sel.saturating_sub(1);
-                        }
-                        Key::Named(NamedKey::ArrowDown) => {
-                            if total > 0 { s.diag_panel_sel = (s.diag_panel_sel + 1).min(total.saturating_sub(1)); }
-                        }
-                        Key::Named(NamedKey::Enter) if total > 0 => {
-                            let mut sev_items: Vec<(usize, VPath, usize)> = s.diagnostics.iter()
-                                .flat_map(|(path, diags)| {
-                                    let sev_ord = |s: &DiagSeverity| match s { DiagSeverity::Error => 0, DiagSeverity::Warning => 1, _ => 2 };
-                                    diags.iter().map(move |d| (sev_ord(&d.severity), path.clone(), d.line))
-                                })
-                                .collect();
-                            sev_items.sort();
-                            let idx = s.diag_panel_sel.min(sev_items.len().saturating_sub(1));
-                            if idx < sev_items.len() {
-                                let (_, path, line) = sev_items[idx].clone();
-                                push_cursor_history(s);
-                                jump_to_path_line_col(s, path, line, 0);
-                            }
-                        }
-                        _ => {}
-                    }
-                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
-                    return;
+                // Sidebar list navigation (Diagnostics, Search results). Only while the
+                // list has focus: Up/Down/Enter walk it, Escape hands the keyboard back
+                // to the active pane, and any other key goes to the pane (dropping focus).
+                if s.sidebar_list_focused {
+                    let list_on_screen = s.explorer.is_some() && s.left_panel_visible && match s.left_view {
+                        LeftView::Diagnostics  => true,
+                        LeftView::GlobalSearch => s.global_find.focus == GlobalFindFocus::Results,
+                        _ => false,
+                    };
+                    if !list_on_screen { s.sidebar_list_focused = false; }
                 }
-
-                // Global find results navigation
-                if s.explorer.is_some() && s.left_view == LeftView::GlobalSearch
-                    && s.global_find.focus == GlobalFindFocus::Results
-                    && !s.global_find.results.is_empty()
+                if s.sidebar_list_focused && !is_modifier_key(&event.logical_key)
+                    && !sidebar_lets_through(s, &event.logical_key, cmd, ctrl, shift)
                 {
-                    match &event.logical_key {
-                        Key::Named(NamedKey::ArrowUp) => {
-                            s.global_find.selected = s.global_find.selected.saturating_sub(1);
+                    let diagnostics = s.left_view == LeftView::Diagnostics;
+                    let nav = matches!(&event.logical_key, Key::Named(
+                        NamedKey::ArrowUp | NamedKey::ArrowDown | NamedKey::Enter | NamedKey::Escape));
+                    if nav && !(cmd || ctrl || alt) {
+                        match &event.logical_key {
+                            Key::Named(NamedKey::Escape) => s.sidebar_list_focused = false,
+                            Key::Named(NamedKey::ArrowUp) if diagnostics => {
+                                s.diag_panel_sel = s.diag_panel_sel.saturating_sub(1);
+                            }
+                            Key::Named(NamedKey::ArrowDown) if diagnostics => {
+                                let total: usize = s.diagnostics.values().map(|v| v.len()).sum();
+                                if total > 0 { s.diag_panel_sel = (s.diag_panel_sel + 1).min(total - 1); }
+                            }
+                            Key::Named(NamedKey::Enter) if diagnostics => {
+                                let mut sev_items: Vec<(usize, VPath, usize)> = s.diagnostics.iter()
+                                    .flat_map(|(path, diags)| {
+                                        let sev_ord = |s: &DiagSeverity| match s { DiagSeverity::Error => 0, DiagSeverity::Warning => 1, _ => 2 };
+                                        diags.iter().map(move |d| (sev_ord(&d.severity), path.clone(), d.line))
+                                    })
+                                    .collect();
+                                sev_items.sort();
+                                let idx = s.diag_panel_sel.min(sev_items.len().saturating_sub(1));
+                                if let Some((_, path, line)) = sev_items.get(idx).cloned() {
+                                    push_cursor_history(s);
+                                    jump_to_path_line_col(s, path, line, 0);
+                                }
+                            }
+                            Key::Named(NamedKey::ArrowUp) => {
+                                s.global_find.selected = s.global_find.selected.saturating_sub(1);
+                                global_find_reveal_selected(s);
+                            }
+                            Key::Named(NamedKey::ArrowDown) => {
+                                let n = s.global_find.results.len();
+                                s.global_find.selected = (s.global_find.selected + 1).min(n.saturating_sub(1));
+                                global_find_reveal_selected(s);
+                            }
+                            Key::Named(NamedKey::Enter) => {
+                                if let Some(r) = s.global_find.results.get(s.global_find.selected).cloned() {
+                                    push_cursor_history(s);
+                                    jump_to_path_line_col(s, r.path, r.line_num, r.match_col);
+                                }
+                            }
+                            _ => {}
                         }
-                        Key::Named(NamedKey::ArrowDown) => {
-                            let n = s.global_find.results.len();
-                            s.global_find.selected = (s.global_find.selected + 1).min(n.saturating_sub(1));
-                        }
-                        Key::Named(NamedKey::Enter) => {
-                            let r = s.global_find.results[s.global_find.selected].clone();
-                            push_cursor_history(s);
-                            jump_to_path_line_col(s, r.path, r.line_num, r.match_col);
-                        }
-                        _ => {}
+                        { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                        return;
                     }
-                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
-                    return;
+                    s.sidebar_list_focused = false;
+                    s.needs_redraw = true;
                 }
 
-                // Settings text field editing
-                if let Some(field_id) = s.settings_edit_field {
+                // Settings text field editing. The field lives in the Settings tab: once
+                // another tab or pane is active, keep what was typed and stop capturing.
+                if s.settings_edit_field.is_some() && !settings_tab_active(s) {
+                    commit_settings_field(s);
+                }
+                if s.settings_edit_field.is_some() && !is_app_shortcut(&event.logical_key, cmd, ctrl, shift) {
+                    let char_byte = |text: &str, ci: usize| text.char_indices().nth(ci).map_or(text.len(), |(i, _)| i);
                     match &event.logical_key {
-                        Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Escape) => {
-                            if matches!(&event.logical_key, Key::Named(NamedKey::Enter)) {
-                                let text = s.settings_edit_text.clone();
-                                match field_id {
-                                    SettingsFieldId::FormatOnSave          => s.settings.format_on_save = text,
-                                    SettingsFieldId::OrganizeImportsOnSave => s.settings.organize_imports_on_save = text,
-                                    SettingsFieldId::FormatCommand         => s.settings.format_command = text,
-                                    SettingsFieldId::CollabPort            => {
-                                        if let Ok(p) = text.trim().parse::<u16>() {
-                                            s.settings.collab_port = p;
-                                        }
-                                    }
-                                    SettingsFieldId::CollabIncludeGlobs    => {
-                                        s.settings.collab_include_globs =
-                                            text.split(',').map(|g| g.trim().to_owned())
-                                                .filter(|g| !g.is_empty()).collect();
-                                    }
-                                    SettingsFieldId::CollabExcludeGlobs    => {
-                                        s.settings.collab_exclude_globs =
-                                            text.split(',').map(|g| g.trim().to_owned())
-                                                .filter(|g| !g.is_empty()).collect();
-                                    }
-                                }
-                                s.settings.save();
-                                sync_collab_settings(s);
-                            }
-                            s.settings_edit_field = None;
-                        }
+                        Key::Named(NamedKey::Enter) => commit_settings_field(s),
+                        Key::Named(NamedKey::Escape) => { s.settings_edit_field = None; }
                         Key::Named(NamedKey::Backspace) => {
                             if s.settings_edit_cursor > 0 {
-                                let byte_off = s.settings_edit_text.char_indices()
-                                    .nth(s.settings_edit_cursor - 1).map(|(i, _)| i).unwrap_or(0);
+                                let byte_off = char_byte(&s.settings_edit_text, s.settings_edit_cursor - 1);
                                 s.settings_edit_text.remove(byte_off);
                                 s.settings_edit_cursor -= 1;
+                            }
+                        }
+                        Key::Named(NamedKey::Delete) => {
+                            if s.settings_edit_cursor < s.settings_edit_text.chars().count() {
+                                let byte_off = char_byte(&s.settings_edit_text, s.settings_edit_cursor);
+                                s.settings_edit_text.remove(byte_off);
                             }
                         }
                         Key::Named(NamedKey::ArrowLeft)  => {
@@ -10202,15 +10396,21 @@ impl App {
                         Key::Named(NamedKey::End)  => {
                             s.settings_edit_cursor = s.settings_edit_text.chars().count();
                         }
-                        _ => {
-                            if let Some(txt) = event.text.as_deref() {
-                                if !txt.chars().any(|c| c.is_control()) {
-                                    let byte_off = s.settings_edit_text.char_indices()
-                                        .nth(s.settings_edit_cursor).map(|(i, _)| i)
-                                        .unwrap_or(s.settings_edit_text.len());
-                                    s.settings_edit_text.insert_str(byte_off, txt);
-                                    s.settings_edit_cursor += txt.chars().count();
-                                }
+                        key => {
+                            // With Cmd held winit still reports the letter as text, so
+                            // shortcuts must never be inserted (Cmd+V used to type "v").
+                            let txt: Option<String> = if cmd && matches!(key, Key::Character(c) if matches!(c.as_str(), "v" | "V")) {
+                                clipboard_read().lines().next().map(str::to_owned)
+                            } else if cmd || ctrl {
+                                None
+                            } else {
+                                event.text.as_deref().map(str::to_owned)
+                            };
+                            if let Some(txt) = txt.filter(|t| !t.is_empty() && !t.chars().any(|c| c.is_control())) {
+                                for ch in txt.chars() { s.glyphs.load(ch); }
+                                let byte_off = char_byte(&s.settings_edit_text, s.settings_edit_cursor);
+                                s.settings_edit_text.insert_str(byte_off, &txt);
+                                s.settings_edit_cursor += txt.chars().count();
                             }
                         }
                     }
@@ -10218,26 +10418,19 @@ impl App {
                     return;
                 }
 
-                // Terminal pane intercepts (before PTY forwarding)
-                if s.panes.get(&s.active_pane).map_or(false, |p| p.kind == PaneKind::Terminal) {
-                    // Cmd+W — LSP output panes hide (minimize); regular terminals close their tab
-                    if cmd && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "w") {
-                        let pane_id = s.active_pane;
-                        if s.lsp.servers.contains_key(&pane_id) {
-                            hide_lsp_output_pane(s, pane_id);
-                            { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
-                            return;
-                        }
-                        let idx = s.panes.get(&pane_id).map(|p| p.active).unwrap_or(0);
-                        if close_terminal_tab(s, pane_id, idx) {
-                            s.panes.clear();
-                            el.exit();
-                            return;
-                        }
-                        check_lsp_binaries_if_settings_open(s);
-                        { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                // Cmd+W — close the active tab of any pane kind (LSP output panes hide)
+                if cmd && !shift && matches!(&event.logical_key, Key::Character(c) if matches!(c.as_str(), "w" | "W")) {
+                    if close_active_tab(s) {
+                        s.panes.clear();
+                        el.exit();
                         return;
                     }
+                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                    return;
+                }
+
+                // Terminal pane intercepts (before PTY forwarding)
+                if s.panes.get(&s.active_pane).map_or(false, |p| p.kind == PaneKind::Terminal) {
                     // Ctrl+Shift+5 — split: new terminal with same shell below
                     if ctrl && shift && matches!(&event.logical_key, Key::Character(c) if matches!(c.as_str(), "5" | "%")) {
                         // If in a remote workspace, prefer SSH over duplicating the local shell.
@@ -10347,11 +10540,10 @@ impl App {
                     // NOT clear the terminal selection. On macOS, pressing Cmd alone fires
                     // a KeyboardInput event; clearing term_sel here would destroy the
                     // selection before the user can press C for Cmd+C.
-                    if matches!(&event.logical_key, Key::Named(k) if matches!(k,
-                        NamedKey::Super | NamedKey::Hyper | NamedKey::Meta
-                        | NamedKey::Control | NamedKey::Alt | NamedKey::Shift
-                        | NamedKey::CapsLock | NamedKey::Fn | NamedKey::FnLock))
-                    {
+                    // Cmd (Super) combos are app shortcuts, never terminal input: winit
+                    // still reports their letter as text, so an unbound one such as
+                    // Cmd+S or Cmd+1 used to type "s"/"1" into the shell.
+                    if is_modifier_key(&event.logical_key) || cmd {
                         s.needs_redraw = true;
                         self.dirty.store(true, Ordering::Release);
                         return;
@@ -10380,19 +10572,8 @@ impl App {
                     return;
                 }
 
-                // MarkdownPreview pane: Cmd+W closes it, all other input ignored
+                // MarkdownPreview pane: read-only (Cmd+W is handled above)
                 if s.panes.get(&s.active_pane).map_or(false, |p| p.kind == PaneKind::MarkdownPreview) {
-                    if cmd && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "w") {
-                        let pane_id = s.active_pane;
-                        s.md_panes.remove(&pane_id);
-                        s.panes.remove(&pane_id);
-                        if remove_pane_from_layout(s, pane_id) {
-                            s.panes.clear();
-                            el.exit();
-                            return;
-                        }
-                        { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
-                    }
                     return;
                 }
 
@@ -10442,22 +10623,6 @@ impl App {
                 if find_handled {
                     { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                 } else {
-                    // Cmd+W for settings tab: close the tab (never dirty, no LSP needed)
-                    if cmd && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "w") {
-                        let pane_id = s.active_pane;
-                        if s.panes.get(&pane_id).and_then(|p| p.tabs.get(p.active))
-                                .map_or(false, |t| t.kind == TabKind::Settings) {
-                            let tab_idx = s.panes.get(&pane_id).map(|p| p.active).unwrap_or(0);
-                            if close_editor_tab(s, pane_id, tab_idx) {
-                                s.panes.clear();
-                                el.exit();
-                            }
-                            s.needs_redraw = true;
-                            self.dirty.store(true, Ordering::Release);
-                            return;
-                        }
-                    }
-
                     // Block text editing in settings and git-diff tabs: neither has a
                     // real buffer (a diff tab's path names the diffed file, so typing
                     // and saving there would overwrite it).
@@ -10477,7 +10642,7 @@ impl App {
                             Key::Character(c) if if collab_ro {
                                 matches!(c.as_str(), "x" | "v" | "z" | "Z" | "h")
                             } else {
-                                matches!(c.as_str(), "a" | "x" | "v" | "z" | "Z" | "d" | "l" | "L" | "f" | "h" | "g")
+                                matches!(c.as_str(), "a" | "x" | "v" | "z" | "Z" | "d" | "l" | "L" | "f" | "h" | "g" | "G")
                             })
                         {
                             true // editing / selection shortcuts do nothing in read-only tabs
@@ -10539,33 +10704,6 @@ impl App {
                         } else if (ctrl || cmd) && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "s") {
                             execute_command(s, CommandAction::Save);
                             true
-                        } else if cmd && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "=") {
-                            let old = s.font_size;
-                            s.font_size = (s.font_size + 2.0).min(36.0);
-                            let ratio = s.font_size / old;
-                            s.explorer_w = ((s.explorer_w as f32 * ratio).round() as i32).clamp(80, 600);
-                            s.settings.font_size = s.font_size;
-                            s.settings.save();
-                            s.rebuild_glyphs();
-                            true
-                        } else if cmd && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "-") {
-                            let old = s.font_size;
-                            s.font_size = (s.font_size - 2.0).max(8.0);
-                            let ratio = s.font_size / old;
-                            s.explorer_w = ((s.explorer_w as f32 * ratio).round() as i32).clamp(80, 600);
-                            s.settings.font_size = s.font_size;
-                            s.settings.save();
-                            s.rebuild_glyphs();
-                            true
-                        } else if cmd && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "0") {
-                            let old = s.font_size;
-                            s.font_size = FONT_PX;
-                            let ratio = s.font_size / old;
-                            s.explorer_w = ((s.explorer_w as f32 * ratio).round() as i32).clamp(80, 600);
-                            s.settings.font_size = s.font_size;
-                            s.settings.save();
-                            s.rebuild_glyphs();
-                            true
                         } else if cmd && matches!(&event.logical_key, Key::Character(c) if matches!(c.as_str(), "t" | "n" | "N")) {
                             if s.pane().kind == PaneKind::Editor {
                                 let new_buf_id = s.next_buf_id;
@@ -10574,15 +10712,6 @@ impl App {
                                 pane.tabs.push(Tab::untitled(new_buf_id));
                                 pane.active = pane.tabs.len() - 1;
                                 s.reset_blink();
-                            }
-                            true
-                        } else if cmd && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "w") {
-                            let pane_id = s.active_pane;
-                            let tab_idx = s.panes.get(&pane_id).map(|p| p.active).unwrap_or(0);
-                            if request_close_editor_tab(s, pane_id, tab_idx) == Some(true) {
-                                s.panes.clear();
-                                el.exit();
-                                return;
                             }
                             true
                         } else if cmd && !shift && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "\\") {
@@ -10609,13 +10738,13 @@ impl App {
                                 s.active_pane = new_id;
                             }
                             true
-                        } else if cmd && shift && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "]") {
+                        } else if cmd && shift && matches!(&event.logical_key, Key::Character(c) if matches!(c.as_str(), "]" | "}")) {
                             if s.pane().kind == PaneKind::Editor && !s.pane().tabs.is_empty() {
                                 let pane = s.pane_mut();
                                 pane.active = (pane.active + 1) % pane.tabs.len();
                             }
                             true
-                        } else if cmd && shift && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "[") {
+                        } else if cmd && shift && matches!(&event.logical_key, Key::Character(c) if matches!(c.as_str(), "[" | "{")) {
                             if s.pane().kind == PaneKind::Editor && !s.pane().tabs.is_empty() {
                                 let n = s.pane().tabs.len();
                                 let pane = s.pane_mut();
@@ -10644,6 +10773,7 @@ impl App {
                         }
                         // ── Find / Replace ────────────────────────────────────────────────────
                         else if cmd && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "f") {
+                            blur_sidebar(s);
                             let query = s.tab().sel_text().unwrap_or_default();
                             let f = s.find_mut();
                             f.open = true;
@@ -10655,6 +10785,7 @@ impl App {
                             f.sel_anchor_q = None;
                             true
                         } else if cmd && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "h") {
+                            blur_sidebar(s);
                             let query = s.tab().sel_text().unwrap_or_default();
                             let f = s.find_mut();
                             f.open = true;
@@ -10665,7 +10796,9 @@ impl App {
                             f.cursor_query = f.query.len();
                             f.sel_anchor_q = None;
                             true
-                        } else if cmd && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "g") {
+                        } else if cmd && matches!(&event.logical_key, Key::Character(c) if matches!(c.as_str(), "g" | "G")) {
+                            // Cmd+Shift+G = previous match (Cmd+G is routed here only while
+                            // the find bar is open; otherwise it is "go to line").
                             if !s.find().query.is_empty() { find_step(s, shift); }
                             true
                         }
@@ -12159,6 +12292,7 @@ fn render(s: &mut State) {
     let ui_scale         = s.font_size / FONT_PX;
     let left_view        = s.left_view;
     let left_panel_visible = s.left_panel_visible;
+    let sidebar_list_focused = s.sidebar_list_focused;
     let act_w            = s.activity_bar_w();
     let status_msg       = s.status_msg.clone();
     // Collab status shown in right side of status bar when active and no other status_msg
@@ -12634,7 +12768,10 @@ fn render(s: &mut State) {
                     let ry = fy + ri as i32 * lh;
                     if ry + lh > h as i32 - status_h { break; }
                     let is_sel = start + ri == gf.selected;
-                    if is_sel { fill(buf, w, h, px, ry, pw - 1, lh, SEL_BG); }
+                    if is_sel {
+                        fill(buf, w, h, px, ry, pw - 1, lh, SEL_BG);
+                        if sidebar_list_focused { fill(buf, w, h, px, ry, 2, lh, ACCENT); }
+                    }
                     let header = format!("{}:{}", name, line_num + 1);
                     draw_str(buf, w, h, g, &header, px + 2, ry + asc, ACCENT, px + pw - 1);
                     let hlen = header.chars().count() as i32 * cw + 4;
@@ -12656,7 +12793,10 @@ fn render(s: &mut State) {
                 for (i, (name, line_num, sev, msg, _path)) in dp.iter().enumerate() {
                     if ry + lh > panel_h { break; }
                     let is_sel = i == diag_panel_sel;
-                    if is_sel { fill(buf, w, h, px, ry, pw - 1, lh, SEL_BG); }
+                    if is_sel {
+                        fill(buf, w, h, px, ry, pw - 1, lh, SEL_BG);
+                        if sidebar_list_focused { fill(buf, w, h, px, ry, 2, lh, ACCENT); }
+                    }
                     let (icon, sev_color) = match sev {
                         DiagSeverity::Error   => ("[!]", 0xFF5555u32),
                         DiagSeverity::Warning => ("[~]", 0xE0AF68u32),
@@ -13892,6 +14032,51 @@ fn main() {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    fn ch(c: &str) -> Key { Key::Character(c.into()) }
+
+    #[test]
+    fn app_shortcuts_pass_through_sidebar_fields_but_field_editing_keys_do_not() {
+        // (key, cmd, ctrl, shift)
+        let passes = [
+            (ch("s"), true, false, false),   // save
+            (ch("s"), false, true, false),   // Ctrl+S save
+            (ch("w"), true, false, false),   // close tab
+            (ch("1"), true, false, false),   // select tab
+            (ch("}"), true, false, true),    // Cmd+Shift+] as macOS reports it
+            (ch("]"), true, false, true),
+            (ch("{"), true, false, true),    // Cmd+Shift+[
+            (ch("G"), true, false, true),    // Cmd+Shift+G find previous
+            (ch("\\"), true, false, false),  // split right
+            (Key::Named(NamedKey::Tab), false, true, false), // Ctrl+Tab
+        ];
+        for (key, cmd, ctrl, shift) in passes {
+            assert!(is_app_shortcut(&key, cmd, ctrl, shift), "{key:?} cmd={cmd} ctrl={ctrl} shift={shift}");
+        }
+        let stays = [
+            (ch("s"), false, false, false),  // typing an "s"
+            (ch("a"), true, false, false),   // select all in the field
+            (ch("c"), true, false, false),
+            (ch("v"), true, false, false),
+            (ch("x"), true, false, false),
+            (ch("z"), true, false, false),   // must not undo the editor behind the field
+            (ch("\\"), true, false, true),
+            (Key::Named(NamedKey::Tab), false, false, false), // field focus cycling
+            (Key::Named(NamedKey::Enter), true, false, false),
+        ];
+        for (key, cmd, ctrl, shift) in stays {
+            assert!(!is_app_shortcut(&key, cmd, ctrl, shift), "{key:?} cmd={cmd} ctrl={ctrl} shift={shift}");
+        }
+    }
+
+    #[test]
+    fn modifier_only_presses_are_recognised() {
+        for k in [NamedKey::Shift, NamedKey::Super, NamedKey::Control, NamedKey::Alt, NamedKey::AltGraph] {
+            assert!(is_modifier_key(&Key::Named(k)));
+        }
+        assert!(!is_modifier_key(&ch("a")));
+        assert!(!is_modifier_key(&Key::Named(NamedKey::ArrowDown)));
+    }
 
     fn test_dir(label: &str) -> PathBuf {
         let nonce = std::time::SystemTime::now()
