@@ -2332,21 +2332,8 @@ impl TermSel {
     }
 }
 
-fn clipboard_write(text: &str) {
-    use std::io::Write;
-    if let Ok(mut child) = std::process::Command::new("pbcopy")
-        .stdin(std::process::Stdio::piped()).spawn()
-    {
-        if let Some(stdin) = child.stdin.as_mut() { let _ = stdin.write_all(text.as_bytes()); }
-        let _ = child.wait();
-    }
-}
-
-fn clipboard_read() -> String {
-    std::process::Command::new("pbpaste").output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-        .unwrap_or_default()
-}
+fn clipboard_write(text: &str) { clipboard_set(text); }
+fn clipboard_read() -> String { clipboard_get().unwrap_or_default() }
 
 impl State {
     fn pane(&self)         -> &Pane     { &self.panes[&self.active_pane] }
@@ -5080,9 +5067,8 @@ fn clipboard_set(text: &str) {
         }
     }
     #[cfg(not(target_os = "macos"))]
-    { let _ = text; }
+    { with_clipboard(|c| { let _ = c.set_text(text.to_owned()); }); }
 }
-
 fn clipboard_get() -> Option<String> {
     #[cfg(target_os = "macos")]
     {
@@ -5091,7 +5077,18 @@ fn clipboard_get() -> Option<String> {
             .and_then(|o| String::from_utf8(o.stdout).ok())
     }
     #[cfg(not(target_os = "macos"))]
-    { None }
+    { with_clipboard(|c| c.get_text().ok()).flatten() }
+}
+
+/// The process-wide clipboard handle. It is kept alive because on X11 the
+/// copied text is served by the owner: dropping it would empty the clipboard.
+#[cfg(not(target_os = "macos"))]
+fn with_clipboard<R>(f: impl FnOnce(&mut arboard::Clipboard) -> R) -> Option<R> {
+    use std::sync::{Mutex, OnceLock};
+    static CLIPBOARD: OnceLock<Mutex<Option<arboard::Clipboard>>> = OnceLock::new();
+    let mut guard = CLIPBOARD.get_or_init(|| Mutex::new(None)).lock().ok()?;
+    if guard.is_none() { *guard = arboard::Clipboard::new().ok(); }
+    guard.as_mut().map(f)
 }
 
 fn open_file_dialog() -> Option<PathBuf> {
@@ -5106,10 +5103,12 @@ fn open_file_dialog() -> Option<PathBuf> {
         Some(PathBuf::from(path.trim()))
     }
     #[cfg(not(target_os = "macos"))]
-    { None }
+    {
+        let dir = dialog_start_dir();
+        linux_dialog(&["--file-selection", "--title=Open File"], &["--getopenfilename", &dir])
+            .map(PathBuf::from)
+    }
 }
-
-/// "Save As" dialog for an untitled buffer (macOS only; None elsewhere or on cancel).
 fn save_file_dialog() -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
@@ -5122,12 +5121,15 @@ fn save_file_dialog() -> Option<PathBuf> {
         (!path.is_empty()).then(|| PathBuf::from(path))
     }
     #[cfg(not(target_os = "macos"))]
-    { None }
+    {
+        let dir = dialog_start_dir();
+        linux_dialog(&["--file-selection", "--save", "--title=Save As"], &["--getsavefilename", &dir])
+            .map(PathBuf::from)
+    }
 }
-
 fn prompt_for_name(prompt: &str, default: &str) -> Option<String> {
     #[cfg(target_os = "macos")]
-    {
+    let name = {
         let script = r#"
 on run argv
     set answer to display dialog (item 1 of argv) default answer (item 2 of argv) buttons {"Cancel", "OK"} default button "OK"
@@ -5138,21 +5140,52 @@ end run
             .args(["-e", script, "--", prompt, default])
             .output().ok()?;
         if !out.status.success() { return None; }
-        let name = String::from_utf8(out.stdout).ok()?.trim().to_owned();
-        let path = std::path::Path::new(&name);
-        if name.is_empty()
-            || matches!(name.as_str(), "." | "..")
-            || path.file_name().and_then(|value| value.to_str()) != Some(name.as_str())
-        {
-            return None;
-        }
-        Some(name)
-    }
+        String::from_utf8(out.stdout).ok()?.trim().to_owned()
+    };
     #[cfg(not(target_os = "macos"))]
+    let name = linux_dialog(
+        &["--entry", "--title=local-text", &format!("--text={prompt}"), &format!("--entry-text={default}")],
+        &["--inputbox", prompt, default],
+    )?.trim().to_owned();
+    let path = std::path::Path::new(&name);
+    if name.is_empty()
+        || matches!(name.as_str(), "." | "..")
+        || path.file_name().and_then(|value| value.to_str()) != Some(name.as_str())
     {
-        let _ = (prompt, default);
-        None
+        return None;
     }
+    Some(name)
+}
+
+/// Linux has no built-in dialog API: use zenity (GNOME) or else kdialog (KDE).
+/// Returns what the tool printed; `None` when the user cancelled or neither
+/// tool is installed (see `dialog_tool_missing`).
+#[cfg(not(target_os = "macos"))]
+fn linux_dialog(zenity: &[&str], kdialog: &[&str]) -> Option<String> {
+    for (bin, args) in [("zenity", zenity), ("kdialog", kdialog)] {
+        let Ok(out) = std::process::Command::new(bin).args(args)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+        else { continue }; // not installed: try the next one
+        if !out.status.success() { return None; } // cancelled
+        let text = String::from_utf8(out.stdout).ok()?;
+        let text = text.trim_end_matches(['\n', '\r']);
+        return (!text.is_empty()).then(|| text.to_owned());
+    }
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+fn dialog_start_dir() -> String {
+    std::env::current_dir().map(|d| d.to_string_lossy().into_owned()).unwrap_or_else(|_| ".".to_owned())
+}
+
+/// File/name dialogs can't be shown at all (Linux without zenity or kdialog).
+fn dialog_tool_missing() -> bool {
+    if MACOS { return false; }
+    let Some(path) = std::env::var_os("PATH") else { return true };
+    !std::env::split_paths(&path).any(|dir| dir.join("zenity").is_file() || dir.join("kdialog").is_file())
 }
 
 fn unique_copy_destination(parent: &std::path::Path, source: &std::path::Path) -> PathBuf {
@@ -5547,6 +5580,10 @@ fn input_field_edit(
     ctrl:   bool,
     shift:  bool,
 ) -> bool {
+    // Word-wise: Option on macOS, Ctrl (or Alt) on Linux. Whole line: Cmd on
+    // macOS; Linux uses Home/End and Ctrl+Shift+Backspace.
+    let word = alt || (!MACOS && ctrl);
+    let line = MACOS && cmd;
     // Snapshot selection range before any mutation to avoid borrow conflicts
     let sel_range: Option<(usize, usize)> = sel.and_then(|a| {
         let mn = a.min(*cursor);
@@ -5564,8 +5601,8 @@ fn input_field_edit(
             } else if sel.is_none() {
                 *sel = Some(*cursor);
             }
-            *cursor = if alt { qf_prev_word(field, *cursor) }
-                      else if cmd { 0 }
+            *cursor = if word { qf_prev_word(field, *cursor) }
+                      else if line { 0 }
                       else { qf_prev_char(field, *cursor) };
             true
         }
@@ -5578,8 +5615,8 @@ fn input_field_edit(
             } else if sel.is_none() {
                 *sel = Some(*cursor);
             }
-            *cursor = if alt { qf_next_word(field, *cursor) }
-                      else if cmd { field.len() }
+            *cursor = if word { qf_next_word(field, *cursor) }
+                      else if line { field.len() }
                       else { qf_next_char(field, *cursor) };
             true
         }
@@ -5599,7 +5636,7 @@ fn input_field_edit(
             if let Some((mn, mx)) = sel_range {
                 field.drain(mn..mx); *cursor = mn; *sel = None;
             } else {
-                let next = qf_next_char(field, *cursor);
+                let next = if word { qf_next_word(field, *cursor) } else { qf_next_char(field, *cursor) };
                 if next > *cursor { field.drain(*cursor..next); }
             }
             true
@@ -5607,9 +5644,9 @@ fn input_field_edit(
         Key::Named(NamedKey::Backspace) => {
             if let Some((mn, mx)) = sel_range {
                 field.drain(mn..mx); *cursor = mn; *sel = None;
-            } else if cmd {
+            } else if line || (!MACOS && ctrl && shift) {
                 field.clear(); *cursor = 0; *sel = None;
-            } else if alt {
+            } else if word {
                 let nc = qf_prev_word(field, *cursor);
                 field.drain(nc..*cursor); *cursor = nc;
             } else if *cursor > 0 {
@@ -5650,7 +5687,7 @@ fn input_field_edit(
                 }
                 true
             }
-            s if !cmd && !ctrl => {
+            s if !cmd && !ctrl && (MACOS || !alt) => {
                 if let Some((mn, mx)) = sel_range {
                     field.drain(mn..mx); *cursor = mn; *sel = None;
                 }
@@ -6693,6 +6730,42 @@ fn commit_settings_field(s: &mut State) {
     sync_collab_settings(s);
 }
 
+const MACOS: bool = cfg!(target_os = "macos");
+
+/// The app-shortcut modifier ("cmd" throughout the key handling): Command on
+/// macOS, Control on Linux.
+fn primary_mod(m: ModifiersState) -> bool {
+    if MACOS { m.super_key() } else { m.control_key() }
+}
+
+/// Shortcut labels are written macOS-style ("Cmd+S", "Opt+Shift+F"); show the
+/// Linux names there.
+fn key_label(label: &str) -> std::borrow::Cow<'_, str> {
+    if MACOS || !(label.contains("Cmd") || label.contains("Opt+")) {
+        return std::borrow::Cow::Borrowed(label);
+    }
+    std::borrow::Cow::Owned(label.replace("Cmd+", "Ctrl+").replace("Opt+", "Alt+"))
+}
+
+/// A sidebar text field (tree search, commit message, a search field) on
+/// screen has keyboard focus.
+fn sidebar_text_field_focused(s: &State) -> bool {
+    s.explorer.as_ref().map_or(false, |ex| s.left_panel_visible && match s.left_view {
+        LeftView::FileTree     => ex.tree_search_focused,
+        LeftView::Git          => s.git_panel.commit_focused,
+        LeftView::GlobalSearch => s.global_find.focus != GlobalFindFocus::Results,
+        _ => false,
+    })
+}
+
+/// The active terminal is what the user is typing into (no overlay or sidebar
+/// field has the keyboard).
+fn terminal_has_keyboard(s: &State) -> bool {
+    s.panes.get(&s.active_pane).map_or(false, |p| p.kind == PaneKind::Terminal)
+        && !s.quick_finder.open && s.context_menu.is_none() && s.lsp_panel.is_none()
+        && !sidebar_text_field_focused(s)
+}
+
 /// A key event that only reports a modifier going down.
 fn is_modifier_key(key: &Key) -> bool {
     matches!(key, Key::Named(k) if matches!(k,
@@ -6799,7 +6872,11 @@ fn save_tab(s: &mut State, pane_id: usize, tab_idx: usize) -> bool {
         .map_or(false, |t| t.kind == TabKind::Editor && t.path.is_none() && t.collab_path.is_none());
     if needs_name {
         let Some(chosen) = save_file_dialog() else {
-            s.status_msg = Some("Untitled file not saved (no file name chosen)".to_owned());
+            s.status_msg = Some(if dialog_tool_missing() {
+                "Untitled file not saved: install zenity or kdialog for file dialogs".to_owned()
+            } else {
+                "Untitled file not saved (no file name chosen)".to_owned()
+            });
             return false;
         };
         if let Some(t) = s.panes.get_mut(&pane_id).and_then(|p| p.tabs.get_mut(tab_idx)) {
@@ -7989,7 +8066,7 @@ impl App {
                     let item_h = s.glyphs.lh + 2;
                     let sep_h  = 5i32;
                     let label_w = cm.items.iter().filter(|i| i.action != CtxAction::Separator).map(|i| i.label.chars().count()).max().unwrap_or(8) as i32;
-                    let sc_w    = cm.items.iter().filter(|i| i.action != CtxAction::Separator).map(|i| i.shortcut.chars().count()).max().unwrap_or(0) as i32;
+                    let sc_w    = cm.items.iter().filter(|i| i.action != CtxAction::Separator).map(|i| key_label(i.shortcut).chars().count()).max().unwrap_or(0) as i32;
                     let menu_w  = (label_w + sc_w + 4) * s.glyphs.cw + 16;
                     let total_h: i32 = cm.items.iter().map(|i| if i.action == CtxAction::Separator { sep_h } else { item_h }).sum::<i32>() + 4;
                     let menu_x = cm.x.min(s.w as i32 - menu_w).max(0);
@@ -8082,9 +8159,9 @@ impl App {
                         let r     = s.active_pane_rect();
                         let fh    = s.find_h();
                         let in_ed = my >= r.y + s.tab_h() && my < r.y + r.h - fh && mx >= r.x;
-                        let cmd   = s.mods.super_key();
-                        // When Cmd is held and mouse is in the editor content area, use pointer cursor
-                        // to signal that Cmd+Click will navigate (goto definition)
+                        let cmd   = primary_mod(s.mods);
+                        // When Cmd (Linux: Ctrl) is held over the editor content, use the pointer
+                        // cursor to signal that Cmd/Ctrl+Click will navigate (goto definition)
                         let cursor = if !in_ed {
                             CursorIcon::Default
                         } else if cmd {
@@ -8464,7 +8541,7 @@ impl App {
                 let mx  = s.mouse_x as i32;
                 let my  = s.mouse_y as i32;
                 let alt = s.mods.alt_key();
-                let cmd = s.mods.super_key();
+                let cmd = primary_mod(s.mods);
                 let shift = s.mods.shift_key();
 
                 // Quick finder overlay click (must run before other handlers)
@@ -8539,7 +8616,7 @@ impl App {
                     let sep_h  = 5i32;
                     let total_h: i32 = cm.items.iter().map(|i| if i.action == CtxAction::Separator { sep_h } else { item_h }).sum::<i32>() + 4;
                     let label_w = cm.items.iter().filter(|i| i.action != CtxAction::Separator).map(|i| i.label.chars().count()).max().unwrap_or(8) as i32;
-                    let sc_w    = cm.items.iter().filter(|i| i.action != CtxAction::Separator).map(|i| i.shortcut.chars().count()).max().unwrap_or(0) as i32;
+                    let sc_w    = cm.items.iter().filter(|i| i.action != CtxAction::Separator).map(|i| key_label(i.shortcut).chars().count()).max().unwrap_or(0) as i32;
                     let menu_w  = (label_w + sc_w + 4) * s.glyphs.cw + 16;
                     let menu_x  = cm.x.min(s.w as i32 - menu_w).max(0);
                     let menu_y  = cm.y.min(s.h as i32 - total_h).max(0);
@@ -9901,13 +9978,44 @@ impl App {
                 }
             }
 
-            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+            WindowEvent::KeyboardInput { mut event, .. } if event.state == ElementState::Pressed => {
                 dlog!("[input] {:?}", event.logical_key);
                 s.status_msg = None;
                 let ctrl  = s.mods.control_key();
-                let cmd   = s.mods.super_key();
+                // App shortcuts use `cmd`: Command on macOS, Control on Linux (where
+                // `cmd` and `ctrl` are then both set; the places where Linux and
+                // macOS conventions differ check MACOS).
+                let cmd   = primary_mod(s.mods);
                 let alt   = s.mods.alt_key();
                 let shift = s.mods.shift_key();
+                // Unshifted shortcut letters are matched lowercase: with Caps Lock on,
+                // Ctrl+S arrives as "S" and missed every binding.
+                if (cmd || ctrl) && !shift {
+                    if let Key::Character(c) = &event.logical_key {
+                        if c.len() == 1 && c.chars().all(|ch| ch.is_ascii_uppercase()) {
+                            event.logical_key = Key::Character(c.to_ascii_lowercase().into());
+                        }
+                    }
+                }
+                // Whether the terminal is what's being typed into, decided before any
+                // handler moves focus. On Linux it then owns plain Ctrl+<letter>
+                // (readline's Ctrl+P/B/G/W…): app shortcuts there take Shift
+                // (Ctrl+Shift+W/C/V/Q) or aren't letters (Ctrl+`, Ctrl+=).
+                let term_focused = terminal_has_keyboard(s);
+                let shell_keys = !MACOS && term_focused;
+
+                // Ctrl+Q — quit (macOS gets Cmd+Q from the app menu)
+                if !MACOS && cmd && (shift || !shell_keys)
+                    && matches!(&event.logical_key, Key::Character(c) if c.eq_ignore_ascii_case("q"))
+                {
+                    if request_quit(s) {
+                        s.panes.clear();
+                        el.exit();
+                        return;
+                    }
+                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                    return;
+                }
 
                 // LSP manager panel captures all keys while open.
                 if s.lsp_panel.is_some() {
@@ -9953,7 +10061,7 @@ impl App {
                 }
 
                 // Cmd+P — quick file finder
-                if cmd && !shift && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "p") {
+                if cmd && !shift && !shell_keys && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "p") {
                     open_quick_finder(s, self.proxy.clone());
                     { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                     return;
@@ -9973,7 +10081,7 @@ impl App {
                 // open with a query it means "next match" instead (editor handler).
                 let find_next = !s.quick_finder.open && active_editor_tab(s).is_some()
                     && s.find().open && !s.find().query.is_empty();
-                if cmd && !shift && !find_next
+                if cmd && !shift && !find_next && !shell_keys
                     && matches!(&event.logical_key, Key::Character(c) if matches!(c.as_str(), "g" | "G"))
                 {
                     let pane_id = s.active_pane;
@@ -9999,7 +10107,7 @@ impl App {
                 }
 
                 // Cmd+B — toggle left panel visibility
-                if cmd && !shift && matches!(&event.logical_key, Key::Character(c) if matches!(c.as_str(), "b" | "B")) {
+                if cmd && !shift && !shell_keys && matches!(&event.logical_key, Key::Character(c) if matches!(c.as_str(), "b" | "B")) {
                     if s.explorer.is_some() {
                         s.left_panel_visible = !s.left_panel_visible;
                         // A hidden sidebar must not keep the keyboard.
@@ -10401,7 +10509,7 @@ impl App {
                             // shortcuts must never be inserted (Cmd+V used to type "v").
                             let txt: Option<String> = if cmd && matches!(key, Key::Character(c) if matches!(c.as_str(), "v" | "V")) {
                                 clipboard_read().lines().next().map(str::to_owned)
-                            } else if cmd || ctrl {
+                            } else if cmd || ctrl || (!MACOS && alt) {
                                 None
                             } else {
                                 event.text.as_deref().map(str::to_owned)
@@ -10418,8 +10526,9 @@ impl App {
                     return;
                 }
 
-                // Cmd+W — close the active tab of any pane kind (LSP output panes hide)
-                if cmd && !shift && matches!(&event.logical_key, Key::Character(c) if matches!(c.as_str(), "w" | "W")) {
+                // Cmd+W — close the active tab of any pane kind (LSP output panes hide).
+                // In a focused terminal on Linux Ctrl+W is the shell's: Ctrl+Shift+W.
+                if cmd && shift == shell_keys && matches!(&event.logical_key, Key::Character(c) if c.eq_ignore_ascii_case("w")) {
                     if close_active_tab(s) {
                         s.panes.clear();
                         el.exit();
@@ -10431,6 +10540,14 @@ impl App {
 
                 // Terminal pane intercepts (before PTY forwarding)
                 if s.panes.get(&s.active_pane).map_or(false, |p| p.kind == PaneKind::Terminal) {
+                    // A shortcut let through from a sidebar field is not terminal input
+                    // (e.g. Ctrl+S on its way to "save" must not send XOFF to the shell).
+                    if !term_focused {
+                        { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                        return;
+                    }
+                    let is_char = |k: &str| matches!(&event.logical_key, Key::Character(c) if c.eq_ignore_ascii_case(k));
+                    let backspace = matches!(&event.logical_key, Key::Named(NamedKey::Backspace));
                     // Ctrl+Shift+5 — split: new terminal with same shell below
                     if ctrl && shift && matches!(&event.logical_key, Key::Character(c) if matches!(c.as_str(), "5" | "%")) {
                         // If in a remote workspace, prefer SSH over duplicating the local shell.
@@ -10464,8 +10581,11 @@ impl App {
                         { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                         return;
                     }
-                    // Cmd+C — copy terminal selection (or fall through when term_copy_paste disabled)
-                    if cmd && matches!(&event.logical_key, Key::Character(c) if matches!(c.as_str(), "c" | "C")) {
+                    // Copy the selection: Cmd+C on macOS; on Linux Ctrl+Shift+C, or Ctrl+C
+                    // while text is selected if terminal copy/paste is enabled.
+                    let copy_key = is_char("c") && !alt
+                        && if MACOS { cmd } else { ctrl && (shift || s.settings.term_copy_paste) };
+                    if copy_key {
                         if let Some(sel) = s.term_sel.clone() {
                             if !sel.is_empty() {
                                 let pane_id = s.active_pane;
@@ -10494,11 +10614,18 @@ impl App {
                                 return;
                             }
                         }
-                        // No selection: if copy/paste enabled, swallow here; otherwise fall through to PTY
-                        if s.settings.term_copy_paste { return; }
+                        // No selection: Cmd+C / Ctrl+Shift+C do nothing, while plain Ctrl+C
+                        // goes on to the shell as an interrupt.
+                        if MACOS || shift { return; }
                     }
-                    // Cmd+V — paste from clipboard (only when term_copy_paste enabled)
-                    if s.settings.term_copy_paste && cmd && matches!(&event.logical_key, Key::Character(c) if matches!(c.as_str(), "v" | "V")) {
+                    // Paste: Cmd+V on macOS when terminal copy/paste is enabled; on Linux
+                    // Ctrl+Shift+V, or Ctrl+V when enabled.
+                    let paste_key = is_char("v") && !alt && if MACOS {
+                        cmd && s.settings.term_copy_paste
+                    } else {
+                        ctrl && (shift || s.settings.term_copy_paste)
+                    };
+                    if paste_key {
                         s.term_sel = None;
                         let text = clipboard_read();
                         if !text.is_empty() {
@@ -10513,8 +10640,8 @@ impl App {
                         }
                         return;
                     }
-                    // Cmd+Backspace → send \x15 (kill to line start) when enabled
-                    if s.settings.term_cmd_bs && cmd && matches!(&event.logical_key, Key::Named(NamedKey::Backspace)) {
+                    // Cmd+Backspace (Linux: Ctrl+Shift+Backspace) → send \x15 (kill to line start) when enabled
+                    if s.settings.term_cmd_bs && backspace && if MACOS { cmd } else { ctrl && shift } {
                         let p = &s.panes[&s.active_pane];
                         if let Some(&tid) = p.term_ids.get(p.active) {
                             if let Some(tp) = s.term_panes.get(&tid) {
@@ -10524,8 +10651,9 @@ impl App {
                         }
                         return;
                     }
-                    // Alt/Option+Backspace → send \x17 (delete previous word) when enabled
-                    if s.settings.term_alt_bs && alt && matches!(&event.logical_key, Key::Named(NamedKey::Backspace)) {
+                    // Alt/Option+Backspace → send \x17 (delete previous word) when enabled;
+                    // on Linux Ctrl+Backspace always does, as it does in the editor.
+                    if backspace && ((s.settings.term_alt_bs && alt) || (!MACOS && ctrl && !shift && !alt)) {
                         let p = &s.panes[&s.active_pane];
                         if let Some(&tid) = p.term_ids.get(p.active) {
                             if let Some(tp) = s.term_panes.get(&tid) {
@@ -10543,7 +10671,7 @@ impl App {
                     // Cmd (Super) combos are app shortcuts, never terminal input: winit
                     // still reports their letter as text, so an unbound one such as
                     // Cmd+S or Cmd+1 used to type "s"/"1" into the shell.
-                    if is_modifier_key(&event.logical_key) || cmd {
+                    if is_modifier_key(&event.logical_key) || s.mods.super_key() {
                         s.needs_redraw = true;
                         self.dirty.store(true, Ordering::Release);
                         return;
@@ -10557,12 +10685,23 @@ impl App {
                         })
                     };
                     let application_cursor = target.map_or(false, |(_, mode)| mode);
-                    let bytes = terminal::encode_key(
+                    let mut bytes = None;
+                    if !MACOS {
+                        // xterm conventions: modifier parameters on arrows/Home/End
+                        // (Ctrl+Left = word left in readline).
+                        bytes = terminal::encode_modified_cursor_key(&event.logical_key, s.mods);
+                    }
+                    let bytes = bytes.or_else(|| terminal::encode_key(
                         &event.logical_key,
                         s.mods,
                         event.text.as_deref(),
                         application_cursor,
-                    );
+                    )).map(|b| {
+                        // Linux: Alt is Meta and prefixes ESC (Alt+B/F/., Alt+Backspace).
+                        let meta = !MACOS && alt
+                            && matches!(&event.logical_key, Key::Character(_) | Key::Named(NamedKey::Backspace));
+                        if meta { [b"\x1b".as_slice(), &b].concat() } else { b }
+                    });
                     if let Some(bytes) = bytes {
                         if let Some((pty_fd, _)) = target {
                             // SAFETY: pty_fd is valid (>= 0 checked); bytes slice lives for this synchronous call.
@@ -10640,9 +10779,9 @@ impl App {
                     let handled =
                         if read_only && (cmd || alt || ctrl) && matches!(&event.logical_key,
                             Key::Character(c) if if collab_ro {
-                                matches!(c.as_str(), "x" | "v" | "z" | "Z" | "h")
+                                matches!(c.as_str(), "x" | "v" | "z" | "Z" | "y" | "h")
                             } else {
-                                matches!(c.as_str(), "a" | "x" | "v" | "z" | "Z" | "d" | "l" | "L" | "f" | "h" | "g" | "G")
+                                matches!(c.as_str(), "a" | "x" | "v" | "z" | "Z" | "y" | "d" | "l" | "L" | "f" | "h" | "g" | "G")
                             })
                         {
                             true // editing / selection shortcuts do nothing in read-only tabs
@@ -10692,6 +10831,9 @@ impl App {
                         } else if cmd && shift && matches!(&event.logical_key, Key::Character(c) if matches!(c.as_str(), "z" | "Z")) {
                             s.redo();
                             true
+                        } else if !MACOS && cmd && !shift && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "y") {
+                            s.redo(); // Ctrl+Y, the Linux redo alongside Ctrl+Shift+Z
+                            true
                         } else if cmd && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "v") {
                             if let Some(text) = clipboard_get() {
                                 for ch in text.chars() { s.glyphs.load(ch); }
@@ -10699,7 +10841,11 @@ impl App {
                             }
                             true
                         } else if cmd && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "o") {
-                            if let Some(path) = open_file_dialog() { open_or_reuse_tab(s, VPath::Local(path)); }
+                            if let Some(path) = open_file_dialog() {
+                                open_or_reuse_tab(s, VPath::Local(path));
+                            } else if dialog_tool_missing() {
+                                s.status_msg = Some("Install zenity or kdialog for file dialogs".to_owned());
+                            }
                             true
                         } else if (ctrl || cmd) && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "s") {
                             execute_command(s, CommandAction::Save);
@@ -10770,6 +10916,13 @@ impl App {
                                 pane.active = (pane.active + 1) % n;
                             }
                             true
+                        } else if ctrl && matches!(&event.logical_key, Key::Named(NamedKey::PageUp | NamedKey::PageDown)) {
+                            // Ctrl+PageUp / Ctrl+PageDown — previous / next tab
+                            let n = s.pane().tabs.len();
+                            let back = matches!(&event.logical_key, Key::Named(NamedKey::PageUp));
+                            let pane = s.pane_mut();
+                            pane.active = if back { pane.active.checked_sub(1).unwrap_or(n - 1) } else { (pane.active + 1) % n };
+                            true
                         }
                         // ── Find / Replace ────────────────────────────────────────────────────
                         else if cmd && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "f") {
@@ -10799,6 +10952,10 @@ impl App {
                         } else if cmd && matches!(&event.logical_key, Key::Character(c) if matches!(c.as_str(), "g" | "G")) {
                             // Cmd+Shift+G = previous match (Cmd+G is routed here only while
                             // the find bar is open; otherwise it is "go to line").
+                            if !s.find().query.is_empty() { find_step(s, shift); }
+                            true
+                        } else if matches!(&event.logical_key, Key::Named(NamedKey::F3)) {
+                            // F3 / Shift+F3 — next / previous match (Linux convention)
                             if !s.find().query.is_empty() { find_step(s, shift); }
                             true
                         }
@@ -10871,7 +11028,7 @@ impl App {
                             false
                         } else if collab_ro && (matches!(&event.logical_key,
                             Key::Named(NamedKey::Backspace | NamedKey::Delete | NamedKey::Enter | NamedKey::Tab | NamedKey::Space))
-                            || (matches!(&event.logical_key, Key::Character(_)) && !cmd && !ctrl))
+                            || (matches!(&event.logical_key, Key::Character(_)) && !cmd && !ctrl && (MACOS || !alt)))
                         {
                             s.status_msg = Some("This shared file is read-only for your role".to_owned());
                             false
@@ -10904,25 +11061,32 @@ impl App {
                             false
                         } else {
                             match &event.logical_key {
+                                // macOS: Cmd+arrows go to line/document ends, Option(/Ctrl)
+                                // moves by word, Cmd+Option+Up/Down adds a cursor.
+                                // Linux: Ctrl(/Alt) moves by word, Home/End and Ctrl+Home/End
+                                // go to the ends, Ctrl+Up/Down scrolls, and Ctrl+Shift or
+                                // Alt+Shift (or Ctrl+Alt) +Up/Down adds a cursor.
                                 Key::Named(NamedKey::ArrowLeft) => {
-                                    if cmd            { s.move_home(shift); }
+                                    if MACOS && cmd   { s.move_home(shift); }
                                     else if alt||ctrl { s.move_word_left(shift); }
                                     else              { s.move_left(shift); }
                                 }
                                 Key::Named(NamedKey::ArrowRight) => {
-                                    if cmd            { s.move_end(shift); }
+                                    if MACOS && cmd   { s.move_end(shift); }
                                     else if alt||ctrl { s.move_word_right(shift); }
                                     else              { s.move_right(shift); }
                                 }
                                 Key::Named(NamedKey::ArrowUp) => {
-                                    if cmd && alt      { s.add_cursor_above(); }
-                                    else if cmd        { s.move_doc_start(shift); }
-                                    else               { s.move_up(shift); }
+                                    if (cmd && alt) || (!MACOS && shift && (ctrl || alt)) { s.add_cursor_above(); }
+                                    else if MACOS && cmd { s.move_doc_start(shift); }
+                                    else if ctrl && !MACOS { s.scroll_by(-1); }
+                                    else                 { s.move_up(shift); }
                                 }
                                 Key::Named(NamedKey::ArrowDown) => {
-                                    if cmd && alt      { s.add_cursor_below(); }
-                                    else if cmd        { s.move_doc_end(shift); }
-                                    else               { s.move_down(shift); }
+                                    if (cmd && alt) || (!MACOS && shift && (ctrl || alt)) { s.add_cursor_below(); }
+                                    else if MACOS && cmd { s.move_doc_end(shift); }
+                                    else if ctrl && !MACOS { s.scroll_by(1); }
+                                    else                 { s.move_down(shift); }
                                 }
                                 Key::Named(NamedKey::Home) => {
                                     if ctrl { s.move_doc_start(shift); } else { s.move_home(shift); }
@@ -10930,13 +11094,15 @@ impl App {
                                 Key::Named(NamedKey::End) => {
                                     if ctrl { s.move_doc_end(shift); } else { s.move_end(shift); }
                                 }
+                                // To the line start/end: Cmd+Backspace/Delete on macOS,
+                                // Ctrl+Shift+Backspace/Delete on Linux (Ctrl alone = word).
                                 Key::Named(NamedKey::Backspace) => {
-                                    if cmd            { s.delete_to_line_start(); }
+                                    if (MACOS && cmd) || (!MACOS && ctrl && shift) { s.delete_to_line_start(); }
                                     else if alt||ctrl { s.delete_word_back(); }
                                     else              { s.backspace(); }
                                 }
                                 Key::Named(NamedKey::Delete) => {
-                                    if cmd            { s.delete_to_line_end(); }
+                                    if (MACOS && cmd) || (!MACOS && ctrl && shift) { s.delete_to_line_end(); }
                                     else if alt||ctrl { s.delete_word_fwd(); }
                                     else              { s.delete_fwd(); }
                                 }
@@ -10953,7 +11119,9 @@ impl App {
                                     execute_command(s, action);
                                 }
                                 _ => {
-                                    if !ctrl && !cmd {
+                                    // On Linux Alt+letter is a shortcut, not text (macOS
+                                    // Option types accented/symbol characters).
+                                    if !ctrl && !cmd && (MACOS || !alt) {
                                         if let Some(txt) = event.text.as_deref() {
                                             for ch in txt.chars() { s.glyphs.load(ch); }
                                             s.insert_str(txt);
@@ -11496,7 +11664,8 @@ impl App {
                 s.collab_file_list = Vec::new(); // a FileList follows
                 if let Some(doc) = doc { guest_load_doc(s, doc); }
                 let n = s.collab.as_ref().map_or(0, |sess| sess.peers.len());
-                s.status_msg = Some(format!("🔒 collab: connected ({n} peer{}) — Cmd+P lists shared files", if n == 1 { "" } else { "s" }));
+                s.status_msg = Some(format!("🔒 collab: connected ({n} peer{}) — {} lists shared files",
+                    if n == 1 { "" } else { "s" }, key_label("Cmd+P")));
                 s.needs_redraw = true;
                 self.dirty.store(true, Ordering::Release);
             }
@@ -12357,7 +12526,7 @@ fn render(s: &mut State) {
         let view_end   = (view_start + 10).min(n);
         s.quick_finder.filtered_commands[view_start..view_end].iter().map(|cmd| {
             match cmd {
-                QfCommand::Static(i) => (COMMANDS[*i].name.to_owned(), COMMANDS[*i].shortcut.to_owned()),
+                QfCommand::Static(i) => (COMMANDS[*i].name.to_owned(), key_label(COMMANDS[*i].shortcut).into_owned()),
                 QfCommand::LspOutput { title, .. } => (format!("Open LSP Output: {}", title), String::new()),
             }
         }).collect()
@@ -12498,7 +12667,7 @@ fn render(s: &mut State) {
 
     // Cmd+hover underline: when Cmd is held and the mouse is over an identifier in an editor
     // pane that has an active LSP server, underline the token to indicate goto-def is available.
-    let cmd_held = s.mods.super_key();
+    let cmd_held = primary_mod(s.mods); // Cmd (macOS) / Ctrl (Linux) + hover
     let cmd_hover_underline: Option<(i32, i32, i32, i32)> = if cmd_held {
         pane_snaps.iter().find_map(|snap| {
             if snap.is_settings_tab { return None; }
@@ -13068,7 +13237,7 @@ fn render(s: &mut State) {
                 let sy = vy + lh + 4;
                 if row_vis(sy) {
                     draw_str(buf, w, h, g, "  UI Scale", r.x, sy + asc, FG, btn_x - cw);
-                    let scale_str = format!("  {:.0}%  (Cmd+= / Cmd+-)", ui_scale * 100.0);
+                    let scale_str = format!("  {:.0}%  ({})", ui_scale * 100.0, key_label("Cmd+= / Cmd+-"));
                     draw_str(buf, w, h, g, &scale_str, btn_x, sy + asc, FG_DIM, r.x + r.w);
                 }
                 // Rainbow Brackets row
@@ -13140,7 +13309,7 @@ fn render(s: &mut State) {
 
                 let tcp_y = term_sec_y + lh + 4;
                 if row_vis(tcp_y) {
-                    draw_str(buf, w, h, g, "  Copy/Paste (Cmd+C / Cmd+V)", r.x, tcp_y + asc, FG, btn_x - cw);
+                    draw_str(buf, w, h, g, &key_label("  Copy/Paste (Cmd+C / Cmd+V)"), r.x, tcp_y + asc, FG, btn_x - cw);
                     let (tcp_bg, tcp_fg) = if term_copy_paste { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
                     fc(buf, btn_x, tcp_y, 8 * cw, lh, tcp_bg);
                     draw_str(buf, w, h, g, if term_copy_paste { " [x] On " } else { " [ ] Off" }, btn_x, tcp_y + asc, tcp_fg, btn_x + 8 * cw);
@@ -13148,7 +13317,8 @@ fn render(s: &mut State) {
 
                 let tcb_y = tcp_y + lh + 4;
                 if row_vis(tcb_y) {
-                    draw_str(buf, w, h, g, "  Cmd+Backspace \u{2192} \\x15", r.x, tcb_y + asc, FG, btn_x - cw);
+                    let kill_line = if MACOS { "  Cmd+Backspace \u{2192} \\x15" } else { "  Ctrl+Shift+Backspace \u{2192} \\x15" };
+                    draw_str(buf, w, h, g, kill_line, r.x, tcb_y + asc, FG, btn_x - cw);
                     let (tcb_bg, tcb_fg) = if term_cmd_bs { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
                     fc(buf, btn_x, tcb_y, 8 * cw, lh, tcb_bg);
                     draw_str(buf, w, h, g, if term_cmd_bs { " [x] On " } else { " [ ] Off" }, btn_x, tcb_y + asc, tcb_fg, btn_x + 8 * cw);
@@ -13790,7 +13960,7 @@ fn render(s: &mut State) {
             let item_h  = lh + 2;
             let sep_h   = 5i32;
             let label_w = items.iter().filter(|i| i.action != CtxAction::Separator).map(|i| i.label.chars().count()).max().unwrap_or(8) as i32;
-            let sc_w    = items.iter().filter(|i| i.action != CtxAction::Separator).map(|i| i.shortcut.chars().count()).max().unwrap_or(0) as i32;
+            let sc_w    = items.iter().filter(|i| i.action != CtxAction::Separator).map(|i| key_label(i.shortcut).chars().count()).max().unwrap_or(0) as i32;
             let menu_w  = (label_w + sc_w + 4) * cw + 16;
             let total_h: i32 = items.iter().map(|i| if i.action == CtxAction::Separator { sep_h } else { item_h }).sum::<i32>() + 4;
             let menu_x  = (*cmx).min(w as i32 - menu_w).max(0);
@@ -13813,8 +13983,9 @@ fn render(s: &mut State) {
                 let label_color = if item.enabled { FG } else { FG_DIM };
                 draw_str(buf, w, h, g, item.label, menu_x + cw, iy + asc, label_color, menu_x + menu_w - sc_w * cw - cw - 4);
                 if !item.shortcut.is_empty() {
-                    let sc_x = menu_x + menu_w - item.shortcut.chars().count() as i32 * cw - cw;
-                    draw_str(buf, w, h, g, item.shortcut, sc_x, iy + asc, FG_DIM, menu_x + menu_w - 1);
+                    let shortcut = key_label(item.shortcut);
+                    let sc_x = menu_x + menu_w - shortcut.chars().count() as i32 * cw - cw;
+                    draw_str(buf, w, h, g, &shortcut, sc_x, iy + asc, FG_DIM, menu_x + menu_w - 1);
                 }
                 iy += item_h;
             }
@@ -14067,6 +14238,39 @@ mod tests {
         for (key, cmd, ctrl, shift) in stays {
             assert!(!is_app_shortcut(&key, cmd, ctrl, shift), "{key:?} cmd={cmd} ctrl={ctrl} shift={shift}");
         }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn linux_shortcut_labels_name_ctrl_and_alt() {
+        assert_eq!(key_label("Cmd+Shift+F12"), "Ctrl+Shift+F12");
+        assert_eq!(key_label("Opt+Shift+F"), "Alt+Shift+F");
+        assert_eq!(key_label("Cmd+= / Cmd+-"), "Ctrl+= / Ctrl+-");
+        assert_eq!(key_label("Ctrl+`"), "Ctrl+`");
+        assert_eq!(key_label("F12"), "F12");
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn linux_text_fields_use_ctrl_for_words_and_ignore_alt_letters() {
+        // (field, cursor) after one key; args: key, cmd, alt, ctrl, shift.
+        // On Linux the key handler passes cmd == ctrl for Ctrl.
+        let edit = |text: &str, cursor: usize, key: Key, cmd: bool, alt: bool, ctrl: bool, shift: bool| {
+            let (mut f, mut c, mut sel) = (text.to_owned(), cursor, None);
+            input_field_edit(&mut f, &mut c, &mut sel, &key, cmd, alt, ctrl, shift);
+            (f, c)
+        };
+        let left  = Key::Named(NamedKey::ArrowLeft);
+        let bs    = Key::Named(NamedKey::Backspace);
+        // Ctrl+Left: previous word (macOS-style "start of line" was used before)
+        assert_eq!(edit("foo bar", 7, left, true, false, true, false), ("foo bar".to_owned(), 4));
+        // Ctrl+Backspace: delete the previous word, not the whole field
+        assert_eq!(edit("foo bar", 7, bs.clone(), true, false, true, false), ("foo ".to_owned(), 4));
+        // Ctrl+Shift+Backspace clears it
+        assert_eq!(edit("foo bar", 7, bs, true, false, true, true), (String::new(), 0));
+        // Alt+letter is a shortcut, not text
+        assert_eq!(edit("foo", 3, ch("x"), false, true, false, false), ("foo".to_owned(), 3));
+        assert_eq!(edit("foo", 3, ch("x"), false, false, false, false), ("foox".to_owned(), 4));
     }
 
     #[test]

@@ -29,6 +29,8 @@ objc2-metal       = { version = "0.3", features = ["MTLCommandBuffer", "MTLComma
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 softbuffer = "0.4"
+# System clipboard (X11, plus Wayland compositors with data-control); macOS uses pbcopy/pbpaste.
+arboard    = { version = "3.7", default-features = false, features = ["wayland-data-control"] }
 
 [profile.release]
 strip = true

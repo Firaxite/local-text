@@ -937,14 +937,39 @@ pub fn encode_key(
             let c = s.chars().next()?;
             if c.is_ascii_alphabetic() {
                 Some(vec![(c.to_ascii_lowercase() as u8) - b'a' + 1])
-            } else if c == '[' {
-                Some(b"\x1b".to_vec())
             } else {
-                None
+                // The other C0 controls, as xterm sends them: Ctrl+@ NUL, Ctrl+[ ESC,
+                // Ctrl+\ FS (SIGQUIT), Ctrl+] GS, Ctrl+^ RS, Ctrl+_ / Ctrl+/ US
+                // (readline undo), Ctrl+? DEL.
+                let byte = match c {
+                    '@' => 0x00, '[' => 0x1b, '\\' => 0x1c, ']' => 0x1d,
+                    '^' => 0x1e, '_' | '/' => 0x1f, '?' => 0x7f,
+                    _ => return None,
+                };
+                Some(vec![byte])
             }
         }
+        Key::Named(NamedKey::Space) if ctrl => Some(vec![0x00]), // Ctrl+Space = NUL (set mark)
         _ => text.filter(|t| !t.is_empty()).map(|t| t.as_bytes().to_vec()),
     }
+}
+
+/// xterm encoding of arrows/Home/End pressed with Shift, Alt or Ctrl:
+/// `ESC [ 1 ; m X` with m = 1 + shift + 2·alt + 4·ctrl, so Ctrl+Left is
+/// `ESC [1;5D` (readline's backward-word). `None` without a modifier or for
+/// any other key.
+pub fn encode_modified_cursor_key(key: &Key, mods: ModifiersState) -> Option<Vec<u8>> {
+    let suffix = match key {
+        Key::Named(NamedKey::ArrowUp)    => 'A',
+        Key::Named(NamedKey::ArrowDown)  => 'B',
+        Key::Named(NamedKey::ArrowRight) => 'C',
+        Key::Named(NamedKey::ArrowLeft)  => 'D',
+        Key::Named(NamedKey::End)        => 'F',
+        Key::Named(NamedKey::Home)       => 'H',
+        _ => return None,
+    };
+    let m = 1 + mods.shift_key() as u8 + 2 * mods.alt_key() as u8 + 4 * mods.control_key() as u8;
+    (m > 1).then(|| format!("\x1b[1;{m}{suffix}").into_bytes())
 }
 
 /// Encode a mouse event as bytes to write to the PTY master fd.
@@ -977,6 +1002,30 @@ mod tests {
         for &b in bytes {
             parser.advance(&mut handler, b);
         }
+    }
+
+    #[test]
+    fn ctrl_punctuation_sends_c0_controls() {
+        let ctrl = |c: &str| encode_key(&Key::Character(c.into()), ModifiersState::CONTROL, Some(c), false);
+        assert_eq!(ctrl("\\"), Some(vec![0x1c])); // SIGQUIT
+        assert_eq!(ctrl("_"), Some(vec![0x1f]));    // readline undo
+        assert_eq!(ctrl("]"), Some(vec![0x1d]));
+        assert_eq!(ctrl("c"), Some(vec![0x03]));
+        assert_eq!(ctrl("C"), Some(vec![0x03]));
+        assert_eq!(ctrl("1"), None);
+        assert_eq!(encode_key(&Key::Named(NamedKey::Space), ModifiersState::CONTROL, Some(" "), false), Some(vec![0x00]));
+        assert_eq!(encode_key(&Key::Named(NamedKey::Space), ModifiersState::empty(), Some(" "), false), Some(b" ".to_vec()));
+    }
+
+    #[test]
+    fn modified_cursor_keys_use_xterm_parameters() {
+        let left = Key::Named(NamedKey::ArrowLeft);
+        assert_eq!(encode_modified_cursor_key(&left, ModifiersState::CONTROL), Some(b"\x1b[1;5D".to_vec()));
+        assert_eq!(encode_modified_cursor_key(&left, ModifiersState::ALT), Some(b"\x1b[1;3D".to_vec()));
+        assert_eq!(encode_modified_cursor_key(&Key::Named(NamedKey::Home), ModifiersState::SHIFT | ModifiersState::CONTROL),
+                   Some(b"\x1b[1;6H".to_vec()));
+        assert_eq!(encode_modified_cursor_key(&left, ModifiersState::empty()), None);
+        assert_eq!(encode_modified_cursor_key(&Key::Named(NamedKey::Enter), ModifiersState::CONTROL), None);
     }
 
     #[test]
