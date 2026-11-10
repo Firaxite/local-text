@@ -6591,7 +6591,9 @@ fn spawn_collab_file_list(s: &State, site_id: u64) {
         let paths: Vec<String> = raw.into_iter()
             .filter_map(|p| p.strip_prefix(&root).ok().and_then(|r| r.to_str()).map(|r| r.replace(std::path::MAIN_SEPARATOR, "/")))
             .filter(|rel| collab::is_safe_rel_path(rel)
-                && collab::guest_can_view(rel, role, &perms_snap, &include, &exclude))
+                && collab::guest_can_view(rel, role, &perms_snap, &include, &exclude)
+                // Only files the guest could actually open (not symlinks/aliases).
+                && collab::resolve_under_root(&root, rel).is_some())
             .collect();
         let _ = proxy.send_event(UserEvent::CollabFileListReady { site_id, paths });
     });
@@ -11839,7 +11841,11 @@ impl App {
                     .flatten();
                 let mut doc = None;
                 if let Some(rel) = rel {
-                    let may_view = s.collab.as_ref().map_or(false, |sess| sess.guest_may_view(site_id, &rel));
+                    // Same checks as `host_send_doc`, including that `rel` is the file's
+                    // canonical name (not a symlink to something the guest may not see).
+                    let root = s.explorer.as_ref().and_then(|e| e.root.as_local_path().map(|p| p.to_path_buf()));
+                    let may_view = s.collab.as_ref().map_or(false, |sess| sess.guest_may_view(site_id, &rel))
+                        && root.map_or(false, |root| collab::resolve_under_root(&root, &rel).is_some());
                     if let (true, Some((pid, ti))) = (may_view, find_collab_tab(s, &rel)) {
                         let content: String = s.panes[&pid].tabs[ti].text.chunks().collect();
                         if let Some(sess) = s.collab.as_mut() {

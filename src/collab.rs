@@ -19,6 +19,12 @@
 // Each message is padded to a multiple of 512 bytes, then encrypted with a
 // fresh random 24-byte nonce.  The Poly1305 tag provides authentication.
 //
+// Replay protection: on accept the host sends `HELLO_MAGIC` + a random 32-byte
+// connection id in the clear. Every encrypted frame after that (the guest's Join
+// first) carries (magic, connection id, direction, sequence number) as AEAD
+// associated data, so a frame only decrypts at its own position, in its own
+// direction, on its own connection (see `FrameCipher`).
+//
 // Wire format per frame (over raw TCP):
 //   [4-byte big-endian u32 frame_len][24-byte nonce][ciphertext+tag]
 // frame_len = 24 + len(ciphertext+tag)
@@ -33,7 +39,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng};
+use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use rand::RngCore;
 use ropey::Rope;
@@ -494,6 +500,8 @@ impl ServerDoc {
 
 // ── Session state ─────────────────────────────────────────────────────────────
 
+/// Per-guest outgoing queues of `encode_msg` payloads; each guest's writer thread
+/// seals them with that connection's `FrameCipher`.
 type GuestTxs = Arc<Mutex<HashMap<u64, mpsc::SyncSender<Vec<u8>>>>>;
 
 pub struct CollabSession {
@@ -529,6 +537,7 @@ pub enum CollabRole {
         invite_str: String,
     },
     Guest {
+        /// `encode_msg` payloads; the writer thread seals them.
         to_host: mpsc::Sender<Vec<u8>>,
     },
 }
@@ -579,7 +588,7 @@ impl CollabSession {
     /// Send to one guest (host) or to the host (guest). A guest whose queue is
     /// full (not reading) is disconnected rather than buffered without bound.
     pub fn send_to_site(&self, site_id: u64, msg: &CollabMsg) {
-        let Ok(frame) = encrypt_msg(&self.session_key, msg) else { return };
+        let Ok(frame) = encode_msg(msg) else { return };
         match &self.role {
             CollabRole::Host { guest_txs, .. } => {
                 let mut map = lock_recover(guest_txs);
@@ -594,7 +603,7 @@ impl CollabSession {
     /// Host: send to every guest (except one) for which `filter` holds.
     pub fn broadcast_where(&self, except: Option<u64>, msg: &CollabMsg, filter: impl Fn(u64) -> bool) {
         let CollabRole::Host { guest_txs, .. } = &self.role else { return };
-        let Ok(frame) = encrypt_msg(&self.session_key, msg) else { return };
+        let Ok(frame) = encode_msg(msg) else { return };
         let mut map = lock_recover(guest_txs);
         let targets: Vec<u64> = map.keys().copied().filter(|&sid| Some(sid) != except && filter(sid)).collect();
         for sid in targets {
@@ -733,44 +742,95 @@ fn unpad(data: &[u8]) -> &[u8] {
     &data[..len]
 }
 
-pub fn encrypt_msg(key: &[u8; 32], msg: &CollabMsg) -> std::io::Result<Vec<u8>> {
+/// Serialize and pad a message, ready for a connection's `FrameCipher` to seal.
+/// Done once per message (a broadcast shares it); each connection's writer thread
+/// then seals it under its own connection id and sequence number.
+pub fn encode_msg(msg: &CollabMsg) -> std::io::Result<Vec<u8>> {
     let json = serde_json::to_vec(msg)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let pad_size = match msg {
         CollabMsg::Op { .. } | CollabMsg::RemoteOp { .. } => PAD_OP_SIZE,
         _                   => PAD_CONTROL_SIZE,
     };
-    let padded = pad_to(&json, pad_size);
-
-    let cipher = XChaCha20Poly1305::new(key.into());
-    let nonce  = XChaCha20Poly1305::generate_nonce(&mut OsRng);  // 24 bytes
-    let ct     = cipher.encrypt(&nonce, padded.as_ref())
-        .map_err(|_| std::io::Error::other("encrypt error"))?;
-
-    // Frame: [4-byte len][24-byte nonce][ciphertext+tag]
-    let frame_body_len = nonce.len() + ct.len();
-    let mut frame = Vec::with_capacity(4 + frame_body_len);
-    frame.extend_from_slice(&(frame_body_len as u32).to_be_bytes());
-    frame.extend_from_slice(&nonce);
-    frame.extend_from_slice(&ct);
-    Ok(frame)
+    Ok(pad_to(&json, pad_size))
 }
 
-pub fn decrypt_frame(key: &[u8; 32], frame: &[u8]) -> Result<CollabMsg, String> {
-    if frame.len() < 24 {
-        return Err("frame too short".to_owned());
+/// First frame of every connection, host → guest, in the clear: a protocol tag plus a
+/// fresh random connection id. Every later frame (starting with the guest's `Join`)
+/// is bound to that id, so frames recorded from one connection are useless on another
+/// and a captured `Join` can't be replayed to join as that peer.
+const HELLO_MAGIC: &[u8; 8] = b"LTCOLAB2";
+const CONN_ID_LEN: usize = 32;
+
+/// Directions, part of each frame's associated data so a frame can't be reflected
+/// back to its sender.
+const DIR_GUEST_TO_HOST: u8 = 0;
+const DIR_HOST_TO_GUEST: u8 = 1;
+
+/// One direction of one connection. Each frame is authenticated together with
+/// (connection id, direction, sequence number) as associated data; the sequence
+/// number isn't sent — both ends count frames, which TCP delivers in order. A
+/// replayed, reordered, reflected or dropped frame therefore fails to decrypt, and
+/// the connection is closed.
+pub struct FrameCipher {
+    cipher:  XChaCha20Poly1305,
+    conn_id: [u8; CONN_ID_LEN],
+    dir:     u8,
+    seq:     u64,
+}
+
+impl FrameCipher {
+    fn new(key: &[u8; 32], conn_id: [u8; CONN_ID_LEN], dir: u8) -> Self {
+        Self { cipher: XChaCha20Poly1305::new(key.into()), conn_id, dir, seq: 0 }
     }
-    let (nonce_bytes, ct) = frame.split_at(24);
-    let nonce  = XNonce::from_slice(nonce_bytes);
-    let cipher = XChaCha20Poly1305::new(key.into());
-    let plain  = cipher.decrypt(nonce, ct)
-        .map_err(|_| "decryption failed (wrong key or corrupted frame)".to_owned())?;
-    let unpadded = unpad(&plain);
-    if unpadded.is_empty() {
-        return Err("empty payload after unpadding".to_owned());
+
+    fn aad(&self) -> [u8; 8 + CONN_ID_LEN + 1 + 8] {
+        let mut aad = [0u8; 8 + CONN_ID_LEN + 1 + 8];
+        aad[..8].copy_from_slice(HELLO_MAGIC);
+        aad[8..8 + CONN_ID_LEN].copy_from_slice(&self.conn_id);
+        aad[8 + CONN_ID_LEN] = self.dir;
+        aad[8 + CONN_ID_LEN + 1..].copy_from_slice(&self.seq.to_be_bytes());
+        aad
     }
-    serde_json::from_slice(unpadded)
-        .map_err(|e| format!("json parse error: {e}"))
+
+    /// Encrypt an `encode_msg` payload as the next frame in this direction.
+    /// Frame: [4-byte len][24-byte nonce][ciphertext+tag]
+    pub fn seal(&mut self, padded: &[u8]) -> std::io::Result<Vec<u8>> {
+        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);  // 24 bytes
+        let aad = self.aad();
+        let ct = self.cipher.encrypt(&nonce, Payload { msg: padded, aad: &aad })
+            .map_err(|_| std::io::Error::other("encrypt error"))?;
+        self.seq += 1;
+        let frame_body_len = nonce.len() + ct.len();
+        let mut frame = Vec::with_capacity(4 + frame_body_len);
+        frame.extend_from_slice(&(frame_body_len as u32).to_be_bytes());
+        frame.extend_from_slice(&nonce);
+        frame.extend_from_slice(&ct);
+        Ok(frame)
+    }
+
+    pub fn seal_msg(&mut self, msg: &CollabMsg) -> std::io::Result<Vec<u8>> {
+        self.seal(&encode_msg(msg)?)
+    }
+
+    /// Decrypt the next frame in this direction (as returned by `read_frame`).
+    pub fn open(&mut self, frame: &[u8]) -> Result<CollabMsg, String> {
+        if frame.len() < 24 {
+            return Err("frame too short".to_owned());
+        }
+        let (nonce_bytes, ct) = frame.split_at(24);
+        let nonce = XNonce::from_slice(nonce_bytes);
+        let aad = self.aad();
+        let plain = self.cipher.decrypt(nonce, Payload { msg: ct, aad: &aad })
+            .map_err(|_| "decryption failed (wrong key, corrupted or replayed frame)".to_owned())?;
+        self.seq += 1;
+        let unpadded = unpad(&plain);
+        if unpadded.is_empty() {
+            return Err("empty payload after unpadding".to_owned());
+        }
+        serde_json::from_slice(unpadded)
+            .map_err(|e| format!("json parse error: {e}"))
+    }
 }
 
 // ── Frame I/O ─────────────────────────────────────────────────────────────────
@@ -802,8 +862,25 @@ pub fn write_frame(stream: &mut impl Write, frame: &[u8]) -> std::io::Result<()>
 
 /// A workspace-relative path made only of normal components (no absolute paths,
 /// `.` or `..`): the only form guests are allowed to name files in.
+///
+/// Guest-facing paths always use `/` as the separator. On Windows `\` is a separator
+/// too and `:` names an alternate data stream, so either one in a guest path would let
+/// it name a file under a different spelling than the permission checks see
+/// (`dir\.secret\file` isn't "hidden" when split on `/`): both are rejected there.
 pub fn is_safe_rel_path(rel: &str) -> bool {
-    !rel.is_empty() && Path::new(rel).components().all(|c| matches!(c, Component::Normal(_)))
+    if rel.is_empty() { return false; }
+    if cfg!(windows) && rel.contains(['\\', ':']) { return false; }
+    rel.split('/').all(|c| {
+        let mut comps = Path::new(c).components();
+        matches!((comps.next(), comps.next()), (Some(Component::Normal(_)), None))
+    })
+}
+
+/// True if any component of `path` is a dot-file/dir. Splits on both separators so a
+/// path that slipped past `is_safe_rel_path` still can't hide a `.secret` component
+/// behind a `\`.
+fn has_hidden_component(path: &str) -> bool {
+    path.split(['/', '\\']).any(|c| c.starts_with('.'))
 }
 
 /// Returns true if `path` (relative to workspace root, using `/` separators)
@@ -824,7 +901,7 @@ pub fn guest_can_view(
     let bits = role_perms.for_role(role);
     if bits & perms::VIEW_FILES == 0 { return false; }
 
-    let is_hidden = path.split('/').any(|c| c.starts_with('.'));
+    let is_hidden = has_hidden_component(path);
     if is_hidden && bits & perms::VIEW_HIDDEN == 0 { return false; }
 
     if !include.is_empty() && !include.iter().any(|g| glob_match(g, path)) {
@@ -837,26 +914,48 @@ pub fn guest_can_view(
 }
 
 /// Resolve a guest-supplied **relative** path against the workspace `root`, returning the
-/// on-disk path only if it stays inside `root`. Guests are handed workspace-relative paths
-/// (see the file-list builder), so anything that isn't a sequence of normal components is
-/// rejected: absolute paths (`/etc/passwd` — which `Path::join` would let escape the root
-/// entirely) and `.`/`..` traversal. The path is then canonicalized and re-checked for
-/// containment so a symlink inside the workspace can't redirect outside it either. Returns
-/// None on escape or if the path can't be resolved (e.g. missing file).
+/// on-disk path only if it stays inside `root` *and* `rel` is that file's one canonical
+/// name. Guests are handed workspace-relative paths (see the file-list builder), so
+/// anything that isn't a sequence of normal components is rejected: absolute paths
+/// (`/etc/passwd` — which `Path::join` would let escape the root entirely) and `.`/`..`
+/// traversal. The path is then canonicalized and must come back as exactly `rel`:
+///
+/// - a symlink inside the workspace can't redirect outside it, nor to a hidden or
+///   excluded file inside it (`notes.txt -> .env`), since the permission checks only
+///   ever saw the link's name;
+/// - on Windows, aliases of a file — other letter case (`SECRET/x` vs an exclude glob of
+///   `secret/**`), 8.3 short names (`GIT~1`), trailing dots or spaces — are refused
+///   for the same reason.
+///
+/// Returns None on escape, on any alias, or if the path can't be resolved (e.g. missing
+/// file).
 pub fn resolve_under_root(root: &Path, rel: &str) -> Option<PathBuf> {
     if !is_safe_rel_path(rel) {
         return None;
     }
     let canon_root = root.canonicalize().ok()?;
     let canon = canon_root.join(rel).canonicalize().ok()?;
-    canon.starts_with(&canon_root).then_some(canon)
+    (canonical_rel(&canon_root, &canon)? == rel).then_some(canon)
+}
+
+/// `canon` (a canonicalized path) relative to `canon_root`, `/`-separated, or None if it
+/// lies outside the root or isn't valid UTF-8.
+fn canonical_rel(canon_root: &Path, canon: &Path) -> Option<String> {
+    let parts: Option<Vec<&str>> = canon.strip_prefix(canon_root).ok()?
+        .components()
+        .map(|c| match c {
+            Component::Normal(n) => n.to_str(),
+            _ => None,
+        })
+        .collect();
+    let parts = parts?;
+    (!parts.is_empty()).then(|| parts.join("/"))
 }
 
 /// Returns true if `path` is writable for the given role.
 pub fn guest_can_write(path: &str, role: PeerRole, role_perms: &RolePermissions) -> bool {
     let bits = role_perms.for_role(role);
-    let is_hidden = path.split('/').any(|c| c.starts_with('.'));
-    if is_hidden {
+    if has_hidden_component(path) {
         bits & perms::WRITE_HIDDEN != 0
     } else {
         bits & perms::WRITE_FILES != 0
@@ -1004,24 +1103,40 @@ fn handle_guest(
         PENDING_CONNECTIONS.fetch_sub(1, Ordering::AcqRel);
         return;
     };
+    let mut writer = stream;
+    // ── Hello: a fresh connection id that every later frame is bound to ─────
+    let mut conn_id = [0u8; CONN_ID_LEN];
+    rand::thread_rng().fill_bytes(&mut conn_id);
+    let _ = writer.set_write_timeout(Some(Duration::from_secs(15)));
+    let hello = [&HELLO_MAGIC[..], &conn_id[..]].concat();
+    let mut hello_frame = (hello.len() as u32).to_be_bytes().to_vec();
+    hello_frame.extend_from_slice(&hello);
+    if write_frame(&mut writer, &hello_frame).is_err() {
+        PENDING_CONNECTIONS.fetch_sub(1, Ordering::AcqRel);
+        let _ = writer.shutdown(Shutdown::Both);
+        return;
+    }
+    let mut opener = FrameCipher::new(&key, conn_id, DIR_GUEST_TO_HOST);
+    let mut sealer = FrameCipher::new(&key, conn_id, DIR_HOST_TO_GUEST);
+
     // ── Authenticate: the first frame must decrypt to a Join ────────────────
     let _ = reader.set_read_timeout(Some(Duration::from_secs(15)));
     let join = read_frame(&mut reader, MAX_PREAUTH_FRAME).ok()
-        .and_then(|f| decrypt_frame(&key, &f).ok());
+        .and_then(|f| opener.open(&f).ok());
     PENDING_CONNECTIONS.fetch_sub(1, Ordering::AcqRel);
     let Some(CollabMsg::Join { peer_name }) = join else {
-        let _ = stream.shutdown(Shutdown::Both);
+        let _ = writer.shutdown(Shutdown::Both);
         return;
     };
     let _ = reader.set_read_timeout(None);
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(20)));
+    let _ = writer.set_write_timeout(Some(Duration::from_secs(20)));
 
     // Writer thread for this guest. When it stops (write error or the host
     // dropped our queue as too slow) the socket is shut down so the reader ends too.
     let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(GUEST_QUEUE);
-    let mut writer = stream;
     std::thread::spawn(move || {
-        for frame in rx {
+        for payload in rx {
+            let Ok(frame) = sealer.seal(&payload) else { break };
             if write_frame(&mut writer, &frame).is_err() { break; }
         }
         let _ = writer.shutdown(Shutdown::Both);
@@ -1038,12 +1153,17 @@ fn handle_guest(
     let _ = proxy.send_event(UserEvent::CollabGuestJoined { site_id, peer });
 
     while let Ok(frame) = read_frame(&mut reader, MAX_FRAME) {
-        match decrypt_frame(&key, &frame) {
+        match opener.open(&frame) {
             Ok(CollabMsg::Join { .. }) => {} // already joined
             Ok(msg) => {
                 let _ = proxy.send_event(UserEvent::CollabMessage { from_site_id: site_id, msg });
             }
-            Err(e) => eprintln!("collab: decrypt error from site {site_id}: {e}"),
+            Err(e) => {
+                // Out of sequence (replayed/injected) or tampered: drop the connection.
+                eprintln!("collab: dropping site {site_id}: {e}");
+                let _ = reader.shutdown(Shutdown::Both);
+                break;
+            }
         }
     }
     // Disconnect: remove from guest map, notify main thread
@@ -1094,9 +1214,33 @@ pub fn connect_guest(
         };
         let mut writer = stream;
 
+        // Hello: the host's connection id, which every frame below is bound to.
+        let _ = reader.set_read_timeout(Some(Duration::from_secs(15)));
+        let hello = read_frame(&mut reader, 64);
+        let _ = reader.set_read_timeout(None);
+        let conn_id = match hello {
+            Ok(h) if h.len() == HELLO_MAGIC.len() + CONN_ID_LEN && h.starts_with(HELLO_MAGIC) => {
+                let mut id = [0u8; CONN_ID_LEN];
+                id.copy_from_slice(&h[HELLO_MAGIC.len()..]);
+                id
+            }
+            Ok(_) => {
+                let _ = proxy.send_event(UserEvent::CollabError {
+                    msg: "host speaks a different collab protocol version".to_owned(),
+                });
+                return;
+            }
+            Err(e) => {
+                let _ = proxy.send_event(UserEvent::CollabError { msg: format!("read error: {e}") });
+                return;
+            }
+        };
+        let mut sealer = FrameCipher::new(&session_key, conn_id, DIR_GUEST_TO_HOST);
+        let mut opener = FrameCipher::new(&session_key, conn_id, DIR_HOST_TO_GUEST);
+
         // Send Join
         let join_msg = CollabMsg::Join { peer_name };
-        let join_frame = match encrypt_msg(&session_key, &join_msg) {
+        let join_frame = match sealer.seal_msg(&join_msg) {
             Ok(f) => f,
             Err(e) => {
                 let _ = proxy.send_event(UserEvent::CollabError { msg: format!("encrypt error: {e}") });
@@ -1117,7 +1261,7 @@ pub fn connect_guest(
                     return;
                 }
             };
-            match decrypt_frame(&session_key, &frame) {
+            match opener.open(&frame) {
                 Ok(CollabMsg::Welcome { your_site_id, peers, role, role_perms, doc }) => {
                     break (your_site_id, peers, role, role_perms, doc);
                 }
@@ -1139,9 +1283,11 @@ pub fn connect_guest(
         // Writer thread
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
         std::thread::spawn(move || {
-            for frame in rx {
+            for payload in rx {
+                let Ok(frame) = sealer.seal(&payload) else { break };
                 if write_frame(&mut writer, &frame).is_err() { break; }
             }
+            let _ = writer.shutdown(Shutdown::Both);
         });
 
         let session = Box::new(CollabSession {
@@ -1164,7 +1310,6 @@ pub fn connect_guest(
         let _ = proxy.send_event(UserEvent::CollabConnected { session, doc });
 
         // Reader loop
-        let key = session_key;
         loop {
             let frame = match read_frame(&mut reader, MAX_FRAME) {
                 Ok(f) => f,
@@ -1173,11 +1318,17 @@ pub fn connect_guest(
                     break;
                 }
             };
-            match decrypt_frame(&key, &frame) {
+            match opener.open(&frame) {
                 Ok(msg) => {
                     let _ = proxy.send_event(UserEvent::CollabMessage { from_site_id: 0, msg });
                 }
-                Err(e) => { eprintln!("collab: decrypt error: {e}"); }
+                Err(e) => {
+                    // Out of sequence (replayed/injected) or tampered: disconnect.
+                    eprintln!("collab: dropping connection to host: {e}");
+                    let _ = reader.shutdown(Shutdown::Both);
+                    let _ = proxy.send_event(UserEvent::CollabDisconnected);
+                    break;
+                }
             }
         }
     });
@@ -1208,6 +1359,73 @@ mod tests {
         assert!(resolve_under_root(root, "../../etc/passwd").is_none()); // parent escape
         assert!(resolve_under_root(root, "a/../../b").is_none());        // mid-path ..
         assert!(resolve_under_root(root, "./x").is_none());              // explicit `.`
+    }
+
+    #[test]
+    fn guest_paths_cannot_hide_components_behind_backslashes() {
+        let mut role_perms = RolePermissions::default();
+        let role = PeerRole::Contributor;
+        role_perms.set_for_role(role, perms::VIEW_FILES | perms::WRITE_FILES);
+        assert!(guest_can_view("dir/file", role, &role_perms, &[], &[]));
+        assert!(!guest_can_view("dir\\.secret\\file", role, &role_perms, &[], &[]));
+        assert!(!guest_can_write("dir\\.git\\config", role, &role_perms));
+        assert!(is_safe_rel_path("src/main.rs"));
+        assert!(!is_safe_rel_path("src//main.rs"));
+        assert!(!is_safe_rel_path("src/"));
+        if cfg!(windows) {
+            assert!(!is_safe_rel_path("dir\\.secret\\file"));
+            assert!(!is_safe_rel_path("file.txt:stream"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_under_root_rejects_symlink_aliases() {
+        let dir = std::env::temp_dir().join(format!("lt-collab-alias-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".secret")).unwrap();
+        std::fs::write(dir.join(".secret/key"), "k").unwrap();
+        std::os::unix::fs::symlink(dir.join(".secret/key"), dir.join("notes.txt")).unwrap();
+        assert!(resolve_under_root(&dir, "notes.txt").is_none());
+        assert!(resolve_under_root(&dir, ".secret/key").is_some());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn cipher_pair(conn: u8, dir: u8) -> (FrameCipher, FrameCipher) {
+        let key = [7u8; 32];
+        (FrameCipher::new(&key, [conn; CONN_ID_LEN], dir), FrameCipher::new(&key, [conn; CONN_ID_LEN], dir))
+    }
+
+    fn body(frame: &[u8]) -> &[u8] { &frame[4..] }
+
+    #[test]
+    fn frames_decrypt_in_order() {
+        let (mut tx, mut rx) = cipher_pair(1, DIR_GUEST_TO_HOST);
+        for i in 0..3 {
+            let f = tx.seal_msg(&CollabMsg::FileRequest { path: format!("f{i}") }).unwrap();
+            assert!(matches!(rx.open(body(&f)), Ok(CollabMsg::FileRequest { path }) if path == format!("f{i}")));
+        }
+    }
+
+    #[test]
+    fn replayed_frame_is_rejected() {
+        let (mut tx, mut rx) = cipher_pair(1, DIR_GUEST_TO_HOST);
+        let f = tx.seal_msg(&CollabMsg::FileRequest { path: "a".into() }).unwrap();
+        assert!(rx.open(body(&f)).is_ok());
+        assert!(rx.open(body(&f)).is_err());
+    }
+
+    #[test]
+    fn frame_from_another_connection_or_direction_is_rejected() {
+        let key = [7u8; 32];
+        let mut tx = FrameCipher::new(&key, [1; CONN_ID_LEN], DIR_GUEST_TO_HOST);
+        let join = tx.seal_msg(&CollabMsg::Join { peer_name: "x".into() }).unwrap();
+        // A captured Join replayed on a new connection (new id from the host).
+        let mut other_conn = FrameCipher::new(&key, [2; CONN_ID_LEN], DIR_GUEST_TO_HOST);
+        assert!(other_conn.open(body(&join)).is_err());
+        // Reflected back at its sender as if it came the other way.
+        let mut reflected = FrameCipher::new(&key, [1; CONN_ID_LEN], DIR_HOST_TO_GUEST);
+        assert!(reflected.open(body(&join)).is_err());
     }
 
     #[test]

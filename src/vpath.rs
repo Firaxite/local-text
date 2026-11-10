@@ -135,6 +135,16 @@ pub(crate) fn posix_join(base: &Path, component: impl AsRef<Path>) -> PathBuf {
     PathBuf::from(format!("{base}{sep}{comp}"))
 }
 
+/// A host or user name that is safe to hand to `ssh` as the `[user@]host` argument:
+/// non-empty, not starting with `-` (which `ssh` would parse as an option, e.g.
+/// `ssh://-oProxyCommand=…` running a local command), and free of whitespace and control
+/// characters.
+fn is_safe_ssh_word(s: &str) -> bool {
+    !s.is_empty()
+        && !s.starts_with('-')
+        && !s.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
 impl SshHost {
     /// The ControlMaster socket path used to multiplex connections.
     ///
@@ -232,7 +242,7 @@ impl VPath {
                 (host_port.to_owned(), None)
             };
 
-            if !host.is_empty() {
+            if is_safe_ssh_word(&host) && user.as_deref().map_or(true, is_safe_ssh_word) {
                 let ssh_host = SshHost { user, host, port };
                 let path = PathBuf::from(path_part);
                 return VPath::Remote { host: ssh_host, path };
@@ -723,6 +733,18 @@ mod tests {
     fn preserves_colons_in_remote_path() {
         assert_remote("ssh://example.com:/srv/app:a/b:c", None, "example.com", None, "/srv/app:a/b:c");
         assert_remote("ssh://example.com:2222:~/src/app:a", None, "example.com", Some(2222), "~/src/app:a");
+    }
+
+    #[test]
+    fn rejects_hosts_and_users_that_ssh_would_parse_as_options() {
+        for uri in [
+            "ssh://-oProxyCommand=touch%20pwned:~/x",
+            "ssh://-oProxyCommand=id@example.com:~/x",
+            "ssh://me@-oProxyCommand=id:~/x",
+            "ssh://exa mple.com:~/x",
+        ] {
+            assert!(matches!(VPath::parse(uri), VPath::Local(_)), "{uri} must not parse as remote");
+        }
     }
 
     #[test]
