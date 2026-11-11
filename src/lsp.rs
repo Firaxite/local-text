@@ -593,10 +593,10 @@ pub fn request_references(srv: &mut LspServer, path: &VPath, line: usize, col: u
     id
 }
 
-pub fn request_formatting(srv: &mut LspServer, path: &VPath, generation: u64, save_after: bool) -> u64 {
+pub fn request_formatting(srv: &mut LspServer, path: &VPath, generation: u64, save_after: bool, indent: crate::layout::Indent) -> u64 {
     let id = send_request(srv, "textDocument/formatting", serde_json::json!({
         "textDocument": { "uri": path.to_lsp_uri() },
-        "options": { "tabSize": 4, "insertSpaces": true }
+        "options": { "tabSize": indent.size, "insertSpaces": !indent.use_tabs }
     }));
     srv.pending.insert(id, PendingKind::Formatting { path: path.clone(), generation, save_after });
     id

@@ -128,6 +128,14 @@ pub struct Settings {
     /// contents match what the user approved.
     #[serde(default)]
     pub trusted_project_configs: std::collections::HashMap<String, String>,
+    /// Width of a tab stop, and spaces per indent level when `insert_spaces`.
+    pub tab_size:           usize,
+    /// Tab key / auto-indent inserts spaces (true) or tab characters (false).
+    pub insert_spaces:      bool,
+    /// Detect tab size / tabs-vs-spaces per file from its contents when opened.
+    pub detect_indentation: bool,
+    /// Soft-wrap long lines at the window edge.
+    pub word_wrap:          bool,
 }
 
 impl Default for Settings {
@@ -157,6 +165,10 @@ impl Default for Settings {
             collab_include_globs:     Vec::new(),
             collab_exclude_globs:     Vec::new(),
             trusted_project_configs:  std::collections::HashMap::new(),
+            tab_size:                 4,
+            insert_spaces:            true,
+            detect_indentation:       true,
+            word_wrap:                false,
         }
     }
 }
@@ -167,6 +179,11 @@ impl Settings {
     pub fn default_cpu_double_buffer() -> bool { true }
     pub fn default_gpu_drawable_count() -> u8 { 2 }
     pub fn default_collab_port() -> u16 { 7777 }
+
+    /// The configured default indentation (before per-file detection).
+    pub fn default_indent(&self) -> crate::layout::Indent {
+        crate::layout::Indent { use_tabs: !self.insert_spaces, size: self.tab_size.clamp(1, 16) }
+    }
 
     /// `config.json` in the platform config directory (see `os::config_dir`).
     fn config_path() -> Option<PathBuf> {

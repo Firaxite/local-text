@@ -11,6 +11,7 @@ mod proj_config;
 mod vpath;
 mod ssh;
 mod collab;
+mod layout;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -544,6 +545,8 @@ enum CommandAction {
     ManageLspServers,
     EditProjectLspConfig,
     TrustProjectLspConfig,
+    ToggleWordWrap,
+    IndentSpaces, IndentTabs, TabSize(usize), DetectIndent,
 }
 
 struct CommandEntry { name: &'static str, shortcut: &'static str, action: CommandAction }
@@ -576,6 +579,13 @@ const COMMANDS: &[CommandEntry] = &[
     CommandEntry { name: "LSP: Manage Servers",    shortcut: "",              action: CommandAction::ManageLspServers },
     CommandEntry { name: "LSP: Edit Project Settings", shortcut: "",          action: CommandAction::EditProjectLspConfig },
     CommandEntry { name: "LSP: Trust Project Settings", shortcut: "",         action: CommandAction::TrustProjectLspConfig },
+    CommandEntry { name: "View: Toggle Word Wrap", shortcut: "Opt+Z",         action: CommandAction::ToggleWordWrap },
+    CommandEntry { name: "Indentation: Indent Using Spaces", shortcut: "",    action: CommandAction::IndentSpaces },
+    CommandEntry { name: "Indentation: Indent Using Tabs", shortcut: "",      action: CommandAction::IndentTabs },
+    CommandEntry { name: "Indentation: Tab Size 2", shortcut: "",             action: CommandAction::TabSize(2) },
+    CommandEntry { name: "Indentation: Tab Size 4", shortcut: "",             action: CommandAction::TabSize(4) },
+    CommandEntry { name: "Indentation: Tab Size 8", shortcut: "",             action: CommandAction::TabSize(8) },
+    CommandEntry { name: "Indentation: Detect from Content", shortcut: "",    action: CommandAction::DetectIndent },
 ];
 
 // ── Global find/replace ───────────────────────────────────────────────────────
@@ -648,6 +658,13 @@ struct Tab {
     /// Workspace-relative path of a document shared by a collab host (guest side
     /// only). Such tabs have no `path`: the content lives on the host.
     collab_path: Option<String>,
+    /// Indentation for this buffer (from settings, or detected when the file loads).
+    indent:      layout::Indent,
+    /// True once the user picked an indentation for this buffer explicitly; a
+    /// reload then doesn't re-detect it.
+    indent_locked: bool,
+    /// With word wrap: the visual row within line `scroll` at the top of the view.
+    scroll_sub:  usize,
 }
 
 impl Tab {
@@ -657,7 +674,16 @@ impl Tab {
               undo_stack: Vec::new(), redo_stack: Vec::new(), last_typing: false,
               hl_cache: Vec::new(), hl_dirty_from: 0, hl_color_cache: HashMap::new(),
               hl_before: None, max_line_len: Some(0), edit_generation: 0,
-              lsp_synced_gen: None, remote_load_token: None, collab_path: None }
+              lsp_synced_gen: None, remote_load_token: None, collab_path: None,
+              indent: layout::default_indent(), indent_locked: false,
+              scroll_sub: 0 }
+    }
+
+    /// Pick this buffer's indentation from the settings and (if enabled) its
+    /// contents. Called whenever a file's content is (re)loaded.
+    fn setup_indent(&mut self) {
+        if self.indent_locked { return; }
+        self.indent = layout::indent_for(&self.text);
     }
 
     fn settings() -> Self {
@@ -801,6 +827,8 @@ impl Tab {
         self.max_line_len = None;
         self.remote_load_token = None;
         self.edit_generation += 1;
+        self.scroll_sub = 0;
+        self.setup_indent();
         Ok(())
     }
 
@@ -2517,6 +2545,50 @@ impl State {
         }
     }
 
+    /// Text columns available for wrapping in a pane of width `rect_w`.
+    fn wrap_cols(rect_w: i32, gutter_w: i32, cw: i32) -> usize {
+        ((rect_w - gutter_w - SB_W) / cw.max(1)).max(8) as usize
+    }
+
+    /// Layout (tab width, wrap width) of the active tab in pane `pane_id`.
+    fn view_layout(&self, pane_id: usize) -> layout::Layout {
+        let Some(pane) = self.panes.get(&pane_id) else { return layout::Layout::new(4, None) };
+        let tab = pane.tab();
+        let wrap = (self.settings.word_wrap && tab.kind == TabKind::Editor).then(|| {
+            let rect = layout_tree(&self.pane_tree, self.pane_area()).into_iter()
+                .find(|(id, _)| *id == pane_id).map(|(_, r)| r).unwrap_or(self.pane_area());
+            Self::wrap_cols(rect.w, Self::gutter_w(tab.text.len_lines(), self.glyphs.cw), self.glyphs.cw)
+        });
+        layout::Layout::new(tab.indent.size, wrap)
+    }
+
+    /// (line, visual row within the line, visual column within the row) of `pos`.
+    fn pos_visual(text: &Rope, pos: usize, lay: layout::Layout) -> (usize, usize, usize) {
+        let pos = pos.min(text.len_chars());
+        let line = text.char_to_line(pos);
+        let col = pos - text.line_to_char(line);
+        let chars = layout::line_chars(text, line);
+        let rows = layout::wrap_rows(&chars, lay);
+        let row = layout::row_of_col(&rows, col);
+        let start = rows[row].min(chars.len());
+        let vx = layout::vcol_of(&chars[start..], col.saturating_sub(start), lay.tab_w);
+        (line, row, vx)
+    }
+
+    /// Char offset at visual column `vx` of row `row` of `line` (clamped).
+    fn visual_to_pos(text: &Rope, line: usize, row: usize, vx: usize, lay: layout::Layout) -> usize {
+        let line = line.min(text.len_lines().saturating_sub(1));
+        let chars = layout::line_chars(text, line);
+        let rows = layout::wrap_rows(&chars, lay);
+        let row = row.min(rows.len() - 1);
+        let start = rows[row].min(chars.len());
+        let end = rows.get(row + 1).copied().unwrap_or(chars.len()).min(chars.len());
+        let mut col = start + layout::col_at_vcol(&chars[start..end], vx, lay.tab_w);
+        // The end of a non-last row is the start of the next one: stay on this row.
+        if row + 1 < rows.len() && col >= end && end > start { col = end - 1; }
+        text.line_to_char(line) + col
+    }
+
     fn ensure_visible(&mut self) {
         let r   = self.active_pane_rect();
         let fh  = { let ap = self.active_pane; Self::pane_find_h(&self.panes[&ap], self.glyphs.lh) };
@@ -2524,13 +2596,29 @@ impl State {
         let vis_v = (eh / self.glyphs.lh).max(1) as usize;
         let gw    = { let ap = self.active_pane; Self::gutter_w(self.panes[&ap].tab().text.len_lines(), self.glyphs.cw) };
         let vis_h = ((r.w - gw) / self.glyphs.cw).max(1) as usize;
-        let (line, col) = self.cursor_lc();
         let id = self.active_pane;
+        let lay = self.view_layout(id);
         let t = self.panes.get_mut(&id).unwrap().tab_mut();
-        if line < t.scroll              { t.scroll  = line; }
-        if line >= t.scroll  + vis_v   { t.scroll  = (line + 1).saturating_sub(vis_v); }
-        if col  < t.hscroll             { t.hscroll = col; }
-        if col  >= t.hscroll + vis_h   { t.hscroll = (col  + 1).saturating_sub(vis_h); }
+        let head = t.primary().head;
+        let (line, row, vx) = Self::pos_visual(&t.text, head, lay);
+        if lay.wrap.is_none() { t.scroll_sub = 0; }
+        let top = (t.scroll, t.scroll_sub);
+        match layout::rows_between(&t.text, top.0, top.1, line, row, lay, vis_v) {
+            None => { t.scroll = line; t.scroll_sub = row; }
+            Some(n) if n >= vis_v => {
+                let last = t.text.len_lines().saturating_sub(1);
+                let (l, sub) = layout::advance_rows(&t.text, line, row, -(vis_v as isize - 1), lay, last);
+                t.scroll = l;
+                t.scroll_sub = sub;
+            }
+            Some(_) => {}
+        }
+        if lay.wrap.is_some() {
+            t.hscroll = 0;
+        } else {
+            if vx < t.hscroll           { t.hscroll = vx; }
+            if vx >= t.hscroll + vis_h { t.hscroll = (vx + 1).saturating_sub(vis_h); }
+        }
     }
 
     // ── Multi-cursor helpers ──────────────────────────────────────────────────
@@ -2661,11 +2749,18 @@ impl State {
     }
 
     fn insert_str_per_cursor(&mut self, texts: &[String]) {
+        let with_ends: Vec<(String, usize)> = texts.iter().map(|t| (t.clone(), t.chars().count())).collect();
+        self.insert_str_per_cursor_at(&with_ends);
+    }
+
+    /// Replace each cursor's selection (left-to-right order) with `texts[k].0` and
+    /// leave that cursor `texts[k].1` chars into the inserted text.
+    fn insert_str_per_cursor_at(&mut self, texts: &[(String, usize)]) {
         self.push_undo(false);
         let order = self.cursor_order_ltr();
         let mut delta: isize = 0;
         for (k, &i) in order.iter().enumerate() {
-            let text = texts.get(k).map(|s| s.as_str()).unwrap_or("");
+            let (text, at) = texts.get(k).map(|(s, a)| (s.as_str(), *a)).unwrap_or(("", 0));
             let n_chars = text.chars().count();
             let (orig_lo, orig_hi) = { let c = &self.tab().cursors[i]; (c.lo(), c.hi()) };
             let lo = apply_delta(orig_lo, delta, self.tab().text.len_chars());
@@ -2676,7 +2771,7 @@ impl State {
             }
             let pos = lo.min(self.tab().text.len_chars());
             if !text.is_empty() { self.tab_mut().text.insert(pos, text); }
-            self.tab_mut().cursors[i] = Cursor::new(pos + n_chars);
+            self.tab_mut().cursors[i] = Cursor::new(pos + at.min(n_chars));
             delta += n_chars as isize;
             self.tab_mut().dirty = true;
         }
@@ -2684,24 +2779,45 @@ impl State {
         self.ensure_visible();
     }
 
+    /// Enter: keep the current line's indentation, add a level after an opening
+    /// bracket (or a Python block header), and put a matching closing bracket right
+    /// after the cursor on its own line.
     fn insert_newline(&mut self) {
-        if self.tab().lang() != Lang::Python {
-            self.insert_str("\n");
-            return;
-        }
-        let insertions: Vec<String> = self.cursor_order_ltr().into_iter().map(|i| {
-            let cursor = &self.tab().cursors[i];
-            let pos = cursor.lo().min(self.tab().text.len_chars());
-            let line_idx = self.tab().text.char_to_line(pos);
-            let line_start = self.tab().text.line_to_char(line_idx);
-            let before: String = self.tab().text.slice(line_start..pos).chars().collect();
-            let indent: String = before.chars()
-                .take_while(|c| matches!(c, ' ' | '\t'))
-                .collect();
-            let extra = if python_line_opens_block(&before) { "    " } else { "" };
-            format!("\n{indent}{extra}")
+        let lang = self.tab().lang();
+        let unit = self.tab().indent.unit();
+        let insertions: Vec<(String, usize)> = self.cursor_order_ltr().into_iter().map(|i| {
+            let t = self.tab();
+            let cursor = &t.cursors[i];
+            let pos = cursor.lo().min(t.text.len_chars());
+            let end = cursor.hi().min(t.text.len_chars());
+            let line_idx = t.text.char_to_line(pos);
+            let line_start = t.text.line_to_char(line_idx);
+            let before: String = t.text.slice(line_start..pos).chars().collect();
+            let indent: String = before.chars().take_while(|c| matches!(c, ' ' | '\t')).collect();
+            let trimmed = before.trim_end();
+            let opener = trimmed.chars().last().filter(|c| matches!(c, '{' | '[' | '('));
+            let extra = match lang {
+                Lang::Python => python_line_opens_block(&before) || opener.is_some(),
+                Lang::None | Lang::Markdown => false,
+                _ => opener.is_some(),
+            };
+            let next = (end < t.text.len_chars()).then(|| t.text.char(end));
+            let closes = matches!((opener, next), (Some('{'), Some('}')) | (Some('['), Some(']')) | (Some('('), Some(')')));
+            if extra && closes {
+                let head = format!("\n{indent}{unit}");
+                let n = head.chars().count();
+                (format!("{head}\n{indent}"), n)
+            } else if extra {
+                let text = format!("\n{indent}{unit}");
+                let n = text.chars().count();
+                (text, n)
+            } else {
+                let text = format!("\n{indent}");
+                let n = text.chars().count();
+                (text, n)
+            }
         }).collect();
-        self.insert_str_per_cursor(&insertions);
+        self.insert_str_per_cursor_at(&insertions);
     }
 
     fn backspace(&mut self) {
@@ -2940,9 +3056,11 @@ impl State {
         merged
     }
 
-    /// Tab: with a selection spanning lines, indent those lines; otherwise insert
-    /// spaces at each cursor (replacing a selection within a single line).
+    /// Tab: with a selection spanning lines, indent those lines by one level;
+    /// otherwise insert one level at each cursor (spaces up to the next tab stop, or
+    /// a tab character), replacing a selection within a single line.
     fn indent(&mut self) {
+        let indent = self.tab().indent;
         let multi_line = self.tab().cursors.iter().any(|c| {
             c.has_sel() && {
                 let t = self.tab();
@@ -2951,9 +3069,24 @@ impl State {
             }
         });
         if !multi_line {
-            self.insert_str("    ");
+            if indent.use_tabs {
+                self.insert_str("\t");
+                return;
+            }
+            let texts: Vec<String> = self.cursor_order_ltr().into_iter().map(|i| {
+                let t = self.tab();
+                let pos = t.cursors[i].lo().min(t.text.len_chars());
+                let line = t.text.char_to_line(pos);
+                let col = pos - t.text.line_to_char(line);
+                let chars = layout::line_chars(&t.text, line);
+                let v = layout::vcol_of(&chars, col, indent.size);
+                " ".repeat(indent.size - v % indent.size)
+            }).collect();
+            self.insert_str_per_cursor(&texts);
             return;
         }
+        let unit = indent.unit();
+        let unit_len = unit.chars().count();
         let ranges = self.cursor_line_ranges();
         self.push_undo(false);
         // Bottom-up so earlier line starts stay valid.
@@ -2962,13 +3095,13 @@ impl State {
             for line in (first..=last).rev() {
                 if State::line_len(&self.tab().text, line) == 0 { continue; } // leave blank lines alone
                 let at = self.tab().text.line_to_char(line);
-                self.tab_mut().text.insert(at, "    ");
+                self.tab_mut().text.insert(at, &unit);
                 inserted_at.push(at);
             }
         }
-        // Shift cursors: every insertion at or before a position moves it right by 4.
+        // Shift cursors: every insertion at or before a position moves it right.
         inserted_at.sort_unstable();
-        let shift = |pos: usize| pos + 4 * inserted_at.partition_point(|&a| a <= pos);
+        let shift = |pos: usize| pos + unit_len * inserted_at.partition_point(|&a| a <= pos);
         for c in &mut self.tab_mut().cursors {
             c.head = shift(c.head);
             c.tail = shift(c.tail);
@@ -2978,9 +3111,10 @@ impl State {
         self.ensure_visible();
     }
 
-    /// Shift+Tab: remove up to 4 leading spaces (or one tab) from each line the
-    /// cursors touch.
+    /// Shift+Tab: remove one indent level (a tab, or up to tab-size spaces) from
+    /// each line the cursors touch.
     fn dedent(&mut self) {
+        let size = self.tab().indent.size.max(1);
         let ranges = self.cursor_line_ranges();
         let mut removals: Vec<(usize, usize)> = Vec::new(); // (start char, count)
         {
@@ -2989,7 +3123,7 @@ impl State {
                 for line in first..=last {
                     let start = t.line_to_char(line);
                     let mut n = 0;
-                    for ch in t.line(line).chars().take(4) {
+                    for ch in t.line(line).chars().take(size) {
                         if ch == ' ' { n += 1; } else { if ch == '\t' && n == 0 { n = 1; } break; }
                     }
                     if n > 0 { removals.push((start, n)); }
@@ -3038,19 +3172,28 @@ impl State {
         self.ensure_visible();
     }
 
-    fn move_up(&mut self, selecting: bool) {
-        let n = self.tab().cursors.len();
-        let mut new_heads = Vec::with_capacity(n);
-        for i in 0..n {
-            let pos  = self.tab().cursors[i].head.min(self.tab().text.len_chars());
-            let line = self.tab().text.char_to_line(pos);
-            let col  = pos - self.tab().text.line_to_char(line);
-            let h = if line == 0 { 0 } else {
-                let prev = line - 1;
-                self.tab().text.line_to_char(prev) + col.min(Self::line_len(&self.tab().text, prev))
-            };
-            new_heads.push(h);
+    /// Position one visual row above (`up`) or below `pos`, keeping its visual column.
+    fn vertical_target(&self, pos: usize, up: bool) -> usize {
+        let lay = self.view_layout(self.active_pane);
+        let text = &self.tab().text;
+        let (line, row, vx) = Self::pos_visual(text, pos, lay);
+        if up {
+            if row > 0 { return Self::visual_to_pos(text, line, row - 1, vx, lay); }
+            if line == 0 { return 0; }
+            let prev_rows = layout::line_row_count(text, line - 1, lay);
+            Self::visual_to_pos(text, line - 1, prev_rows - 1, vx, lay)
+        } else {
+            if row + 1 < layout::line_row_count(text, line, lay) {
+                return Self::visual_to_pos(text, line, row + 1, vx, lay);
+            }
+            if line >= Self::last_line(text) { return text.len_chars(); }
+            Self::visual_to_pos(text, line + 1, 0, vx, lay)
         }
+    }
+
+    fn move_up(&mut self, selecting: bool) {
+        let heads: Vec<usize> = self.tab().cursors.iter().map(|c| c.head).collect();
+        let new_heads: Vec<usize> = heads.into_iter().map(|h| self.vertical_target(h, true)).collect();
         for (i, h) in new_heads.into_iter().enumerate() { self.tab_mut().cursors[i].head = h; }
         if !selecting { for c in &mut self.tab_mut().cursors { c.tail = c.head; } }
         self.dedup_cursors();
@@ -3058,19 +3201,8 @@ impl State {
     }
 
     fn move_down(&mut self, selecting: bool) {
-        let n = self.tab().cursors.len();
-        let mut new_heads = Vec::with_capacity(n);
-        for i in 0..n {
-            let pos  = self.tab().cursors[i].head.min(self.tab().text.len_chars());
-            let line = self.tab().text.char_to_line(pos);
-            let col  = pos - self.tab().text.line_to_char(line);
-            let last = Self::last_line(&self.tab().text);
-            let h = if line >= last { self.tab().text.len_chars() } else {
-                let next = line + 1;
-                self.tab().text.line_to_char(next) + col.min(Self::line_len(&self.tab().text, next))
-            };
-            new_heads.push(h);
-        }
+        let heads: Vec<usize> = self.tab().cursors.iter().map(|c| c.head).collect();
+        let new_heads: Vec<usize> = heads.into_iter().map(|h| self.vertical_target(h, false)).collect();
         for (i, h) in new_heads.into_iter().enumerate() { self.tab_mut().cursors[i].head = h; }
         if !selecting { for c in &mut self.tab_mut().cursors { c.tail = c.head; } }
         self.dedup_cursors();
@@ -3193,7 +3325,15 @@ impl State {
             let t = self.tab();
             Self::last_line(&t.text)
         };
+        let lay = if kind == TabKind::Editor { self.view_layout(self.active_pane) } else { layout::Layout::new(4, None) };
         let t = self.tab_mut();
+        if lay.wrap.is_some() {
+            let (l, sub) = layout::advance_rows(&t.text, t.scroll, t.scroll_sub, delta as isize, lay, last);
+            t.scroll = l;
+            t.scroll_sub = sub;
+            return;
+        }
+        t.scroll_sub = 0;
         if delta < 0 {
             t.scroll = t.scroll.saturating_sub((-delta) as usize);
         } else {
@@ -3202,6 +3342,7 @@ impl State {
     }
 
     fn hscroll_by(&mut self, delta: i32) {
+        if self.view_layout(self.active_pane).wrap.is_some() { return; }
         let r  = self.active_pane_rect();
         let gw = self.active_gutter_w();
         let vis_h = ((r.w - gw) / self.glyphs.cw).max(1) as usize;
@@ -3223,16 +3364,25 @@ impl State {
     }
 
     fn xy_to_char(&self, mx: i32, my: i32) -> usize {
-        let r     = self.active_pane_rect();
+        let r = self.active_pane_rect();
+        self.pane_xy_to_char(self.active_pane, r, mx, my)
+    }
+
+    /// Char offset under pixel (mx, my) in the active tab of pane `pid` (at `r`).
+    fn pane_xy_to_char(&self, pid: usize, r: Rect, mx: i32, my: i32) -> usize {
         let tab_h = self.tab_h();
         let lh    = self.glyphs.lh;
         let cw    = self.glyphs.cw;
-        let ed_x  = r.x + Self::gutter_w(self.tab().text.len_lines(), cw);
-        let vi    = ((my - r.y - tab_h).max(0) / lh) as usize;
-        let t     = self.tab();
-        let li    = (t.scroll + vi).min(t.text.len_lines().saturating_sub(1));
-        let col   = ((mx - ed_x).max(0) / cw) as usize + t.hscroll;
-        t.text.line_to_char(li) + col.min(Self::line_len(&t.text, li))
+        let t     = self.panes[&pid].tab();
+        let lay   = self.view_layout(pid);
+        let ed_x  = r.x + Self::gutter_w(t.text.len_lines(), cw);
+        let vi    = ((my - r.y - tab_h).max(0) / lh) as isize;
+        let last  = t.text.len_lines().saturating_sub(1);
+        let sub   = if lay.wrap.is_some() { t.scroll_sub } else { 0 };
+        let (li, row) = layout::advance_rows(&t.text, t.scroll.min(last), sub, vi, lay, last);
+        let hs    = if lay.wrap.is_some() { 0 } else { t.hscroll };
+        let vx    = (mx - ed_x).max(0) as usize / cw.max(1) as usize + hs;
+        Self::visual_to_pos(&t.text, li, row, vx, lay)
     }
 }
 
@@ -6480,6 +6630,7 @@ fn guest_load_doc(s: &mut State, doc: collab::DocSnapshot) {
             s.next_buf_id += 1;
             tab.collab_path = Some(doc.path.clone());
             tab.replace_text(text);
+            tab.setup_indent();
             let pane = s.panes.get_mut(&ap).unwrap();
             pane.tabs.push(tab);
             pane.active = pane.tabs.len() - 1;
@@ -6777,6 +6928,9 @@ fn split_active_editor(s: &mut State, zone: DropZone) {
         t.collab_path = src.collab_path.clone();
         t.cursors     = src.cursors.clone();
         t.scroll      = src.scroll;
+        t.scroll_sub  = src.scroll_sub;
+        t.indent      = src.indent;
+        t.indent_locked = src.indent_locked;
         t.lsp_synced_gen = Some(t.edit_generation); // same text the server already has
     }
     s.panes.insert(new_id, p);
@@ -7036,6 +7190,16 @@ fn save_tab(s: &mut State, pane_id: usize, tab_idx: usize) -> bool {
     }
 }
 
+fn toggle_word_wrap(s: &mut State) {
+    s.settings.word_wrap = !s.settings.word_wrap;
+    s.settings.save();
+    for pane in s.panes.values_mut() {
+        for t in pane.tabs.iter_mut() { t.scroll_sub = 0; t.hscroll = 0; }
+    }
+    if s.panes.get(&s.active_pane).map_or(false, |p| p.kind == PaneKind::Editor) { s.ensure_visible(); }
+    s.status_msg = Some(if s.settings.word_wrap { "Word wrap on" } else { "Word wrap off" }.to_owned());
+}
+
 fn execute_command(s: &mut State, action: CommandAction) {
     match action {
         CommandAction::Save           => {
@@ -7062,10 +7226,11 @@ fn execute_command(s: &mut State, action: CommandAction) {
             if let (Some(p), true) = (path.as_ref(), want_org || lsp_fmt) {
                 notify_lsp_change_for(s, pid, ti); // server must see exactly what we saved
                 let gen = s.panes[&pid].tabs[ti].edit_generation;
+                let indent = s.panes[&pid].tabs[ti].indent;
                 if let Some(srv) = s.lsp.server_for_lang_host_mut(lang, p.ssh_host()) {
                     if srv.initialized {
                         if want_org { lsp::request_organize_imports(srv, p, gen, lsp_fmt, true); }
-                        else        { lsp::request_formatting(srv, p, gen, true); }
+                        else        { lsp::request_formatting(srv, p, gen, true, indent); }
                     }
                 }
             }
@@ -7093,6 +7258,29 @@ fn execute_command(s: &mut State, action: CommandAction) {
             }
         }
         CommandAction::CloseTab       => { /* needs the event loop to exit: see quick_finder_accept */ }
+        CommandAction::ToggleWordWrap => toggle_word_wrap(s),
+        CommandAction::IndentSpaces | CommandAction::IndentTabs | CommandAction::TabSize(_) | CommandAction::DetectIndent => {
+            let Some(ti) = active_editor_tab(s) else { return };
+            let pid = s.active_pane;
+            let buf_id = s.panes[&pid].tabs[ti].buf_id;
+            let current = s.panes[&pid].tabs[ti].indent;
+            let new = match action {
+                CommandAction::IndentSpaces => layout::Indent { use_tabs: false, ..current },
+                CommandAction::IndentTabs   => layout::Indent { use_tabs: true, ..current },
+                CommandAction::TabSize(n)   => layout::Indent { size: n, ..current },
+                _ => layout::detect_indent(&s.panes[&pid].tabs[ti].text)
+                    .map(|d| if d.use_tabs { layout::Indent { size: current.size, ..d } } else { d })
+                    .unwrap_or_else(|| s.settings.default_indent()),
+            };
+            let locked = !matches!(action, CommandAction::DetectIndent);
+            for p in s.panes.values_mut() {
+                for t in p.tabs.iter_mut().filter(|t| t.buf_id == buf_id) {
+                    t.indent = new;
+                    t.indent_locked = locked;
+                }
+            }
+            s.status_msg = Some(format!("Indentation: {}", new.label()));
+        }
         CommandAction::GoToSettings   => open_settings_tab(s),
         CommandAction::OpenTerminal   => open_terminal_pane(s),
         CommandAction::SplitRight     => split_active_editor(s, DropZone::Right),
@@ -7207,10 +7395,10 @@ fn execute_command(s: &mut State, action: CommandAction) {
                 _ => {
                     notify_lsp_change_for(s, pid, ti);
                     let tab = &s.panes[&pid].tabs[ti];
-                    let (path, gen) = (tab.path.clone(), tab.edit_generation);
+                    let (path, gen, indent) = (tab.path.clone(), tab.edit_generation, tab.indent);
                     if let Some(ref p) = path {
                         if let Some(srv) = s.lsp.server_for_lang_host_mut(lang, p.ssh_host()) {
-                            if srv.initialized { lsp::request_formatting(srv, p, gen, false); }
+                            if srv.initialized { lsp::request_formatting(srv, p, gen, false, indent); }
                         }
                     }
                 }
@@ -7982,6 +8170,7 @@ impl App {
         let attrs = attrs.with_title_hidden(true).with_titlebar_transparent(true);
 
         let loaded_settings = settings::Settings::load();
+        layout::set_defaults(loaded_settings.default_indent(), loaded_settings.detect_indentation);
 
         let win = Arc::new(el.create_window(attrs).unwrap());
         let renderer = match loaded_settings.renderer {
@@ -8633,16 +8822,10 @@ impl App {
                                     .find(|(id, _)| *id == pid)
                                     .map(|(_, r)| r);
                                 pane_rect.and_then(|rect| {
-                                    let lh = s.glyphs.lh;
-                                    let cw = s.glyphs.cw;
-                                    let tab_h = s.tab_h();
-                                    let total_lines = s.panes[&pid].tab().text.len_lines();
-                                    let gutter_w = State::gutter_w(total_lines, cw);
-                                    let ed_x = rect.x + gutter_w;
-                                    let scroll = s.panes[&pid].tab().scroll;
-                                    let hscroll = s.panes[&pid].tab().hscroll;
-                                    let line = scroll + ((my - rect.y - tab_h).max(0) / lh) as usize;
-                                    let col = ((mx - ed_x).max(0) / cw) as usize + hscroll;
+                                    let pos = s.pane_xy_to_char(pid, rect, mx, my);
+                                    let text = &s.panes[&pid].tab().text;
+                                    let line = text.char_to_line(pos);
+                                    let col = pos - text.line_to_char(line);
                                     active_path.as_ref()
                                         .and_then(|p| s.diagnostics.get(p))
                                         .and_then(|diags| diags.iter().find(|d| {
@@ -11165,6 +11348,9 @@ impl App {
                         } else if alt && shift && event.physical_key == PhysicalKey::Code(KeyCode::KeyO) {
                             execute_command(s, CommandAction::OrganizeImports);
                             true
+                        } else if alt && !shift && !cmd && !ctrl && event.physical_key == PhysicalKey::Code(KeyCode::KeyZ) {
+                            toggle_word_wrap(s);
+                            true
                         } else if ctrl && matches!(&event.logical_key, Key::Character(_)) {
                             false
                         } else if collab_ro && (matches!(&event.logical_key,
@@ -11390,8 +11576,9 @@ impl App {
                                 if changed || gen_now == generation {
                                     notify_lsp_change_for(s, pid, ti);
                                     let lang = s.panes[&pid].tabs[ti].lang();
+                                    let indent = s.panes[&pid].tabs[ti].indent;
                                     if let Some(srv) = s.lsp.server_for_lang_host_mut(lang, path.ssh_host()) {
-                                        if srv.initialized { lsp::request_formatting(srv, &path, gen_now, save_after); }
+                                        if srv.initialized { lsp::request_formatting(srv, &path, gen_now, save_after, indent); }
                                     }
                                 }
                             }
@@ -11679,6 +11866,7 @@ impl App {
                                 tab.replace_text(ropey::Rope::from_str(&content));
                                 tab.max_line_len = None;
                                 tab.dirty = false;
+                                tab.setup_indent();
                                 content_loaded = true;
                             } else {
                                 content_dropped = true;
@@ -12041,7 +12229,7 @@ struct PaneSnap {
     find_cursor_r:  usize,
     find_sel_q:     Option<usize>,
     find_sel_r:     Option<usize>,
-    lines:          Vec<(String, usize, Vec<u32>)>,
+    rows:           Vec<RowSnap>,
     total:          usize,
     max_line_len:   usize,
     gutter_w:       i32,
@@ -12056,6 +12244,58 @@ struct PaneSnap {
     diagnostics:    Vec<(usize, usize, usize, DiagSeverity, String)>,
     // Remote collab cursors: (line, col, color) — empty when collab is inactive
     remote_cursors: Vec<(usize, usize, u32)>,
+    /// Right side of the status bar for this tab (indentation, encoding, …).
+    status_info:    String,
+}
+
+/// Status-bar summary of a tab's indentation (and wrap mode).
+fn tab_status_info(tab: &Tab, word_wrap: bool) -> String {
+    let wrap = if word_wrap { "Wrap  " } else { "" };
+    format!("{wrap}{}  ", tab.indent.label())
+}
+
+/// One visual row of an editor pane: a whole line, or one wrapped piece of it.
+struct RowSnap {
+    li:         usize,     // logical line
+    first:      bool,      // first row of its line (gets the line number)
+    last:       bool,      // last row of its line
+    line_start: usize,     // char offset of the line in the document
+    seg_lo:     usize,     // first line column on this row
+    seg_hi:     usize,     // line column just past this row
+    chars:      Vec<char>, // chars[seg_lo..seg_hi]
+    colors:     Vec<u32>,
+    vx:         Vec<u32>,  // visual cell of each char boundary, relative to the row
+}
+
+impl RowSnap {
+    /// Visual cell (from the row start) of line column `col`, clamped to the row.
+    fn cell(&self, col: usize) -> i32 {
+        self.vx[col.clamp(self.seg_lo, self.seg_hi) - self.seg_lo] as i32
+    }
+    /// Is a caret at line column `col` drawn on this row? (A wrap boundary belongs
+    /// to the following row.)
+    fn owns_col(&self, col: usize) -> bool {
+        col >= self.seg_lo && (col < self.seg_hi || (self.last && col == self.seg_hi))
+    }
+    /// Cells covered by document range lo..hi on this row; `newline` adds a cell for
+    /// a selected line break after the last row.
+    fn span_cells(&self, lo: usize, hi: usize, newline: bool) -> Option<(i32, i32)> {
+        let row_lo = self.line_start + self.seg_lo;
+        let row_hi = self.line_start + self.seg_hi;
+        if hi <= row_lo || lo > row_hi || (lo == row_hi && !self.last) { return None; }
+        let a = self.cell(lo.max(row_lo) - self.line_start);
+        let b = if hi > row_hi {
+            self.cell(self.seg_hi) + i32::from(newline && self.last)
+        } else {
+            self.cell(hi - self.line_start)
+        };
+        (b > a).then_some((a, b))
+    }
+    /// Line column at visual cell `cell` of this row.
+    fn col_at_cell(&self, cell: usize) -> usize {
+        let i = self.vx.partition_point(|&v| (v as usize) <= cell).saturating_sub(1);
+        self.seg_lo + i.min(self.chars.len())
+    }
 }
 
 /// Length of the common byte prefix of two ropes. Chunks the ropes still share
@@ -12256,6 +12496,7 @@ fn render(s: &mut State) {
     }).collect();
 
     let rainbow = s.settings.rainbow_brackets;
+    let word_wrap = s.settings.word_wrap;
 
     // Pre-pass: update hl_cache and max_line_len for all visible editor panes (mutable pass)
     for &(pid, rect) in &layout {
@@ -12371,10 +12612,11 @@ fn render(s: &mut State) {
                 find_query: String::new(), find_repl: String::new(),
                 find_cursor_q: 0, find_cursor_r: 0,
                 find_sel_q: None, find_sel_r: None,
-                lines: vec![], total: 0, max_line_len: 0,
+                rows: vec![], total: 0, max_line_len: 0,
                 gutter_w: 0, ln_digits: 0,
                 path_name: String::new(), dirty: false,
                 cur_line: 0, cur_col: 0, diagnostics: vec![], remote_cursors: vec![],
+                status_info: String::new(),
             });
         }
 
@@ -12393,10 +12635,11 @@ fn render(s: &mut State) {
                 find_query: String::new(), find_repl: String::new(),
                 find_cursor_q: 0, find_cursor_r: 0,
                 find_sel_q: None, find_sel_r: None,
-                lines: vec![], total: 0, max_line_len: 0,
+                rows: vec![], total: 0, max_line_len: 0,
                 gutter_w: 0, ln_digits: 0,
                 path_name: String::from("Settings"), dirty: false,
                 cur_line: 0, cur_col: 0, diagnostics: vec![], remote_cursors: vec![],
+                status_info: String::new(),
             });
         }
 
@@ -12404,10 +12647,13 @@ fn render(s: &mut State) {
         let fh   = State::pane_find_h(pane, lh);
         let eh   = (rect.h - tab_h - fh).max(0);
         let vis  = (eh / lh).max(1) as usize;
-        let scroll  = tab.scroll;
-        let hscroll = tab.hscroll;
         let total   = tab.text.len_lines();
         let lang    = tab.lang();
+        let wrap = word_wrap.then(|| State::wrap_cols(rect.w, State::gutter_w(total, cw), cw));
+        let lay  = layout::Layout::new(tab.indent.size, wrap);
+        let scroll  = tab.scroll.min(total.saturating_sub(1));
+        let scroll_sub = if wrap.is_some() { tab.scroll_sub } else { 0 };
+        let hscroll = if wrap.is_some() { 0 } else { tab.hscroll };
 
         let cursors_snap: Vec<(usize, usize, Option<(usize, usize)>)> = tab.cursors.iter().map(|c| {
             let head = c.head.min(tab.text.len_chars());
@@ -12428,15 +12674,13 @@ fn render(s: &mut State) {
         } else {
             (MlState::Normal, 0i32)
         };
-        let line_count = vis.min(total.saturating_sub(scroll));
-        let mut lines: Vec<(String, usize, Vec<u32>)> = Vec::with_capacity(line_count);
+        let mut rows: Vec<RowSnap> = Vec::with_capacity(vis);
         let mut char_buf: Vec<char> = Vec::with_capacity(256);
-        for vi in 0..line_count {
-            let li         = scroll + vi;
+        let mut li = scroll;
+        while rows.len() < vis && li < total {
             let line_start = tab.text.line_to_char(li);
             char_buf.clear();
             char_buf.extend(tab.text.line(li).chars().take_while(|&c| c != '\n' && c != '\r'));
-            let text: String = char_buf.iter().collect();
             let colors = if let Some(cached) = tab.hl_color_cache.get(&li).filter(|v| !v.is_empty()) {
                 if let Some(&(ns, nd)) = tab.hl_cache.get(li + 1) {
                     hl_state = ns;
@@ -12451,10 +12695,25 @@ fn render(s: &mut State) {
             } else {
                 vec![FG; char_buf.len()]
             };
-            lines.push((text, line_start, colors));
+            let starts = layout::wrap_rows(&char_buf, lay);
+            let first_row = if li == scroll { scroll_sub.min(starts.len() - 1) } else { 0 };
+            for r in first_row..starts.len() {
+                if rows.len() >= vis { break; }
+                let lo = starts[r].min(char_buf.len());
+                let hi = starts.get(r + 1).copied().unwrap_or(char_buf.len()).min(char_buf.len());
+                let seg = &char_buf[lo..hi];
+                rows.push(RowSnap {
+                    li, first: r == 0, last: r + 1 == starts.len(), line_start,
+                    seg_lo: lo, seg_hi: hi,
+                    chars: seg.to_vec(),
+                    colors: (lo..hi).map(|i| colors.get(i).copied().unwrap_or(FG)).collect(),
+                    vx: layout::vcols(seg, lay.tab_w),
+                });
+            }
+            li += 1;
         }
 
-        let max_line_len = tab.max_line_len.unwrap_or(0);
+        let max_line_len = if wrap.is_some() { 0 } else { tab.max_line_len.unwrap_or(0) };
         let ln_digits = State::line_num_digits(total);
         let gutter_w  = State::gutter_w(total, cw);
         let tab_info = make_tab_info(&pane.tabs);
@@ -12496,7 +12755,7 @@ fn render(s: &mut State) {
             find_cursor_r: pane.find.replace[..clamp_byte_index(&pane.find.replace, pane.find.cursor_replace)].chars().count(),
             find_sel_q: pane.find.sel_anchor_q.map(|a| pane.find.query[..clamp_byte_index(&pane.find.query, a)].chars().count()),
             find_sel_r: pane.find.sel_anchor_r.map(|a| pane.find.replace[..clamp_byte_index(&pane.find.replace, a)].chars().count()),
-            lines, total, max_line_len, gutter_w, ln_digits,
+            rows, total, max_line_len, gutter_w, ln_digits,
             tab_info, active_tab: pane.active,
             path_name: tab.display_name().to_owned(), dirty: tab.dirty,
             cur_line, cur_col,
@@ -12505,6 +12764,7 @@ fn render(s: &mut State) {
                 .map(|diags| diags.iter().map(|d| (d.line, d.col_start, d.col_end, d.severity.clone(), d.message.clone())).collect())
                 .unwrap_or_default(),
             remote_cursors,
+            status_info: tab_status_info(tab, word_wrap),
         })
     }).collect();
 
@@ -12799,11 +13059,16 @@ fn render(s: &mut State) {
     let my_hover = s.mouse_y as i32;
     let hover_tip: Option<(i32, i32, String)> = pane_snaps.iter().find_map(|snap| {
         let ed_x = snap.rect.x + snap.gutter_w;
+        let content_y = snap.rect.y + tab_h;
+        if my_hover < content_y || mx_hover < ed_x { return None; }
+        let vi = ((my_hover - content_y) / lh) as usize;
+        let row = snap.rows.get(vi)?;
+        let row_y = content_y + vi as i32 * lh;
         snap.diagnostics.iter().find_map(|(dline, cs, ce, _, msg)| {
-            let row_y = snap.rect.y + tab_h + (*dline as i32 - snap.scroll as i32) * lh;
-            if my_hover < row_y || my_hover >= row_y + lh { return None; }
-            let x1 = ed_x + (*cs as i32 - snap.hscroll as i32) * cw;
-            let x2 = ed_x + (*ce as i32 - snap.hscroll as i32) * cw;
+            if *dline != row.li { return None; }
+            let (a, b) = row.span_cells(row.line_start + cs, row.line_start + (*ce).max(cs + 1), false)?;
+            let x1 = ed_x + (a - snap.hscroll as i32) * cw;
+            let x2 = ed_x + (b - snap.hscroll as i32) * cw;
             if mx_hover >= x1 && mx_hover < x2.max(x1 + cw) {
                 Some((mx_hover, row_y, msg.clone()))
             } else { None }
@@ -12822,11 +13087,10 @@ fn render(s: &mut State) {
             let fh = snap.find_h;
             if mx_hover < ed_x || my_hover < content_y || my_hover >= snap.rect.y + snap.rect.h - fh { return None; }
             let vi = (my_hover - content_y) / lh;
-            let li = snap.scroll as i32 + vi;
-            if li < 0 || li as usize >= snap.total { return None; }
-            let col_raw = ((mx_hover - ed_x) / cw + snap.hscroll as i32).max(0) as usize;
-            let (text, _, _) = snap.lines.get(vi as usize)?;
-            let chars: Vec<char> = text.chars().collect();
+            let row = snap.rows.get(vi as usize)?;
+            let cell = ((mx_hover - ed_x) / cw + snap.hscroll as i32).max(0) as usize;
+            let chars = &row.chars;
+            let col_raw = row.col_at_cell(cell) - row.seg_lo;
             if col_raw >= chars.len() { return None; }
             let ch = chars[col_raw];
             let is_word = |c: char| c.is_alphanumeric() || c == '_';
@@ -12835,8 +13099,8 @@ fn render(s: &mut State) {
             while lo > 0 && is_word(chars[lo - 1]) { lo -= 1; }
             let mut hi = col_raw + 1;
             while hi < chars.len() && is_word(chars[hi]) { hi += 1; }
-            let x1 = (ed_x + (lo as i32 - snap.hscroll as i32) * cw).max(ed_x);
-            let x2 = (ed_x + (hi as i32 - snap.hscroll as i32) * cw).min(clip_r);
+            let x1 = (ed_x + (row.vx[lo] as i32 - snap.hscroll as i32) * cw).max(ed_x);
+            let x2 = (ed_x + (row.vx[hi] as i32 - snap.hscroll as i32) * cw).min(clip_r);
             let py_top = content_y + vi * lh;
             if x2 <= x1 { return None; }
             Some((x1, py_top, x2, py_top + lh))
@@ -13742,86 +14006,75 @@ fn render(s: &mut State) {
                 continue;
             }
 
-            // Editor lines
-            for (vi, (text, line_start, colors)) in snap.lines.iter().enumerate() {
-                let li       = scroll + vi;
+            // Editor rows (a wrapped line spans several)
+            for (vi, row) in snap.rows.iter().enumerate() {
+                let li       = row.li;
                 let py       = r.y + tab_h + vi as i32 * lh;
                 let baseline = py + asc;
+                let xc       = |cell: i32| ed_x + (cell - hscroll as i32) * cw;
 
                 // Line number (right-aligned in gutter, colored by diagnostic severity)
-                let ln_str  = (li + 1).to_string();
-                let ln_x    = r.x + (snap.ln_digits as i32 - ln_str.len() as i32) * cw;
-                let is_cur  = snap.cursors_snap.iter().any(|&(l, _, _)| l == li);
-                let ln_color = if is_cur {
-                    FG
+                if row.first {
+                    let ln_str  = (li + 1).to_string();
+                    let ln_x    = r.x + (snap.ln_digits as i32 - ln_str.len() as i32) * cw;
+                    let is_cur  = snap.cursors_snap.iter().any(|&(l, _, _)| l == li);
+                    let ln_color = if is_cur {
+                        FG
+                    } else {
+                        // Check if any diagnostic is on this line; use worst severity color
+                        let has_error = snap.diagnostics.iter().any(|&(dl, _, _, ref s, _)| dl == li && *s == DiagSeverity::Error);
+                        let has_warn  = snap.diagnostics.iter().any(|&(dl, _, _, ref s, _)| dl == li && *s == DiagSeverity::Warning);
+                        if has_error { 0xFF5555u32 } else if has_warn { 0xE0AF68 } else { FG_DIM }
+                    };
+                    draw_str(buf, w, h, g, &ln_str, ln_x, baseline, ln_color, ed_x);
                 } else {
-                    // Check if any diagnostic is on this line; use worst severity color
-                    let has_error = snap.diagnostics.iter().any(|&(dl, _, _, ref s, _)| dl == li && *s == DiagSeverity::Error);
-                    let has_warn  = snap.diagnostics.iter().any(|&(dl, _, _, ref s, _)| dl == li && *s == DiagSeverity::Warning);
-                    if has_error { 0xFF5555u32 } else if has_warn { 0xE0AF68 } else { FG_DIM }
-                };
-                draw_str(buf, w, h, g, &ln_str, ln_x, baseline, ln_color, ed_x);
+                    draw_str(buf, w, h, g, "↪", ed_x - cw - 2, baseline, FG_DIM, ed_x);
+                }
 
                 // Find match highlights
                 for &(mlo, mhi) in &snap.match_ranges {
-                    let lcc      = text.chars().count();
-                    let line_end = line_start + lcc;
-                    if mlo < line_end + 1 && mhi > *line_start {
-                        let is_act = snap.cursors_snap.iter().any(|(_, _, sel)| {
-                            sel.map_or(false, |(lo, hi)| lo == mlo && hi == mhi)
-                        });
-                        let color  = if is_act { HL_MATCH_ACTIVE } else { HL_MATCH };
-                        let col_lo = mlo.saturating_sub(*line_start);
-                        let col_hi = mhi.saturating_sub(*line_start).min(lcc);
-                        let sx     = (ed_x + (col_lo as i32 - hscroll as i32) * cw).max(ed_x);
-                        let ex     = (ed_x + (col_hi as i32 - hscroll as i32) * cw).min(clip_r);
-                        let sw     = (ex - sx).max(0);
-                        if sw > 0 { fill(buf, w, h, sx, py, sw, lh, color); }
-                    }
+                    let Some((a, b)) = row.span_cells(mlo, mhi, false) else { continue };
+                    let is_act = snap.cursors_snap.iter().any(|(_, _, sel)| {
+                        sel.map_or(false, |(lo, hi)| lo == mlo && hi == mhi)
+                    });
+                    let color = if is_act { HL_MATCH_ACTIVE } else { HL_MATCH };
+                    let sx = xc(a).max(ed_x);
+                    let ex = xc(b).min(clip_r);
+                    if ex > sx { fill(buf, w, h, sx, py, ex - sx, lh, color); }
                 }
 
                 // Selection highlights
                 for &(_, _, sel) in &snap.cursors_snap {
-                    if let Some((sel_lo, sel_hi)) = sel {
-                        let lcc      = text.chars().count();
-                        let line_end = line_start + lcc;
-                        if sel_lo < line_end + 1 && sel_hi > *line_start {
-                            let col_lo = sel_lo.saturating_sub(*line_start);
-                            let col_hi = if sel_hi > line_end { lcc + 1 } else { sel_hi - line_start };
-                            let sx_raw = ed_x + (col_lo as i32 - hscroll as i32) * cw;
-                            let sx_end = (ed_x + (col_hi as i32 - hscroll as i32) * cw).min(clip_r);
-                            let sx     = sx_raw.max(ed_x);
-                            let sw     = (sx_end - sx).max(0);
-                            if sw > 0 { fill(buf, w, h, sx, py, sw, lh, SEL_BG); }
-                        }
-                    }
+                    let Some((sel_lo, sel_hi)) = sel else { continue };
+                    let Some((a, b)) = row.span_cells(sel_lo, sel_hi, true) else { continue };
+                    let sx = xc(a).max(ed_x);
+                    let ex = xc(b).min(clip_r);
+                    if ex > sx { fill(buf, w, h, sx, py, ex - sx, lh, SEL_BG); }
                 }
 
-                // Text
-                let mut x = ed_x - hscroll as i32 * cw;
-                for (ci, ch) in text.chars().enumerate() {
-                    if x + cw > ed_x && x < clip_r {
-                        let color = colors.get(ci).copied().unwrap_or(FG);
-                        if let Some((m, bmap)) = g.get(ch) {
-                            blit(buf, w, h, bmap, m, x, baseline, color);
-                        }
-                    }
-                    x += cw;
+                // Text (tabs advance to the next stop and draw nothing)
+                for (ci, &ch) in row.chars.iter().enumerate() {
+                    let x = xc(row.vx[ci] as i32);
                     if x >= clip_r { break; }
+                    if ch == '\t' || x + cw <= ed_x { continue; }
+                    let color = row.colors.get(ci).copied().unwrap_or(FG);
+                    if let Some((m, bmap)) = g.get(ch) {
+                        blit(buf, w, h, bmap, m, x, baseline, color);
+                    }
                 }
 
                 // Cursors
                 for &(c_line, c_col, _) in &snap.cursors_snap {
-                    if c_line == li && cursor_visible {
-                        let cx = ed_x + (c_col as i32 - hscroll as i32) * cw;
+                    if c_line == li && cursor_visible && row.owns_col(c_col) {
+                        let cx = xc(row.cell(c_col));
                         if cx >= ed_x && cx < clip_r { fill(buf, w, h, cx, py, 2, lh, ACCENT); }
                     }
                 }
 
                 // Remote collab cursors (3-pixel bar in peer color)
                 for &(rc_line, rc_col, rc_color) in &snap.remote_cursors {
-                    if rc_line == li {
-                        let cx = ed_x + (rc_col as i32 - hscroll as i32) * cw;
+                    if rc_line == li && row.owns_col(rc_col) {
+                        let cx = xc(row.cell(rc_col));
                         if cx >= ed_x && cx < clip_r { fill(buf, w, h, cx, py, 3, lh, rc_color); }
                     }
                 }
@@ -13834,9 +14087,15 @@ fn render(s: &mut State) {
                         DiagSeverity::Warning => 0xE0AF68,
                         _                     => FG_DIM,
                     };
-                    let x1 = (ed_x + (cs as i32 - hscroll as i32) * cw).max(ed_x);
-                    let x2 = ed_x + (ce as i32 - hscroll as i32) * cw;
-                    let sq_w = (x2 - x1).max(cw).min(clip_r - x1);
+                    let lo = row.line_start + cs;
+                    let hi = row.line_start + ce.max(cs + 1);
+                    // A zero-width diagnostic at the end of the line still gets one cell.
+                    let span = row.span_cells(lo, hi, false)
+                        .or_else(|| (row.last && cs >= row.seg_hi && cs <= row.seg_hi + 1)
+                            .then(|| { let c = row.cell(row.seg_hi); (c, c + 1) }));
+                    let Some((a, b)) = span else { continue };
+                    let x1 = xc(a).max(ed_x);
+                    let sq_w = (xc(b) - x1).max(cw).min(clip_r - x1);
                     if sq_w > 0 { draw_squiggle(buf, w, h, x1, baseline + 2, sq_w, color); }
                 }
             }
@@ -14092,7 +14351,7 @@ fn render(s: &mut State) {
             let dirty_mark = if snap.dirty { " *" } else { "" };
             draw_str(buf, w, h, g, &format!("  {}{dirty_mark}", snap.path_name), 0, sbase, FG, w as i32 - right_margin);
             if collab_status.is_none() {
-                let lc_str = format!("Ln {}, Col {}  ", snap.cur_line + 1, snap.cur_col + 1);
+                let lc_str = format!("{}Ln {}, Col {}  ", snap.status_info, snap.cur_line + 1, snap.cur_col + 1);
                 let lc_w   = lc_str.chars().count() as i32 * cw;
                 draw_str(buf, w, h, g, &lc_str, w as i32 - lc_w, sbase, FG_DIM, w as i32);
             }
@@ -14438,6 +14697,26 @@ mod tests {
         ));
         std::fs::create_dir(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn visual_positions_round_trip_through_tabs_and_wraps() {
+        let text = Rope::from_str("\tab\tc\nword word word word\n");
+        let lay = layout::Layout::new(4, None);
+        // "\tab\tc": a at cell 4, b at 5, the tab after it ends at 8, c at 8.
+        assert_eq!(State::pos_visual(&text, 1, lay), (0, 0, 4));
+        assert_eq!(State::pos_visual(&text, 4, lay), (0, 0, 8));
+        assert_eq!(State::visual_to_pos(&text, 0, 0, 8, lay), 4);
+        assert_eq!(State::visual_to_pos(&text, 0, 0, 1, lay), 0); // left half of the tab
+        assert_eq!(State::visual_to_pos(&text, 0, 0, 3, lay), 1); // right half
+        let wrap = layout::Layout::new(4, Some(10));
+        // "word word word word" wraps after "word word " (cols 0..10, 10..19).
+        let line1 = text.line_to_char(1);
+        assert_eq!(State::pos_visual(&text, line1 + 10, wrap), (1, 1, 0));
+        assert_eq!(State::pos_visual(&text, line1 + 12, wrap), (1, 1, 2));
+        // Clicking past the end of a wrapped (non-last) row stays on that row.
+        assert_eq!(State::visual_to_pos(&text, 1, 0, 30, wrap), line1 + 9);
+        assert_eq!(State::visual_to_pos(&text, 1, 1, 30, wrap), line1 + 19);
     }
 
     #[test]
