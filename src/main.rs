@@ -12,6 +12,7 @@ mod vpath;
 mod ssh;
 mod collab;
 mod layout;
+mod encoding;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -547,6 +548,9 @@ enum CommandAction {
     TrustProjectLspConfig,
     ToggleWordWrap,
     IndentSpaces, IndentTabs, TabSize(usize), DetectIndent,
+    RevertFile,
+    ReopenWithEncoding(encoding::Encoding),
+    SaveWithEncoding(encoding::Encoding),
 }
 
 struct CommandEntry { name: &'static str, shortcut: &'static str, action: CommandAction }
@@ -586,6 +590,17 @@ const COMMANDS: &[CommandEntry] = &[
     CommandEntry { name: "Indentation: Tab Size 4", shortcut: "",             action: CommandAction::TabSize(4) },
     CommandEntry { name: "Indentation: Tab Size 8", shortcut: "",             action: CommandAction::TabSize(8) },
     CommandEntry { name: "Indentation: Detect from Content", shortcut: "",    action: CommandAction::DetectIndent },
+    CommandEntry { name: "File: Revert to Disk Version", shortcut: "",        action: CommandAction::RevertFile },
+    CommandEntry { name: "File Encoding: Reopen as UTF-8", shortcut: "", action: CommandAction::ReopenWithEncoding(encoding::Encoding::Utf8) },
+    CommandEntry { name: "File Encoding: Reopen as UTF-8 with BOM", shortcut: "", action: CommandAction::ReopenWithEncoding(encoding::Encoding::Utf8Bom) },
+    CommandEntry { name: "File Encoding: Reopen as UTF-16 LE", shortcut: "", action: CommandAction::ReopenWithEncoding(encoding::Encoding::Utf16Le) },
+    CommandEntry { name: "File Encoding: Reopen as UTF-16 BE", shortcut: "", action: CommandAction::ReopenWithEncoding(encoding::Encoding::Utf16Be) },
+    CommandEntry { name: "File Encoding: Reopen as Windows-1252 (Latin-1)", shortcut: "", action: CommandAction::ReopenWithEncoding(encoding::Encoding::Windows1252) },
+    CommandEntry { name: "File Encoding: Save as UTF-8", shortcut: "", action: CommandAction::SaveWithEncoding(encoding::Encoding::Utf8) },
+    CommandEntry { name: "File Encoding: Save as UTF-8 with BOM", shortcut: "", action: CommandAction::SaveWithEncoding(encoding::Encoding::Utf8Bom) },
+    CommandEntry { name: "File Encoding: Save as UTF-16 LE", shortcut: "", action: CommandAction::SaveWithEncoding(encoding::Encoding::Utf16Le) },
+    CommandEntry { name: "File Encoding: Save as UTF-16 BE", shortcut: "", action: CommandAction::SaveWithEncoding(encoding::Encoding::Utf16Be) },
+    CommandEntry { name: "File Encoding: Save as Windows-1252 (Latin-1)", shortcut: "", action: CommandAction::SaveWithEncoding(encoding::Encoding::Windows1252) },
 ];
 
 // ── Global find/replace ───────────────────────────────────────────────────────
@@ -665,6 +680,17 @@ struct Tab {
     indent_locked: bool,
     /// With word wrap: the visual row within line `scroll` at the top of the view.
     scroll_sub:  usize,
+    /// Encoding the file was read in and is saved back in.
+    encoding:    encoding::Encoding,
+    /// Modification time and size of the file when it was last loaded or saved
+    /// here; compared against the disk to notice changes made by other programs.
+    disk_stamp:  Option<DiskStamp>,
+    /// The file changed on disk while this buffer had unsaved edits: saving asks
+    /// for confirmation first.
+    disk_conflict: bool,
+    /// A reload of this remote file was requested: the next content for it
+    /// replaces the buffer (when it hasn't been edited meanwhile).
+    remote_reload: bool,
 }
 
 impl Tab {
@@ -676,7 +702,8 @@ impl Tab {
               hl_before: None, max_line_len: Some(0), edit_generation: 0,
               lsp_synced_gen: None, remote_load_token: None, collab_path: None,
               indent: layout::default_indent(), indent_locked: false,
-              scroll_sub: 0 }
+              scroll_sub: 0, encoding: encoding::Encoding::Utf8,
+              disk_stamp: None, disk_conflict: false, remote_reload: false }
     }
 
     /// Pick this buffer's indentation from the settings and (if enabled) its
@@ -808,9 +835,12 @@ impl Tab {
             Err(e) => return Err(LoadError::Io(e.to_string())),
         }
         let bytes = std::fs::read(local_path).map_err(|e| LoadError::Io(e.to_string()))?;
-        // Refuse non-UTF-8 rather than load it lossily: saving would then silently
-        // rewrite every invalid byte as U+FFFD.
-        let content = String::from_utf8(bytes).map_err(|_| LoadError::NotUtf8)?;
+        // Decode in the file's own encoding (saved back the same way). Binary files are
+        // refused rather than loaded lossily, which would corrupt them on save.
+        let (content, enc) = encoding::decode_auto(&bytes).map_err(|_| LoadError::Binary)?;
+        self.encoding   = enc;
+        self.disk_stamp = DiskStamp::of(local_path);
+        self.disk_conflict = false;
         self.text       = Rope::from_str(&content);
         self.path       = Some(path);
         self.cursors    = vec![Cursor::new(0)];
@@ -830,6 +860,14 @@ impl Tab {
         self.scroll_sub = 0;
         self.setup_indent();
         Ok(())
+    }
+
+    /// The buffer encoded for saving, or why it can't be.
+    fn encoded_bytes(&self) -> Result<Vec<u8>, String> {
+        let content: String = self.text.chunks().collect();
+        encoding::encode(&content, self.encoding).map_err(|ch| format!(
+            "Can't save as {}: '{ch}' (U+{:04X}) has no representation in it — change the file encoding (command palette: \"File Encoding\")",
+            self.encoding.label(), ch as u32))
     }
 
     /// Start a new, not-yet-existing file at `path` (empty buffer; the first save creates it).
@@ -856,21 +894,41 @@ impl Tab {
             return Err("Shared file — the session host saves it".to_owned());
         }
         let Some(path) = &self.path else { return Err("Untitled file has no path".to_owned()) };
-        let content: String = self.text.chunks().collect();
+        let bytes = self.encoded_bytes()?;
         match path {
             VPath::Local(local) => {
-                write_file_atomically(local, content.as_bytes())
+                write_file_atomically(local, &bytes)
                     .map_err(|e| format!("Save failed ({}): {e}", local.display()))?;
                 self.dirty = false;
+                self.disk_stamp = DiskStamp::of(local);
+                self.disk_conflict = false;
                 Ok(())
             }
             VPath::Remote { host, path: remote_path } => {
                 let Some(proxy) = proxy else { return Err("remote save requires an event proxy".to_owned()) };
-                ssh::ssh_write_file(host.clone(), remote_path.clone(), content, self.edit_generation, proxy.clone());
+                ssh::ssh_write_file(host.clone(), remote_path.clone(), bytes, self.edit_generation, proxy.clone());
                 // dirty is cleared on RemoteWriteDone if nothing changed in the meantime
                 Ok(())
             }
         }
+    }
+}
+
+/// A file's modification time and size, to detect changes made outside the editor.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct DiskStamp {
+    mtime: Option<std::time::SystemTime>,
+    len:   u64,
+}
+
+impl DiskStamp {
+    fn of(path: &std::path::Path) -> Option<DiskStamp> {
+        let m = std::fs::metadata(path).ok()?;
+        Some(DiskStamp { mtime: m.modified().ok(), len: m.len() })
+    }
+    /// A remote file's (mtime seconds, size) from `ssh::ssh_stat`.
+    fn remote(mtime_secs: u64, len: u64) -> DiskStamp {
+        DiskStamp { mtime: Some(std::time::UNIX_EPOCH + Duration::from_secs(mtime_secs)), len }
     }
 }
 
@@ -879,7 +937,7 @@ impl Tab {
 enum LoadError {
     Remote,      // remote path: loaded asynchronously, not an error
     TooLarge,
-    NotUtf8,
+    Binary,
     NotFound,
     Io(String),
 }
@@ -889,7 +947,7 @@ impl LoadError {
         match self {
             LoadError::Remote   => format!("Loading {path}…"),
             LoadError::TooLarge => format!("File too large to open (>256 MB): {path}"),
-            LoadError::NotUtf8  => format!("Can't open {path}: not valid UTF-8 text (binary file?)"),
+            LoadError::Binary   => format!("Can't open {path}: binary file"),
             LoadError::NotFound => format!("File not found: {path}"),
             LoadError::Io(e)    => format!("Can't open {path}: {e}"),
         }
@@ -1744,7 +1802,10 @@ fn request_quit(s: &mut State) -> bool {
                 let tab = &s.panes[&pid].tabs[ti];
                 let ok = match tab.path.clone() {
                     Some(VPath::Remote { host, path }) => {
-                        let content: String = tab.text.chunks().collect();
+                        let content = match tab.encoded_bytes() {
+                            Ok(b) => b,
+                            Err(e) => { s.status_msg = Some(e); return false; }
+                        };
                         match ssh::ssh_write_file_blocking(&host, &path, &content) {
                             Ok(()) => { s.panes.get_mut(&pid).unwrap().tabs[ti].dirty = false; true }
                             Err(e) => { s.status_msg = Some(format!("Save failed ({}): {e}", path.display())); false }
@@ -2291,9 +2352,12 @@ pub enum UserEvent {
     SshConnecting       { host: vpath::SshHost },
     SshConnected        { host: vpath::SshHost },
     SshError            { host: vpath::SshHost, msg: String },
-    RemoteFileContent   { token: u64, path: VPath, content: String },
+    RemoteFileContent   { token: u64, path: VPath, content: String, encoding: encoding::Encoding },
     RemoteFileError     { token: u64, path: VPath, msg: String },
     RemoteWriteDone     { path: VPath, generation: u64 },
+    /// A remote file's (mtime secs, size), or None if it doesn't exist. `baseline`:
+    /// record it (after a load/save) rather than compare it.
+    RemoteStat          { path: VPath, stamp: Option<(u64, u64)>, baseline: bool },
     RemoteWriteError    { path: VPath, msg: String },
     RemoteDirListing    { path: VPath, entries: Vec<(String, bool)> },
     RemoteDirListingError { path: VPath, msg: String },
@@ -2408,6 +2472,13 @@ struct State {
     discard_armed: Option<(String, Instant)>,
     /// File list sent by the host (guest-side only); empty when hosting or not in a session.
     collab_file_list: Vec<String>,
+    /// Whether the window has keyboard focus, and when open files were last
+    /// compared with the disk.
+    window_focused:  bool,
+    last_disk_check: Instant,
+    /// "Save again to overwrite": a save of this file was refused because it
+    /// changed on disk; a second save within a few seconds overwrites it.
+    overwrite_armed: Option<(VPath, Instant)>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -7162,6 +7233,7 @@ fn save_tab(s: &mut State, pane_id: usize, tab_idx: usize) -> bool {
             t.path = Some(VPath::Local(chosen));
         }
     }
+    if !confirm_overwrite_if_changed_on_disk(s, pane_id, tab_idx) { return false; }
     let Some(tab) = s.panes.get_mut(&pane_id).and_then(|p| p.tabs.get_mut(tab_idx)) else { return false };
     let result = tab.save_with_proxy(Some(&proxy));
     let path = tab.path.clone();
@@ -7186,6 +7258,161 @@ fn save_tab(s: &mut State, pane_id: usize, tab_idx: usize) -> bool {
         Err(e) => {
             s.status_msg = Some(e);
             false
+        }
+    }
+}
+
+/// Saving over a file that another program changed since we loaded it would throw
+/// their changes away: refuse the first save (with an explanation) and let a second
+/// save within a few seconds go through.
+fn confirm_overwrite_if_changed_on_disk(s: &mut State, pane_id: usize, tab_idx: usize) -> bool {
+    let Some(tab) = s.panes.get(&pane_id).and_then(|p| p.tabs.get(tab_idx)) else { return true };
+    let Some(path) = tab.path.clone() else { return true };
+    let changed_locally = path.as_local_path().map_or(false, |p| {
+        tab.disk_stamp.is_some() && DiskStamp::of(p).is_some_and(|now| Some(now) != tab.disk_stamp)
+    });
+    if !tab.disk_conflict && !changed_locally { return true; }
+    let now = Instant::now();
+    if let Some((armed, at)) = &s.overwrite_armed {
+        if armed == &path && now.duration_since(*at) < Duration::from_secs(8) {
+            s.overwrite_armed = None;
+            return true;
+        }
+    }
+    s.overwrite_armed = Some((path.clone(), now));
+    s.status_msg = Some(format!(
+        "{} changed on disk since it was opened here. Save again to overwrite it, or run \"File: Revert to Disk Version\".",
+        path.display_short()));
+    false
+}
+
+/// Every editor tab showing the same buffer as (pid, ti) — the tab itself included.
+fn buffer_tabs(s: &mut State, buf_id: usize) -> impl Iterator<Item = &mut Tab> {
+    s.panes.values_mut().flat_map(|p| p.tabs.iter_mut()).filter(move |t| t.buf_id == buf_id)
+}
+
+/// Compare open local files with the disk (and, with `remote`, ask remote hosts):
+/// a file changed by another program is reloaded if the buffer is clean, or flagged
+/// as a conflict if it has unsaved edits.
+fn check_disk_changes(s: &mut State, remote: bool) {
+    s.last_disk_check = Instant::now();
+    let mut seen: HashSet<usize> = HashSet::new();
+    let mut targets: Vec<(usize, usize)> = Vec::new();
+    let mut remote_paths: Vec<VPath> = Vec::new();
+    let mut ids: Vec<usize> = s.panes.keys().copied().collect();
+    ids.sort_unstable();
+    for pid in ids {
+        for (ti, t) in s.panes[&pid].tabs.iter().enumerate() {
+            if t.kind != TabKind::Editor || !seen.insert(t.buf_id) { continue; }
+            match &t.path {
+                Some(VPath::Local(_)) => targets.push((pid, ti)),
+                Some(p @ VPath::Remote { .. }) if remote && t.remote_load_token.is_none() => remote_paths.push(p.clone()),
+                _ => {}
+            }
+        }
+    }
+    for (pid, ti) in targets {
+        let (buf_id, local, old, dirty, enc) = {
+            let t = &s.panes[&pid].tabs[ti];
+            let Some(local) = t.path.as_ref().and_then(|p| p.as_local_path()).map(|p| p.to_path_buf()) else { continue };
+            (t.buf_id, local, t.disk_stamp, t.dirty, t.encoding)
+        };
+        let now = DiskStamp::of(&local);
+        let name = local.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        match (old, now) {
+            (Some(o), Some(n)) if o != n => {
+                for t in buffer_tabs(s, buf_id) { t.disk_stamp = Some(n); }
+                if dirty {
+                    for t in buffer_tabs(s, buf_id) { t.disk_conflict = true; }
+                    s.status_msg = Some(format!("{name} changed on disk, and you have unsaved edits — saving will ask before overwriting"));
+                    continue;
+                }
+                let Some(bytes) = std::fs::read(&local).ok() else { continue };
+                let decoded = encoding::decode_file_as(&bytes, enc).ok().map(|t| (t, enc))
+                    .or_else(|| encoding::decode_auto(&bytes).ok());
+                let Some((text, new_enc)) = decoded else { continue };
+                if s.panes[&pid].tabs[ti].text == text.as_str() { continue; }
+                let limit = s.settings.undo_limit;
+                let collab = s.collab.is_some();
+                let tab = &mut s.panes.get_mut(&pid).unwrap().tabs[ti];
+                let before = tab.text.clone();
+                if !collab { tab.push_undo_snapshot(limit); }
+                tab.replace_text(Rope::from_str(&text));
+                tab.max_line_len = None;
+                tab.dirty = false;
+                tab.encoding = new_enc;
+                after_background_edit(s, pid, ti, Some(before));
+                for t in buffer_tabs(s, buf_id) { t.dirty = false; t.disk_conflict = false; t.encoding = new_enc; }
+                s.status_msg = Some(format!("Reloaded {name} (changed on disk)"));
+            }
+            (Some(_), None) => {
+                for t in buffer_tabs(s, buf_id) { t.disk_stamp = None; t.dirty = true; }
+                s.status_msg = Some(format!("{name} was deleted on disk — save to recreate it"));
+            }
+            (None, Some(n)) => {
+                for t in buffer_tabs(s, buf_id) { t.disk_stamp = Some(n); }
+            }
+            _ => {}
+        }
+        s.needs_redraw = true;
+    }
+    for path in remote_paths {
+        if let VPath::Remote { host, path: rp } = path {
+            if matches!(s.ssh_connections.get(&host), Some(SshConnectionState::Connected)) {
+                ssh::ssh_stat(host, rp, false, s.proxy.clone());
+            }
+        }
+    }
+}
+
+/// Throw away the buffer's edits and load the file from disk again (optionally
+/// decoding it as `enc`).
+fn revert_to_disk(s: &mut State, pid: usize, ti: usize, enc: Option<encoding::Encoding>) {
+    let Some(tab) = s.panes.get(&pid).and_then(|p| p.tabs.get(ti)) else { return };
+    let buf_id = tab.buf_id;
+    let Some(path) = tab.path.clone() else {
+        s.status_msg = Some("This buffer has no file to revert to".to_owned());
+        return;
+    };
+    match &path {
+        VPath::Local(local) => {
+            let bytes = match std::fs::read(local) {
+                Ok(b) => b,
+                Err(e) => { s.status_msg = Some(format!("Can't read {}: {e}", local.display())); return; }
+            };
+            let decoded = match enc {
+                Some(enc) => encoding::decode_file_as(&bytes, enc).map(|t| (t, enc))
+                    .map_err(|_| format!("{} is not valid {}", path.display_short(), enc.label())),
+                None => encoding::decode_auto(&bytes).map_err(|_| format!("{}: binary file", path.display_short())),
+            };
+            let (text, new_enc) = match decoded {
+                Ok(d) => d,
+                Err(e) => { s.status_msg = Some(e); return; }
+            };
+            let limit = s.settings.undo_limit;
+            let collab = s.collab.is_some();
+            let tab = &mut s.panes.get_mut(&pid).unwrap().tabs[ti];
+            let before = tab.text.clone();
+            if !collab { tab.push_undo_snapshot(limit); }
+            tab.replace_text(Rope::from_str(&text));
+            tab.max_line_len = None;
+            after_background_edit(s, pid, ti, Some(before));
+            let stamp = DiskStamp::of(local);
+            for t in buffer_tabs(s, buf_id) {
+                t.dirty = false;
+                t.disk_conflict = false;
+                t.encoding = new_enc;
+                t.disk_stamp = stamp;
+            }
+            s.status_msg = Some(format!("Reverted {} ({})", path.display_short(), new_enc.label()));
+        }
+        VPath::Remote { .. } => {
+            if enc.is_some() {
+                s.status_msg = Some("Reopening a remote file with another encoding isn't supported".to_owned());
+                return;
+            }
+            for t in buffer_tabs(s, buf_id) { t.dirty = false; t.remote_reload = true; t.disk_conflict = false; }
+            begin_remote_tab_read(s, pid, ti, path);
         }
     }
 }
@@ -7259,6 +7486,33 @@ fn execute_command(s: &mut State, action: CommandAction) {
         }
         CommandAction::CloseTab       => { /* needs the event loop to exit: see quick_finder_accept */ }
         CommandAction::ToggleWordWrap => toggle_word_wrap(s),
+        CommandAction::RevertFile => {
+            let Some(ti) = active_editor_tab(s) else { return };
+            let pid = s.active_pane;
+            revert_to_disk(s, pid, ti, None);
+        }
+        CommandAction::ReopenWithEncoding(enc) => {
+            let Some(ti) = active_editor_tab(s) else { return };
+            let pid = s.active_pane;
+            if s.panes[&pid].tabs[ti].dirty {
+                s.status_msg = Some("Save or revert your changes before reopening with another encoding".to_owned());
+                return;
+            }
+            revert_to_disk(s, pid, ti, Some(enc));
+        }
+        CommandAction::SaveWithEncoding(enc) => {
+            let Some(ti) = active_editor_tab(s) else { return };
+            let pid = s.active_pane;
+            let buf_id = s.panes[&pid].tabs[ti].buf_id;
+            let old = s.panes[&pid].tabs[ti].encoding;
+            for t in buffer_tabs(s, buf_id) { t.encoding = enc; }
+            if !save_tab(s, pid, ti) {
+                // Keep the old encoding if the text can't be represented (or no save happened).
+                for t in buffer_tabs(s, buf_id) { t.encoding = old; }
+            } else {
+                s.status_msg = Some(format!("Saved as {}", enc.label()));
+            }
+        }
         CommandAction::IndentSpaces | CommandAction::IndentTabs | CommandAction::TabSize(_) | CommandAction::DetectIndent => {
             let Some(ti) = active_editor_tab(s) else { return };
             let pid = s.active_pane;
@@ -8028,12 +8282,16 @@ fn global_replace(s: &mut State, results: &[GlobalFindResult], query: &str, repl
             files += 1;
             total += n;
         } else if let Some(local) = path.as_local_path() {
-            let Ok(content) = std::fs::read_to_string(local) else {
+            let Some((content, enc)) = std::fs::read(local).ok().and_then(|b| encoding::decode_auto(&b).ok()) else {
                 errors.push(format!("{}: unreadable", local.display()));
                 continue;
             };
             let Some((new_content, n)) = replace_in_text(&content, query, replace, case_sensitive) else { continue };
-            match write_file_atomically(local, new_content.as_bytes()) {
+            let Ok(new_bytes) = encoding::encode(&new_content, enc) else {
+                errors.push(format!("{}: replacement not representable in {}", local.display(), enc.label()));
+                continue;
+            };
+            match write_file_atomically(local, &new_bytes) {
                 Ok(()) => { files += 1; total += n; }
                 Err(e) => errors.push(format!("{}: {e}", local.display())),
             }
@@ -8319,6 +8577,9 @@ impl App {
             collab_before:    None,
             discard_armed:    None,
             collab_file_list: Vec::new(),
+            window_focused:  true,
+            last_disk_check: Instant::now(),
+            overwrite_armed: None,
         };
 
         if let Some(path) = initial_lsp_path {
@@ -8364,8 +8625,11 @@ impl App {
                 s.needs_redraw = true;
             }
 
-            WindowEvent::Focused(_focused) => {
-                dlog!("[focus] focused={_focused} t={}", ts());
+            WindowEvent::Focused(focused) => {
+                dlog!("[focus] focused={focused} t={}", ts());
+                s.window_focused = focused;
+                // Coming back from another program is when files most often changed.
+                if focused { check_disk_changes(s, true); }
             }
 
             WindowEvent::Resized(sz) => {
@@ -11484,6 +11748,10 @@ impl App {
                 notify_collab_change(s);
                 send_collab_cursor_if_needed(s);
             }
+            if s.window_focused && s.last_disk_check.elapsed() >= Duration::from_secs(2) {
+                check_disk_changes(s, false);
+                if s.needs_redraw { s.win.request_redraw(); }
+            }
             // When vsync is off (no display link), flush dirty flag here so we get
             // one render per event batch rather than one per event.
             if !s.settings.vsync && s.needs_redraw {
@@ -11852,7 +12120,7 @@ impl App {
                 s.needs_redraw = true;
                 self.dirty.store(true, Ordering::Release);
             }
-            UserEvent::RemoteFileContent { token, path, content } => {
+            UserEvent::RemoteFileContent { token, path, content, encoding } => {
                 // Deliver content only to the tab load request that owns this token.
                 // Always clear the token so it doesn't linger; only insert content
                 // if the tab is still clean (user hasn't typed anything yet).
@@ -11862,11 +12130,16 @@ impl App {
                     for tab in pane.tabs.iter_mut() {
                         if tab.path.as_ref() == Some(&path) && tab.remote_load_token == Some(token) {
                             tab.remote_load_token = None;
-                            if !tab.dirty && tab.text.len_chars() == 0 {
+                            let reload = std::mem::take(&mut tab.remote_reload);
+                            if !tab.dirty && (tab.text.len_chars() == 0 || reload) {
+                                if reload && tab.text != content.as_str() {
+                                    tab.push_undo_snapshot(s.settings.undo_limit);
+                                }
                                 tab.replace_text(ropey::Rope::from_str(&content));
                                 tab.max_line_len = None;
                                 tab.dirty = false;
-                                tab.setup_indent();
+                                tab.encoding = encoding;
+                                if !reload { tab.setup_indent(); }
                                 content_loaded = true;
                             } else {
                                 content_dropped = true;
@@ -11882,6 +12155,12 @@ impl App {
                 }
                 if content_loaded {
                     notify_lsp_open(s, &path);
+                    if let Some((pid, ti)) = find_tab_for_path(s, &path) {
+                        propagate_to_siblings(s, pid, ti);
+                    }
+                    if let VPath::Remote { host, path: rp } = &path {
+                        ssh::ssh_stat(host.clone(), rp.clone(), true, s.proxy.clone());
+                    }
                 }
                 s.needs_redraw = true;
                 self.dirty.store(true, Ordering::Release);
@@ -11908,8 +12187,37 @@ impl App {
                     for tab in pane.tabs.iter_mut() {
                         if tab.path.as_ref() == Some(&path) && tab.edit_generation == generation {
                             tab.dirty = false;
+                            tab.disk_conflict = false;
                         }
                     }
+                }
+                if let VPath::Remote { host, path: rp } = &path {
+                    ssh::ssh_stat(host.clone(), rp.clone(), true, s.proxy.clone());
+                }
+                s.needs_redraw = true;
+                self.dirty.store(true, Ordering::Release);
+            }
+            UserEvent::RemoteStat { path, stamp, baseline } => {
+                let stamp = stamp.map(|(m, l)| DiskStamp::remote(m, l));
+                let Some((pid, ti)) = find_tab_for_path(s, &path) else { return };
+                let (buf_id, old, dirty) = { let t = &s.panes[&pid].tabs[ti]; (t.buf_id, t.disk_stamp, t.dirty) };
+                if baseline || old.is_none() {
+                    for t in buffer_tabs(s, buf_id) { t.disk_stamp = stamp; }
+                    return;
+                }
+                if stamp == old { return; }
+                for t in buffer_tabs(s, buf_id) { t.disk_stamp = stamp; }
+                let name = path.display_short();
+                if stamp.is_none() {
+                    for t in buffer_tabs(s, buf_id) { t.dirty = true; }
+                    s.status_msg = Some(format!("{name} was deleted on the remote host — save to recreate it"));
+                } else if dirty {
+                    for t in buffer_tabs(s, buf_id) { t.disk_conflict = true; }
+                    s.status_msg = Some(format!("{name} changed on the remote host, and you have unsaved edits — saving will ask before overwriting"));
+                } else {
+                    for t in buffer_tabs(s, buf_id) { t.remote_reload = true; }
+                    begin_remote_tab_read(s, pid, ti, path.clone());
+                    s.status_msg = Some(format!("Reloading {name} (changed on the remote host)"));
                 }
                 s.needs_redraw = true;
                 self.dirty.store(true, Ordering::Release);
@@ -12251,7 +12559,7 @@ struct PaneSnap {
 /// Status-bar summary of a tab's indentation (and wrap mode).
 fn tab_status_info(tab: &Tab, word_wrap: bool) -> String {
     let wrap = if word_wrap { "Wrap  " } else { "" };
-    format!("{wrap}{}  ", tab.indent.label())
+    format!("{wrap}{}  {}  ", tab.indent.label(), tab.encoding.label())
 }
 
 /// One visual row of an editor pane: a whole line, or one wrapped piece of it.

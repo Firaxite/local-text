@@ -162,14 +162,41 @@ pub fn ssh_read_file(host: SshHost, path: PathBuf, token: u64, proxy: EventLoopP
     thread::spawn(move || {
         let vpath = VPath::Remote { host: host.clone(), path: path.clone() };
         let cmd = format!("cat -- {}", remote_path_expr(&path));
-        match run_ssh_capture(&host, &["sh", "-c", &cmd]) {
-            Ok(content) => {
-                let _ = proxy.send_event(UserEvent::RemoteFileContent { token, path: vpath, content });
+        let decoded = run_ssh_capture_bytes(&host, &["sh", "-c", &cmd]).and_then(|bytes| {
+            crate::encoding::decode_auto(&bytes).map_err(|_| "binary file — not opened".to_owned())
+        });
+        match decoded {
+            Ok((content, encoding)) => {
+                let _ = proxy.send_event(UserEvent::RemoteFileContent { token, path: vpath, content, encoding });
             }
             Err(msg) => {
                 let _ = proxy.send_event(UserEvent::RemoteFileError { token, path: vpath, msg });
             }
         }
+    });
+}
+
+/// Look up a remote file's modification time (seconds) and size. Sends
+/// `RemoteStat` (stamp None = the file doesn't exist); connection errors send nothing.
+pub fn ssh_stat(host: SshHost, path: PathBuf, baseline: bool, proxy: EventLoopProxy<UserEvent>) {
+    thread::spawn(move || {
+        let p = remote_path_expr(&path);
+        let script = format!(
+            "if [ -e {p} ]; then stat -c '%Y %s' -- {p} 2>/dev/null || stat -f '%m %z' -- {p}; else echo missing; fi"
+        );
+        let Ok(out) = run_ssh_capture(&host, &["sh", "-c", &script]) else { return };
+        let out = out.trim();
+        let stamp = if out == "missing" {
+            None
+        } else {
+            let mut it = out.split_whitespace().map(|n| n.parse::<u64>());
+            match (it.next(), it.next()) {
+                (Some(Ok(m)), Some(Ok(l))) => Some((m, l)),
+                _ => return,
+            }
+        };
+        let vpath = VPath::Remote { host, path };
+        let _ = proxy.send_event(UserEvent::RemoteStat { path: vpath, stamp, baseline });
     });
 }
 
@@ -189,7 +216,7 @@ static WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 
 /// Write a file to a remote host. Sends `RemoteWriteDone` (carrying `generation`,
 /// the buffer's edit generation at save time) on success or `RemoteWriteError`.
-pub fn ssh_write_file(host: SshHost, path: PathBuf, content: String, generation: u64, proxy: EventLoopProxy<UserEvent>) {
+pub fn ssh_write_file(host: SshHost, path: PathBuf, content: Vec<u8>, generation: u64, proxy: EventLoopProxy<UserEvent>) {
     let seq = WRITE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     thread::spawn(move || {
         let vpath = VPath::Remote { host: host.clone(), path: path.clone() };
@@ -212,7 +239,7 @@ pub fn ssh_write_file(host: SshHost, path: PathBuf, content: String, generation:
 
 /// Blocking remote write, for saving on quit (the process must not exit while a
 /// background write is still streaming the file).
-pub fn ssh_write_file_blocking(host: &SshHost, path: &Path, content: &str) -> Result<(), String> {
+pub fn ssh_write_file_blocking(host: &SshHost, path: &Path, content: &[u8]) -> Result<(), String> {
     let slot = write_slot(host, path);
     let _guard = slot.lock().unwrap_or_else(|p| p.into_inner());
     write_remote_file(host, path, content)
@@ -563,6 +590,12 @@ fn open_control_master(host: &SshHost) -> Result<(), String> {
 /// Run a command on the remote and capture stdout as a String.
 /// Uses the existing ControlMaster socket (does not create one).
 pub fn run_ssh_capture(host: &SshHost, remote_argv: &[&str]) -> Result<String, String> {
+    String::from_utf8(run_ssh_capture_bytes(host, remote_argv)?)
+        .map_err(|_| "Remote output is not valid UTF-8".to_owned())
+}
+
+/// Run a command on the remote and capture stdout as raw bytes.
+pub fn run_ssh_capture_bytes(host: &SshHost, remote_argv: &[&str]) -> Result<Vec<u8>, String> {
     // OpenSSH sends the remote command as one shell string. Quote argv ourselves
     // so `sh -c <script>` remains one script instead of leaking lines into the
     // remote login shell with unset variables.
@@ -573,8 +606,7 @@ pub fn run_ssh_capture(host: &SshHost, remote_argv: &[&str]) -> Result<String, S
 
     let output = cmd.output().map_err(|e| format!("ssh spawn error: {e}"))?;
     if output.status.success() {
-        String::from_utf8(output.stdout)
-            .map_err(|_| "Remote output is not valid UTF-8".to_owned())
+        Ok(output.stdout)
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         Err(format!("ssh error ({}): {}", output.status, stderr.trim()))
@@ -617,7 +649,7 @@ fi"#,
 }
 
 /// Write `content` to `remote_path` on `host` (see `remote_save_script`).
-fn write_remote_file(host: &SshHost, remote_path: &Path, content: &str) -> Result<(), String> {
+fn write_remote_file(host: &SshHost, remote_path: &Path, content: &[u8]) -> Result<(), String> {
     let script = remote_save_script(remote_path, content.len());
     let mut cmd = batch_command(host, remote_command(&["sh", "-c", &script]));
     cmd.stdin(Stdio::piped())
@@ -627,7 +659,7 @@ fn write_remote_file(host: &SshHost, remote_path: &Path, content: &str) -> Resul
         .map_err(|e| format!("ssh spawn error: {e}"))?;
 
     let write_result = match child.stdin.take() {
-        Some(mut stdin) => stdin.write_all(content.as_bytes()), // stdin dropped → EOF
+        Some(mut stdin) => stdin.write_all(content), // stdin dropped → EOF
         None => Ok(()),
     };
     // Always reap the child, even if the write failed.
