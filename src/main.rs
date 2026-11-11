@@ -13,6 +13,7 @@ mod ssh;
 mod collab;
 mod layout;
 mod encoding;
+mod search;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -365,6 +366,10 @@ struct FindBar {
     replace:        String,
     case_sensitive: bool,
     whole_word:     bool,
+    /// Query is a regular expression.
+    regex:          bool,
+    /// Why the regex doesn't compile (shown instead of the match count).
+    regex_error:    Option<String>,
     focus:          FindFocus,
     cursor_query:   usize,
     cursor_replace: usize,
@@ -373,7 +378,7 @@ struct FindBar {
     // Cached match positions — recomputed only when query/flags/file changes.
     match_cache:     Vec<(usize, usize)>,
     match_cache_gen: u64,                    // edit_generation when cache was built
-    match_cache_key: (String, bool, bool),   // (query, case_sensitive, whole_word)
+    match_cache_key: (String, bool, bool, bool), // (query, case_sensitive, whole_word, regex)
 }
 
 impl FindBar {
@@ -381,12 +386,12 @@ impl FindBar {
         FindBar {
             open: false, input_focused: false, replace_open: false,
             query: String::new(), replace: String::new(),
-            case_sensitive: false, whole_word: false,
+            case_sensitive: false, whole_word: false, regex: false, regex_error: None,
             focus: FindFocus::Query,
             cursor_query: 0, cursor_replace: 0,
             sel_anchor_q: None, sel_anchor_r: None,
             match_cache: Vec::new(), match_cache_gen: 0,
-            match_cache_key: (String::new(), false, false),
+            match_cache_key: (String::new(), false, false, false),
         }
     }
 }
@@ -626,6 +631,8 @@ struct GlobalFind {
     selected:       usize,
     focus:          GlobalFindFocus,
     case_sensitive: bool,
+    /// Query is a regular expression.
+    regex:          bool,
     live_search:    bool,
     search_fire_at: Option<Instant>,
     searching:      bool,   // true while a background search thread is running
@@ -5709,12 +5716,25 @@ fn word_bounds_at(tab: &Tab, pos: usize) -> (usize, usize) {
     (lo, hi)
 }
 
+/// Matches for the find bar's query and flags (regex or literal).
+fn find_bar_matches(text: &Rope, query: &str, cs: bool, ww: bool, regex: bool) -> Result<Vec<(usize, usize)>, String> {
+    if query.is_empty() { return Ok(Vec::new()); }
+    if !regex { return Ok(find_matches(text, query, cs, ww)); }
+    let re = search::build(query, cs, ww)?;
+    Ok(search::rope_matches(&re, text, search::is_multiline(query)))
+}
+
+fn find_bar_flags(s: &State) -> (String, bool, bool, bool) {
+    let f = s.find();
+    (f.query.clone(), f.case_sensitive, f.whole_word, f.regex)
+}
+
 fn find_step(s: &mut State, backwards: bool) {
-    let (query, cs, ww) = {
-        let f = s.find();
-        (f.query.clone(), f.case_sensitive, f.whole_word)
+    let (query, cs, ww, rx) = find_bar_flags(s);
+    let matches = match find_bar_matches(&s.tab().text, &query, cs, ww, rx) {
+        Ok(m) => m,
+        Err(e) => { s.status_msg = Some(format!("Invalid regex: {e}")); return; }
     };
-    let matches = find_matches(&s.tab().text, &query, cs, ww);
     if matches.is_empty() { return; }
     let idx = if backwards {
         let p = s.tab().primary().lo();
@@ -5730,7 +5750,17 @@ fn find_step(s: &mut State, backwards: bool) {
 
 fn replace_current(s: &mut State) {
     if s.tab().primary().has_sel() {
-        let repl = s.find().replace.clone();
+        let (query, cs, ww, rx) = find_bar_flags(s);
+        let mut repl = s.find().replace.clone();
+        if rx {
+            // Only replace a selection that is itself a match, expanding $1 etc.
+            let (lo, hi) = (s.tab().primary().lo(), s.tab().primary().hi());
+            let Ok(re) = search::build(&query, cs, ww) else { return };
+            match search::replacement_for(&re, &s.tab().text, search::is_multiline(&query), &repl, lo, hi) {
+                Some(r) => repl = r,
+                None => { find_step(s, false); return; }
+            }
+        }
         for ch in repl.chars() { s.glyphs.load(ch); }
         s.insert_str(&repl);
         find_step(s, false);
@@ -5739,18 +5769,23 @@ fn replace_current(s: &mut State) {
 
 fn replace_all(s: &mut State) {
     if active_editor_tab(s).is_none() { return; }
-    let (query, cs, ww) = {
-        let f = s.find();
-        (f.query.clone(), f.case_sensitive, f.whole_word)
-    };
-    let matches = find_matches(&s.tab().text, &query, cs, ww);
-    if matches.is_empty() { return; }
+    let (query, cs, ww, rx) = find_bar_flags(s);
+    if query.is_empty() { return; }
     let repl = s.find().replace.clone();
-    for ch in repl.chars() { s.glyphs.load(ch); }
+    let edits: Vec<(usize, usize, String)> = if rx {
+        let re = match search::build(&query, cs, ww) {
+            Ok(re) => re,
+            Err(e) => { s.status_msg = Some(format!("Invalid regex: {e}")); return; }
+        };
+        search::rope_replacements(&re, &s.tab().text, search::is_multiline(&query), &repl)
+    } else {
+        find_matches(&s.tab().text, &query, cs, ww).into_iter().map(|(lo, hi)| (lo, hi, repl.clone())).collect()
+    };
+    if edits.is_empty() { return; }
+    for (_, _, r) in &edits { for ch in r.chars() { s.glyphs.load(ch); } }
     // Goes through push_undo like any edit: undoable, re-highlights, re-syncs the
     // find matches, split views, the language server and collab peers.
     s.push_undo(false);
-    let edits: Vec<(usize, usize, String)> = matches.iter().map(|&(lo, hi)| (lo, hi, repl.clone())).collect();
     let n = edits.len();
     let tab = s.tab_mut();
     let mut cursors = std::mem::take(&mut tab.cursors);
@@ -8179,6 +8214,7 @@ fn spawn_search(gf: &mut GlobalFind, root: PathBuf, proxy: EventLoopProxy<UserEv
     let include = gf.include_glob.clone();
     let exclude = gf.exclude_glob.clone();
     let cs      = gf.case_sensitive;
+    let rx      = gf.regex;
     gf.search_token += 1;
     let token = gf.search_token;
     gf.searching = true;
@@ -8187,12 +8223,18 @@ fn spawn_search(gf: &mut GlobalFind, root: PathBuf, proxy: EventLoopProxy<UserEv
     gf.scroll   = 0;
     std::thread::spawn(move || {
         let results = if query.is_empty() { Vec::new() }
-                      else { global_search(&root, &query, &include, &exclude, cs) };
+                      else { global_search(&root, &query, &include, &exclude, cs, rx) };
         let _ = proxy.send_event(UserEvent::SearchDone { token, results });
     });
 }
 
-fn global_search(root: &std::path::Path, query: &str, include: &str, exclude: &str, case_sensitive: bool) -> Vec<GlobalFindResult> {
+fn global_search(root: &std::path::Path, query: &str, include: &str, exclude: &str, case_sensitive: bool, regex: bool) -> Vec<GlobalFindResult> {
+    let re = if regex {
+        match search::build(query, case_sensitive, false) {
+            Ok(re) => Some(re),
+            Err(_) => return Vec::new(),
+        }
+    } else { None };
     let mut all_files = Vec::new();
     walk_files(root, &mut all_files, 0);
     let (query_chars, _) = fold_chars(query.chars(), case_sensitive);
@@ -8202,11 +8244,14 @@ fn global_search(root: &std::path::Path, query: &str, include: &str, exclude: &s
         if !include.is_empty() && !glob_match(include, &rel) { continue; }
         if !exclude.is_empty() && glob_match(exclude, &rel) { continue; }
         if std::fs::metadata(local_path).map(|m| m.len()).unwrap_or(0) > 64 * 1024 * 1024 { continue; }
-        let Ok(content) = std::fs::read_to_string(local_path) else { continue };
+        let Some((content, _)) = std::fs::read(local_path).ok().and_then(|b| encoding::decode_auto(&b).ok()) else { continue };
         let path = VPath::Local(local_path.clone());
         for (line_num, line) in content.lines().enumerate() {
-            let line_chars: Vec<char> = line.chars().collect();
-            for (lo, hi) in find_in_chars(&line_chars, &query_chars, case_sensitive) {
+            let hits = match &re {
+                Some(re) => search::line_matches(re, line),
+                None => find_in_chars(&line.chars().collect::<Vec<char>>(), &query_chars, case_sensitive),
+            };
+            for (lo, hi) in hits {
                 results.push(GlobalFindResult {
                     path:      path.clone(),
                     line_num,
@@ -8255,7 +8300,13 @@ fn replace_in_text(content: &str, query: &str, replace: &str, case_sensitive: bo
 /// each file's *current* contents (results can be stale). Files open in a tab are
 /// edited in the buffer — undoable, left unsaved — so unsaved edits are never
 /// overwritten; other files are rewritten atomically on disk.
-fn global_replace(s: &mut State, results: &[GlobalFindResult], query: &str, replace: &str, case_sensitive: bool) {
+fn global_replace(s: &mut State, results: &[GlobalFindResult], query: &str, replace: &str, case_sensitive: bool, regex: bool) {
+    let re = if regex {
+        match search::build(query, case_sensitive, false) {
+            Ok(re) => Some(re),
+            Err(e) => { s.status_msg = Some(format!("Invalid regex: {e}")); return; }
+        }
+    } else { None };
     let mut paths: Vec<VPath> = Vec::new();
     for r in results {
         if r.path.as_local_path().is_some() && !paths.contains(&r.path) { paths.push(r.path.clone()); }
@@ -8266,13 +8317,16 @@ fn global_replace(s: &mut State, results: &[GlobalFindResult], query: &str, repl
         if let Some((pid, ti)) = find_tab_for_path(s, &path) {
             let collab = s.collab.is_some();
             let tab = &mut s.panes.get_mut(&pid).unwrap().tabs[ti];
-            let ms = find_matches(&tab.text, query, case_sensitive, false);
-            if ms.is_empty() { continue; }
+            let edits: Vec<(usize, usize, String)> = match &re {
+                Some(re) => search::rope_replacements(re, &tab.text, false, replace),
+                None => find_matches(&tab.text, query, case_sensitive, false).into_iter()
+                    .map(|(lo, hi)| (lo, hi, replace.to_owned())).collect(),
+            };
+            if edits.is_empty() { continue; }
             let before = tab.text.clone();
             if !collab { tab.push_undo_snapshot(limit); }
             tab.note_edit();
-            let n = ms.len();
-            let edits = ms.into_iter().map(|(lo, hi)| (lo, hi, replace.to_owned())).collect();
+            let n = edits.len();
             let mut cursors = std::mem::take(&mut tab.cursors);
             apply_char_edits(&mut tab.text, &mut cursors, edits);
             tab.cursors = cursors;
@@ -8286,7 +8340,11 @@ fn global_replace(s: &mut State, results: &[GlobalFindResult], query: &str, repl
                 errors.push(format!("{}: unreadable", local.display()));
                 continue;
             };
-            let Some((new_content, n)) = replace_in_text(&content, query, replace, case_sensitive) else { continue };
+            let replaced = match &re {
+                Some(re) => search::replace_in_str(re, &content, false, replace),
+                None => replace_in_text(&content, query, replace, case_sensitive),
+            };
+            let Some((new_content, n)) = replaced else { continue };
             let Ok(new_bytes) = encoding::encode(&new_content, enc) else {
                 errors.push(format!("{}: replacement not representable in {}", local.display(), enc.label()));
                 continue;
@@ -8556,7 +8614,7 @@ impl App {
                 query: String::new(), replace: String::new(),
                 include_glob: String::new(), exclude_glob: String::new(),
                 results: vec![], scroll: 0, selected: 0,
-                focus: GlobalFindFocus::Query, case_sensitive: false,
+                focus: GlobalFindFocus::Query, case_sensitive: false, regex: false,
                 live_search: false, search_fire_at: None,
                 searching: false, search_token: 0,
                 cursor_query: 0, cursor_replace: 0, cursor_include: 0, cursor_exclude: 0,
@@ -9739,7 +9797,15 @@ impl App {
                         let results_start_y = search_btn_y + row_h + 4 + lh;
                         if my >= fields_start_y && my < fields_start_y + 4 * row_h {
                             let fi = ((my - fields_start_y) / row_h).clamp(0, 3) as usize;
-                            if mx >= act_w + field_label_w {
+                            if fi == 0 && mx < act_w + field_label_w {
+                                // [Aa] / [.*] toggles in the query row's label area.
+                                let cell = (mx - act_w - 2) / s.glyphs.cw;
+                                if (0..4).contains(&cell) { s.global_find.case_sensitive = !s.global_find.case_sensitive; }
+                                else if (4..8).contains(&cell) { s.global_find.regex = !s.global_find.regex; }
+                                if s.global_find.live_search && !s.global_find.query.is_empty() {
+                                    s.global_find.search_fire_at = Some(Instant::now() + Duration::from_millis(150));
+                                }
+                            } else if mx >= act_w + field_label_w {
                                 let gf_field_w = s.explorer_w() - field_label_w - 4;
                                 let field_x    = act_w + field_label_w;
                                 let cw_g       = s.glyphs.cw;
@@ -9786,7 +9852,8 @@ impl App {
                                     let query   = s.global_find.query.clone();
                                     let replace = s.global_find.replace.clone();
                                     let cs      = s.global_find.case_sensitive;
-                                    global_replace(s, &results, &query, &replace, cs);
+                                    let rx      = s.global_find.regex;
+                                    global_replace(s, &results, &query, &replace, cs, rx);
                                     s.global_find.results.clear();
                                 }
                             } else {
@@ -10280,19 +10347,22 @@ impl App {
                     let cw      = s.glyphs.cw;
                     let rel_row = (my - find_y) / row_h;
                     if rel_row == 0 {
+                        let rx_len   = 4usize;
                         let aa_len   = 4usize;
                         let w_len    = 3usize;
-                        let toggle_w = (aa_len + 1 + w_len) as i32 * cw + 8;
+                        let toggle_w = (rx_len + 1 + aa_len + 1 + w_len) as i32 * cw + 8;
                         // Drawn at the pane's right edge, not the window's (split panes).
-                        let aa_x     = pane_rect.x + pane_rect.w - toggle_w;
+                        let rx_x     = pane_rect.x + pane_rect.w - toggle_w;
+                        let aa_x     = rx_x + (rx_len + 1) as i32 * cw;
                         let wl_x     = aa_x + (aa_len + 1) as i32 * cw;
-                        if mx >= aa_x && mx < wl_x { s.find_mut().case_sensitive = !s.find().case_sensitive; }
+                        if mx >= rx_x && mx < aa_x { s.find_mut().regex = !s.find().regex; }
+                        else if mx >= aa_x && mx < wl_x { s.find_mut().case_sensitive = !s.find().case_sensitive; }
                         else if mx >= wl_x         { s.find_mut().whole_word     = !s.find().whole_word; }
                         else {
                             // Click in query field — focus and position cursor
                             let lw = "Find: ".len() as i32 * cw;
                             let qx = pane_rect.x + 4 + lw;
-                            let qclip = aa_x - cw;
+                            let qclip = rx_x - cw;
                             let q_vis = ((qclip - qx) / cw).max(0) as usize;
                             let f = s.find_mut();
                             f.input_focused = true;
@@ -11305,7 +11375,22 @@ impl App {
                 }
 
                 // A visible find bar only intercepts keys while its input owns focus.
-                let find_handled = if s.find().open && s.find().input_focused {
+                let find_toggle = (s.mods.alt_key() && !s.mods.shift_key()).then(|| match event.physical_key {
+                    PhysicalKey::Code(KeyCode::KeyR) => Some(0),
+                    PhysicalKey::Code(KeyCode::KeyC) => Some(1),
+                    PhysicalKey::Code(KeyCode::KeyW) => Some(2),
+                    _ => None,
+                }).flatten();
+                let find_handled = if s.find().open && s.find().input_focused && find_toggle.is_some() {
+                    // Alt(+Cmd on macOS)+R / C / W: regex / case / whole-word toggles.
+                    let f = s.find_mut();
+                    match find_toggle {
+                        Some(0) => f.regex = !f.regex,
+                        Some(1) => f.case_sensitive = !f.case_sensitive,
+                        _ => f.whole_word = !f.whole_word,
+                    }
+                    true
+                } else if s.find().open && s.find().input_focused {
                     let key = &event.logical_key;
                     match key {
                         Key::Named(NamedKey::Escape) => {
@@ -12531,6 +12616,8 @@ struct PaneSnap {
     find_focus:     FindFocus,
     case_sensitive: bool,
     whole_word:     bool,
+    find_regex:     bool,
+    find_error:     Option<String>,
     find_query:     String,
     find_repl:      String,
     find_cursor_q:  usize,
@@ -12871,10 +12958,13 @@ fn render(s: &mut State) {
         // Refresh find-match cache if the query, flags, or file content changed.
         // Doing this in the mutable pre-pass means the snapshot pass just clones it.
         if pane.find.open && !pane.find.query.is_empty() {
-            let key = (pane.find.query.clone(), pane.find.case_sensitive, pane.find.whole_word);
+            let key = (pane.find.query.clone(), pane.find.case_sensitive, pane.find.whole_word, pane.find.regex);
             let gen = tab.edit_generation;
             if pane.find.match_cache_gen != gen || pane.find.match_cache_key != key {
-                pane.find.match_cache = find_matches(&tab.text, &key.0, key.1, key.2);
+                match find_bar_matches(&tab.text, &key.0, key.1, key.2, key.3) {
+                    Ok(m) => { pane.find.match_cache = m; pane.find.regex_error = None; }
+                    Err(e) => { pane.find.match_cache = Vec::new(); pane.find.regex_error = Some(e); }
+                }
                 pane.find.match_cache_gen = gen;
                 pane.find.match_cache_key = key;
             }
@@ -12917,6 +13007,7 @@ fn render(s: &mut State) {
                 cursors_snap: vec![], match_ranges: vec![],
                 find_open: false, find_repl_open: false, find_input_focused: false,
                 find_focus: FindFocus::Query, case_sensitive: false, whole_word: false,
+                find_regex: false, find_error: None,
                 find_query: String::new(), find_repl: String::new(),
                 find_cursor_q: 0, find_cursor_r: 0,
                 find_sel_q: None, find_sel_r: None,
@@ -12940,6 +13031,7 @@ fn render(s: &mut State) {
                 cursors_snap: vec![], match_ranges: vec![],
                 find_open: false, find_repl_open: false, find_input_focused: false,
                 find_focus: FindFocus::Query, case_sensitive: false, whole_word: false,
+                find_regex: false, find_error: None,
                 find_query: String::new(), find_repl: String::new(),
                 find_cursor_q: 0, find_cursor_r: 0,
                 find_sel_q: None, find_sel_r: None,
@@ -13058,6 +13150,8 @@ fn render(s: &mut State) {
             find_input_focused: pane.find.input_focused,
             find_focus: pane.find.focus, case_sensitive: pane.find.case_sensitive,
             whole_word: pane.find.whole_word,
+            find_regex: pane.find.regex,
+            find_error: pane.find.regex_error.clone(),
             find_query: fq, find_repl: pane.find.replace.clone(),
             find_cursor_q: pane.find.query[..clamp_byte_index(&pane.find.query, pane.find.cursor_query)].chars().count(),
             find_cursor_r: pane.find.replace[..clamp_byte_index(&pane.find.replace, pane.find.cursor_replace)].chars().count(),
@@ -13269,6 +13363,7 @@ fn render(s: &mut State) {
         include:  String, exclude: String,
         focus:    GlobalFindFocus,
         case_sensitive: bool,
+        regex: bool,
         live_search: bool,
         searching: bool,
         results:  Vec<(String, usize, String, usize, usize)>,
@@ -13287,6 +13382,7 @@ fn render(s: &mut State) {
             exclude: gf.exclude_glob.clone(),
             focus:   gf.focus,
             case_sensitive: gf.case_sensitive,
+            regex: gf.regex,
             live_search: gf.live_search,
             searching: gf.searching,
             results: gf.results.iter().map(|r| {
@@ -13592,7 +13688,16 @@ fn render(s: &mut State) {
                     ("Exclude: ", &gf.exclude, GlobalFindFocus::Exclude, gf.cursor_exclude, gf.sel_exc),
                 ];
                 for (label, value, foc, cursor_chars, sel_anc) in &fields {
-                    draw_str(buf, w, h, g, label, px + 2, fy + asc, FG_DIM, field_x);
+                    if *foc == GlobalFindFocus::Query {
+                        // The query row's label area holds the [Aa] / [.*] toggles
+                        // (click offsets in the sidebar click handler).
+                        draw_str(buf, w, h, g, if gf.case_sensitive { "[Aa]" } else { "[aa]" }, px + 2, fy + asc,
+                                 if gf.case_sensitive { ACCENT } else { FG_DIM }, field_x);
+                        draw_str(buf, w, h, g, "[.*]", px + 2 + 4 * cw, fy + asc,
+                                 if gf.regex { ACCENT } else { FG_DIM }, field_x);
+                    } else {
+                        draw_str(buf, w, h, g, label, px + 2, fy + asc, FG_DIM, field_x);
+                    }
                     let is_active = gf.focus == *foc;
                     let bg = if is_active { SEL_BG } else { BG };
                     fill(buf, w, h, field_x, fy, field_w, lh, bg);
@@ -14444,20 +14549,29 @@ fn render(s: &mut State) {
                 let lw        = label.len() as i32 * cw;
                 draw_str(buf, w, h, g, label, r.x + 4, row1_base, FG_DIM, clip_r);
 
+                // Toggles, right-aligned: [.*] regex, [Aa] case, [w] whole word.
+                // Widths must match the click handler (FIND_TOGGLES).
+                let rx_str   = "[.*]";
                 let aa_str   = if snap.case_sensitive { "[Aa]" } else { "[aa]" };
                 let ww_str   = if snap.whole_word     { "[W]"  } else { "[w]"  };
-                let toggle_w = (aa_str.len() + 1 + ww_str.len()) as i32 * cw + 8;
-                let aa_x     = clip_r - toggle_w;
+                let toggle_w = (rx_str.len() + 1 + aa_str.len() + 1 + ww_str.len()) as i32 * cw + 8;
+                let rx_x     = clip_r - toggle_w;
+                let aa_x     = rx_x + (rx_str.len() + 1) as i32 * cw;
                 let ww_x     = aa_x + (aa_str.len() + 1) as i32 * cw;
+                draw_str(buf, w, h, g, rx_str, rx_x, row1_base,
+                         if snap.find_regex { ACCENT } else { FG_DIM }, clip_r);
                 draw_str(buf, w, h, g, aa_str, aa_x, row1_base,
                          if snap.case_sensitive { ACCENT } else { FG_DIM }, clip_r);
                 draw_str(buf, w, h, g, ww_str, ww_x, row1_base,
                          if snap.whole_word     { ACCENT } else { FG_DIM }, clip_r);
 
-                let mc_str = format!("{} matches", snap.match_ranges.len());
-                let mc_w   = mc_str.len() as i32 * cw;
-                let mc_x   = aa_x - mc_w - cw;
-                draw_str(buf, w, h, g, &mc_str, mc_x, row1_base, FG_DIM, mc_x + mc_w + cw);
+                let (mc_str, mc_col) = match &snap.find_error {
+                    Some(_) => ("invalid regex".to_owned(), 0xFF5555u32),
+                    None => (format!("{} matches", snap.match_ranges.len()), FG_DIM),
+                };
+                let mc_w   = mc_str.chars().count() as i32 * cw;
+                let mc_x   = rx_x - mc_w - cw;
+                draw_str(buf, w, h, g, &mc_str, mc_x, row1_base, mc_col, mc_x + mc_w + cw);
 
                 let qx    = r.x + 4 + lw;
                 let qclip = mc_x - cw;
