@@ -431,6 +431,7 @@ enum CtxAction {
     OpenSettings,
     GotoDefinition,
     FindReferences,
+    RenameSymbol,
     FormatDocument,
     OrganizeImports,
     Copy, Cut, Paste,
@@ -529,6 +530,7 @@ enum CommandAction {
     IndentSpaces, IndentTabs, TabSize(usize), DetectIndent,
     RevertFile,
     SetTheme(usize),
+    TriggerSuggest, TriggerParameterHints, RenameSymbol, ShowHover,
     ReopenWithEncoding(encoding::Encoding),
     SaveWithEncoding(encoding::Encoding),
 }
@@ -571,6 +573,10 @@ const COMMANDS: &[CommandEntry] = &[
     CommandEntry { name: "Indentation: Tab Size 8", shortcut: "",             action: CommandAction::TabSize(8) },
     CommandEntry { name: "Indentation: Detect from Content", shortcut: "",    action: CommandAction::DetectIndent },
     CommandEntry { name: "File: Revert to Disk Version", shortcut: "",        action: CommandAction::RevertFile },
+    CommandEntry { name: "Trigger Suggest",        shortcut: "Ctrl+Space",       action: CommandAction::TriggerSuggest },
+    CommandEntry { name: "Trigger Parameter Hints", shortcut: "Ctrl+Shift+Space", action: CommandAction::TriggerParameterHints },
+    CommandEntry { name: "Rename Symbol",          shortcut: "F2",               action: CommandAction::RenameSymbol },
+    CommandEntry { name: "Show Hover",             shortcut: "",                 action: CommandAction::ShowHover },
     CommandEntry { name: "Theme: Tokyo Night",   shortcut: "", action: CommandAction::SetTheme(0) },
     CommandEntry { name: "Theme: Midnight",      shortcut: "", action: CommandAction::SetTheme(1) },
     CommandEntry { name: "Theme: Paper Light",   shortcut: "", action: CommandAction::SetTheme(2) },
@@ -2311,7 +2317,7 @@ pub enum UserEvent {
     TermOutput     { pane_id: usize, data: Box<[u8]> },
     LspOutput      { pane_id: usize, data: Vec<u8> },
     LspDiagnostics { path: VPath, diagnostics: Vec<Diagnostic> },
-    LspResponse    { server_id: usize, id: u64, result: serde_json::Value },
+    LspResponse    { server_id: usize, id: u64, result: serde_json::Value, error: Option<String> },
     LspServerStopped { server_id: usize },
     /// Another local-text process asked us (over the control socket) to stop the
     /// server with this `op_id`; reply with the outcome so it can free the slot.
@@ -2467,6 +2473,17 @@ struct State {
     /// The last session written (skip rewriting an unchanged one), and when.
     last_session_json: String,
     last_session_save: Instant,
+    /// LSP popups (at most one of each) and the inline rename box.
+    completion:  Option<CompletionPopup>,
+    hover:       Option<HoverPopup>,
+    signature:   Option<SignaturePopup>,
+    rename_box:  Option<RenameBox>,
+    /// Pending hover request: (pane, char offset, screen position).
+    hover_request: Option<(usize, usize, (i32, i32))>,
+    /// Mouse resting point and since when (hover info appears after a pause).
+    hover_dwell:   Option<(i32, i32, Instant)>,
+    /// Where the completion list was last drawn: (x, y, w, row height, first item).
+    completion_rect: Option<(i32, i32, i32, i32, usize)>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -3758,6 +3775,430 @@ fn organize_imports_edits(path: &VPath, result: &serde_json::Value, ssh_host: Op
     edit["documentChanges"].as_array()?.iter()
         .find(|dc| dc["textDocument"]["uri"].as_str().map_or(false, is_ours))
         .map(|dc| dc["edits"].clone())
+}
+
+// ── LSP: completion, hover, signature help, rename ───────────────────────────
+
+#[derive(Clone)]
+struct CompletionItem {
+    label:      String,
+    detail:     String,
+    kind:       u8,
+    insert:     String,
+    filter:     String,
+    sort:       String,
+    /// Char offset where the server's text edit starts (replaces up to the cursor).
+    edit_start: Option<usize>,
+    /// Extra edits (e.g. an auto-import) as char ranges in the text at request time.
+    additional: Vec<(usize, usize, String)>,
+}
+
+struct CompletionPopup {
+    pane:     usize,
+    buf_id:   usize,
+    anchor:   usize,
+    items:    Vec<CompletionItem>,
+    filtered: Vec<usize>,
+    selected: usize,
+    scroll:   usize,
+}
+
+struct HoverPopup {
+    pane:  usize,
+    lines: Vec<String>,
+    /// Where it was requested (screen px); it closes once the mouse moves away.
+    at:    (i32, i32),
+}
+
+struct SignaturePopup {
+    pane:   usize,
+    buf_id: usize,
+    label:  String,
+    /// Active parameter as a char range of `label`.
+    active: Option<(usize, usize)>,
+    doc:    String,
+    /// Line the help belongs to (moving off it closes the popup).
+    line:   usize,
+}
+
+struct RenameBox {
+    pane:   usize,
+    buf_id: usize,
+    pos:    usize,
+    text:   String,
+    cursor: usize,
+    sel:    Option<usize>,
+}
+
+const COMPLETION_ROWS: usize = 10;
+
+/// The active editor tab's file, language and server, when the server has finished
+/// initializing: (pane, tab, path, lang).
+fn active_lsp_target(s: &State) -> Option<(usize, usize, VPath, Lang)> {
+    let ti = active_editor_tab(s)?;
+    let pid = s.active_pane;
+    let tab = &s.panes[&pid].tabs[ti];
+    let path = tab.path.clone()?;
+    let lang = tab.lang();
+    let srv = s.lsp.server_for_lang_host(lang, path.ssh_host())?;
+    srv.initialized.then_some((pid, ti, path, lang))
+}
+
+fn word_start_before(text: &Rope, pos: usize) -> usize {
+    let mut a = pos.min(text.len_chars());
+    while a > 0 && State::is_word_char(text.char(a - 1)) { a -= 1; }
+    a
+}
+
+/// Ask the server for completions at the primary cursor (`trigger`: the trigger
+/// character just typed, if any).
+fn lsp_request_completion(s: &mut State, trigger: Option<char>) {
+    let Some((pid, ti, path, lang)) = active_lsp_target(s) else { return };
+    if s.panes[&pid].tabs[ti].cursors.len() != 1 { return; }
+    notify_lsp_change_for(s, pid, ti);
+    let tab = &s.panes[&pid].tabs[ti];
+    let pos = tab.primary().head;
+    let anchor = word_start_before(&tab.text, pos);
+    let (line, col) = char_to_lsp_position(&tab.text, pos);
+    if let Some(srv) = s.lsp.server_for_lang_host_mut(lang, path.ssh_host()) {
+        if srv.caps.completion { lsp::request_completion(srv, &path, line, col, anchor, trigger); }
+    }
+}
+
+fn lsp_request_signature_help(s: &mut State, trigger: Option<char>) {
+    let Some((pid, ti, path, lang)) = active_lsp_target(s) else { return };
+    notify_lsp_change_for(s, pid, ti);
+    let tab = &s.panes[&pid].tabs[ti];
+    let (line, col) = char_to_lsp_position(&tab.text, tab.primary().head);
+    if let Some(srv) = s.lsp.server_for_lang_host_mut(lang, path.ssh_host()) {
+        if srv.caps.signature_help { lsp::request_signature_help(srv, &path, line, col, trigger); }
+    }
+}
+
+/// Ask for hover info at char offset `pos` of the active tab in pane `pid`.
+fn lsp_request_hover(s: &mut State, pid: usize, pos: usize, at: (i32, i32)) {
+    let Some(pane) = s.panes.get(&pid) else { return };
+    let tab = pane.tab();
+    let Some(path) = tab.path.clone() else { return };
+    let lang = tab.lang();
+    let (line, col) = char_to_lsp_position(&tab.text, pos);
+    if s.lsp.server_for_lang_host(lang, path.ssh_host()).map_or(true, |srv| !srv.initialized || !srv.caps.hover) { return; }
+    let (ti, gen) = (pane.active, tab.edit_generation);
+    if tab.lsp_synced_gen != Some(gen) { notify_lsp_change_for(s, pid, ti); }
+    s.hover_request = Some((pid, pos, at));
+    if let Some(srv) = s.lsp.server_for_lang_host_mut(lang, path.ssh_host()) {
+        lsp::request_hover(srv, &path, line, col, pos);
+    }
+}
+
+/// After a character was typed into the editor: open/refresh completion and
+/// signature help as the server asks.
+fn lsp_after_typing(s: &mut State, typed: &str) {
+    let mut chars = typed.chars();
+    let (Some(ch), None) = (chars.next(), chars.next()) else {
+        s.completion = None;
+        return;
+    };
+    let Some((_, _, path, lang)) = active_lsp_target(s) else { return };
+    let Some(srv) = s.lsp.server_for_lang_host(lang, path.ssh_host()) else { return };
+    let caps = srv.caps.clone();
+    if caps.signature_help {
+        if caps.signature_triggers.contains(&ch) {
+            lsp_request_signature_help(s, Some(ch));
+        } else if ch == ')' {
+            s.signature = None;
+        }
+    }
+    if !caps.completion { return; }
+    if caps.completion_triggers.contains(&ch) {
+        s.completion = None;
+        lsp_request_completion(s, Some(ch));
+    } else if State::is_word_char(ch) {
+        if s.completion.is_some() {
+            refresh_completion(s);
+        } else {
+            lsp_request_completion(s, None);
+        }
+    } else {
+        s.completion = None;
+    }
+}
+
+/// Close popups whose context the cursor has left, and refilter the completion
+/// list against what has been typed since it opened.
+fn refresh_completion(s: &mut State) {
+    let Some(ti) = active_editor_tab(s) else {
+        s.completion = None;
+        s.signature = None;
+        return;
+    };
+    let pid = s.active_pane;
+    let tab = &s.panes[&pid].tabs[ti];
+    let pos = tab.primary().head;
+    if let Some(sig) = &s.signature {
+        let line = tab.text.char_to_line(pos.min(tab.text.len_chars()));
+        if sig.pane != pid || sig.buf_id != tab.buf_id || sig.line != line { s.signature = None; }
+    }
+    let Some(c) = &s.completion else { return };
+    let valid = c.pane == pid && c.buf_id == tab.buf_id && tab.cursors.len() == 1 && pos >= c.anchor
+        && (c.anchor..pos).all(|i| State::is_word_char(tab.text.char(i)));
+    if !valid { s.completion = None; return; }
+    let prefix: String = tab.text.slice(c.anchor..pos).chars().collect();
+    let c = s.completion.as_mut().unwrap();
+    let mut scored: Vec<(i32, usize)> = c.items.iter().enumerate()
+        .filter_map(|(i, it)| fuzzy_score(&prefix, &it.filter).map(|sc| (sc, i)))
+        .collect();
+    let items = &c.items;
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| items[a.1].sort.cmp(&items[b.1].sort)));
+    c.filtered = scored.into_iter().map(|(_, i)| i).collect();
+    c.selected = 0;
+    c.scroll = 0;
+    // Nothing left, or the only candidate is exactly what's typed: nothing to offer.
+    let exact = c.filtered.len() == 1 && c.items[c.filtered[0]].insert == prefix;
+    if c.filtered.is_empty() || exact { s.completion = None; }
+}
+
+/// Remove `$1`, `${2:default}` → `default`, `$0` placeholders from a snippet.
+fn strip_snippet(snippet: &str) -> String {
+    let mut out = String::with_capacity(snippet.len());
+    let chars: Vec<char> = snippet.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' if i + 1 < chars.len() => { out.push(chars[i + 1]); i += 2; }
+            '$' if i + 1 < chars.len() && chars[i + 1].is_ascii_digit() => {
+                i += 1;
+                while i < chars.len() && chars[i].is_ascii_digit() { i += 1; }
+            }
+            '$' if i + 1 < chars.len() && chars[i + 1] == '{' => {
+                // ${N:default} or ${N|a,b|}: keep the default / first choice.
+                let mut j = i + 2;
+                while j < chars.len() && chars[j].is_ascii_digit() { j += 1; }
+                let mut depth = 1;
+                let start = j + 1;
+                let mut k = j;
+                while k < chars.len() && depth > 0 {
+                    k += 1;
+                    match chars.get(k) { Some('{') => depth += 1, Some('}') => depth -= 1, _ => {} }
+                }
+                if chars.get(j) == Some(&':') {
+                    out.push_str(&strip_snippet(&chars[start.min(k)..k].iter().collect::<String>()));
+                } else if chars.get(j) == Some(&'|') {
+                    let inner: String = chars[start.min(k)..k].iter().collect();
+                    out.push_str(inner.trim_end_matches('|').split(',').next().unwrap_or(""));
+                }
+                i = k + 1;
+            }
+            c => { out.push(c); i += 1; }
+        }
+    }
+    out
+}
+
+fn parse_completion_items(text: &Rope, result: &serde_json::Value) -> Vec<CompletionItem> {
+    let list = if result.is_array() { result } else { &result["items"] };
+    let Some(arr) = list.as_array() else { return Vec::new() };
+    arr.iter().take(2000).filter_map(|it| {
+        let label = it["label"].as_str()?.to_owned();
+        let snippet = it["insertTextFormat"].as_u64() == Some(2);
+        let (mut insert, edit_start) = match it["textEdit"].as_object() {
+            Some(te) => {
+                let range = if te.contains_key("range") { &te["range"] } else { &te["insert"] };
+                let start = range["start"]["line"].as_u64().zip(range["start"]["character"].as_u64())
+                    .map(|(l, c)| lsp_position_to_char(text, l as usize, c as usize));
+                (te["newText"].as_str().unwrap_or(&label).to_owned(), start)
+            }
+            None => (it["insertText"].as_str().unwrap_or(&label).to_owned(), None),
+        };
+        if snippet { insert = strip_snippet(&insert); }
+        let additional = it["additionalTextEdits"].as_array()
+            .map(|e| lsp_edits_to_char_ranges(text, e)).unwrap_or_default();
+        Some(CompletionItem {
+            detail: it["detail"].as_str().unwrap_or("").lines().next().unwrap_or("").to_owned(),
+            kind: it["kind"].as_u64().unwrap_or(0) as u8,
+            filter: it["filterText"].as_str().unwrap_or(&label).to_owned(),
+            sort: it["sortText"].as_str().unwrap_or(&label).to_owned(),
+            insert, edit_start, additional, label,
+        })
+    }).collect()
+}
+
+/// Apply the selected completion: replace the word typed so far (or the server's
+/// edit range) with the item, plus its extra edits.
+fn accept_completion(s: &mut State) {
+    let Some(c) = s.completion.take() else { return };
+    let Some(item) = c.filtered.get(c.selected).and_then(|&i| c.items.get(i)).cloned() else { return };
+    let Some(ti) = active_editor_tab(s) else { return };
+    let pid = s.active_pane;
+    if pid != c.pane { return; }
+    let pos = s.panes[&pid].tabs[ti].primary().head;
+    let start = item.edit_start.unwrap_or(c.anchor).min(c.anchor).min(pos);
+    for ch in item.insert.chars() { s.glyphs.load(ch); }
+    s.push_undo(false);
+    let tab = s.tab_mut();
+    tab.text.remove(start..pos);
+    tab.text.insert(start, &item.insert);
+    let mut cursor = start + item.insert.chars().count();
+    // Extra edits that lie before the completion (auto-imports at the top of the file).
+    let mut extra: Vec<&(usize, usize, String)> = item.additional.iter().filter(|e| e.1 <= start).collect();
+    extra.sort_by_key(|e| std::cmp::Reverse(e.0));
+    for (lo, hi, t) in extra {
+        let (lo, hi) = (*lo.min(hi), *hi);
+        if hi > tab.text.len_chars() { continue; }
+        tab.text.remove(lo..hi);
+        tab.text.insert(lo, t);
+        cursor = (cursor + t.chars().count()).saturating_sub(hi - lo);
+    }
+    tab.cursors = vec![Cursor::new(cursor.min(tab.text.len_chars()))];
+    tab.dirty = true;
+    s.ensure_visible();
+    if item.insert.ends_with('(') { lsp_request_signature_help(s, Some('(')); }
+}
+
+/// Plain text of a hover result (MarkupContent, MarkedString or an array of them).
+fn hover_text(contents: &serde_json::Value) -> String {
+    match contents {
+        serde_json::Value::String(t) => t.clone(),
+        serde_json::Value::Array(a) => a.iter().map(hover_text).filter(|t| !t.is_empty()).collect::<Vec<_>>().join("\n---\n"),
+        serde_json::Value::Object(o) => o.get("value").and_then(|v| v.as_str()).unwrap_or("").to_owned(),
+        _ => String::new(),
+    }
+}
+
+/// Hover/markdown text → display lines: code fences dropped, wrapped at `width`,
+/// at most `max` lines.
+fn popup_lines(text: &str, width: usize, max: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in text.lines() {
+        let line = raw.trim_end();
+        if line.trim_start().starts_with("```") { continue; }
+        if line.is_empty() && out.last().map_or(true, |l| l.is_empty()) { continue; }
+        let chars: Vec<char> = line.chars().collect();
+        if chars.is_empty() { out.push(String::new()); }
+        for chunk in chars.chunks(width.max(10)) { out.push(chunk.iter().collect()); }
+        if out.len() >= max { out.truncate(max); out.push("…".to_owned()); break; }
+    }
+    while out.last().is_some_and(|l| l.is_empty()) { out.pop(); }
+    out
+}
+
+/// Apply an LSP WorkspaceEdit: open buffers are edited in place (undoable, left
+/// unsaved); local files that aren't open are opened in a background tab first.
+/// Returns (files changed, files skipped).
+fn apply_workspace_edit(s: &mut State, edit: &serde_json::Value, ssh_host: Option<&vpath::SshHost>) -> (usize, usize) {
+    let mut per_file: Vec<(String, serde_json::Value)> = Vec::new();
+    if let Some(changes) = edit["changes"].as_object() {
+        for (uri, edits) in changes { per_file.push((uri.clone(), edits.clone())); }
+    }
+    if let Some(dcs) = edit["documentChanges"].as_array() {
+        for dc in dcs {
+            if let (Some(uri), true) = (dc["textDocument"]["uri"].as_str(), dc["edits"].is_array()) {
+                per_file.push((uri.to_owned(), dc["edits"].clone()));
+            }
+        }
+    }
+    let (mut changed, mut skipped) = (0, 0);
+    for (uri, edits) in per_file {
+        let Some(path) = lsp_uri_to_vpath(&uri, ssh_host) else { skipped += 1; continue };
+        if find_tab_for_path(s, &path).is_none() {
+            if path.as_local_path().is_none() || open_background_tab(s, path.clone()).is_none() {
+                skipped += 1;
+                continue;
+            }
+        }
+        if apply_text_edits(s, &path, &edits, None) { changed += 1; }
+    }
+    (changed, skipped)
+}
+
+/// F2: open the rename box on the word at the cursor.
+fn start_rename(s: &mut State) {
+    let Some((pid, ti, path, lang)) = active_lsp_target(s) else {
+        s.status_msg = Some("Rename needs a running language server for this file".to_owned());
+        return;
+    };
+    if !s.lsp.server_for_lang_host(lang, path.ssh_host()).is_some_and(|srv| srv.caps.rename) {
+        s.status_msg = Some("This language server can't rename symbols".to_owned());
+        return;
+    }
+    let tab = &s.panes[&pid].tabs[ti];
+    let pos = tab.primary().head;
+    let (lo, hi) = word_bounds_at(tab, pos);
+    if lo == hi { s.status_msg = Some("Place the cursor on a symbol to rename it".to_owned()); return; }
+    let text: String = tab.text.slice(lo..hi).chars().collect();
+    s.completion = None;
+    s.rename_box = Some(RenameBox { pane: pid, buf_id: tab.buf_id, pos: lo, cursor: text.len(), sel: Some(0), text });
+}
+
+fn submit_rename(s: &mut State) {
+    let Some(rb) = s.rename_box.take() else { return };
+    let new_name = rb.text.trim().to_owned();
+    if new_name.is_empty() { return; }
+    let Some((pid, ti, path, lang)) = active_lsp_target(s) else { return };
+    if pid != rb.pane || s.panes[&pid].tabs[ti].buf_id != rb.buf_id { return; }
+    notify_lsp_change_for(s, pid, ti);
+    let tab = &s.panes[&pid].tabs[ti];
+    let (line, col) = char_to_lsp_position(&tab.text, rb.pos);
+    let gen = tab.edit_generation;
+    if let Some(srv) = s.lsp.server_for_lang_host_mut(lang, path.ssh_host()) {
+        lsp::request_rename(srv, &path, line, col, &new_name, gen);
+        s.status_msg = Some(format!("Renaming to {new_name}…"));
+    }
+}
+
+const HOVER_DELAY: Duration = Duration::from_millis(600);
+
+/// The mouse rested at (x, y): if it's over a word in an editor, ask for hover info.
+fn hover_at_mouse(s: &mut State, x: i32, y: i32) {
+    if s.context_menu.is_some() || s.quick_finder.open || s.drag.is_some() { return; }
+    let area = s.pane_area();
+    let Some(pid) = pane_at_pos(&s.pane_tree, x, y, area) else { return };
+    let Some(pane) = s.panes.get(&pid) else { return };
+    if pane.kind != PaneKind::Editor || pane.tab().kind != TabKind::Editor { return; }
+    let Some(rect) = layout_tree(&s.pane_tree, area).into_iter().find(|(id, _)| *id == pid).map(|(_, r)| r) else { return };
+    let gutter = State::gutter_w(pane.tab().text.len_lines(), s.glyphs.cw);
+    let text_top = rect.y + s.tab_h();
+    let text_bot = rect.y + rect.h - State::pane_find_h(pane, s.glyphs.lh);
+    if x < rect.x + gutter || y < text_top || y >= text_bot { return; }
+    let pos = s.pane_xy_to_char(pid, rect, x, y);
+    let text = &s.panes[&pid].tab().text;
+    if pos >= text.len_chars() || !State::is_word_char(text.char(pos)) { return; }
+    lsp_request_hover(s, pid, pos, (x, y));
+}
+
+/// Screen position (x, top y) of the active tab's primary cursor.
+fn caret_screen_xy(s: &State) -> Option<(i32, i32)> {
+    let pid = s.active_pane;
+    let r = s.active_pane_rect();
+    let lay = s.view_layout(pid);
+    let t = s.panes.get(&pid)?.tab();
+    let (line, row, vx) = State::pos_visual(&t.text, t.primary().head, lay);
+    let sub = if lay.wrap.is_some() { t.scroll_sub } else { 0 };
+    let n = layout::rows_between(&t.text, t.scroll, sub, line, row, lay, 10_000)? as i32;
+    let x = r.x + State::gutter_w(t.text.len_lines(), s.glyphs.cw) + (vx as i32 - t.hscroll as i32) * s.glyphs.cw;
+    Some((x, r.y + s.tab_h() + n * s.glyphs.lh))
+}
+
+/// Screen position (x, top y) of line/col in an editor pane snapshot, if visible.
+fn snap_xy(snap: &PaneSnap, line: usize, col: usize, tab_h: i32, lh: i32, cw: i32) -> Option<(i32, i32)> {
+    let (vi, row) = snap.rows.iter().enumerate().find(|(_, r)| r.li == line && r.owns_col(col))?;
+    let x = snap.rect.x + snap.gutter_w + (row.cell(col) - snap.hscroll as i32) * cw;
+    Some((x, snap.rect.y + tab_h + vi as i32 * lh))
+}
+
+/// One-letter tag (and color) for an LSP CompletionItemKind.
+fn completion_kind_tag(kind: u8) -> (char, u32) {
+    match kind {
+        2 | 3 | 4 => ('f', th().hl_func),        // method, function, constructor
+        5 | 10    => ('p', th().fg),             // field, property
+        6 | 21    => ('v', th().fg),             // variable, constant
+        7 | 8 | 22 | 25 => ('t', th().hl_type),  // class, interface, struct, type param
+        9         => ('m', th().hl_type),        // module
+        13 | 20   => ('e', th().hl_number),      // enum, enum member
+        14        => ('k', th().hl_keyword),     // keyword
+        15        => ('s', th().hl_string),      // snippet
+        _         => ('·', th().fg_dim),
+    }
 }
 
 // ── Cursor position history ───────────────────────────────────────────────────
@@ -7651,6 +8092,18 @@ fn execute_command(s: &mut State, action: CommandAction) {
         }
         CommandAction::CloseTab       => { /* needs the event loop to exit: see quick_finder_accept */ }
         CommandAction::ToggleWordWrap => toggle_word_wrap(s),
+        CommandAction::TriggerSuggest => lsp_request_completion(s, None),
+        CommandAction::TriggerParameterHints => lsp_request_signature_help(s, None),
+        CommandAction::RenameSymbol => start_rename(s),
+        CommandAction::ShowHover => {
+            if active_editor_tab(s).is_some() {
+                let pid = s.active_pane;
+                let pos = s.tab().primary().head;
+                if let Some((x, y)) = caret_screen_xy(s) {
+                    lsp_request_hover(s, pid, pos, (x, y + s.glyphs.lh));
+                }
+            }
+        }
         CommandAction::SetTheme(i) => {
             let Some(t) = theme::BUILTIN.get(i) else { return };
             s.settings.theme = t.name.to_owned();
@@ -8782,6 +9235,8 @@ impl App {
             overwrite_armed: None,
             last_session_json: String::new(),
             last_session_save: Instant::now(),
+            completion: None, hover: None, signature: None, rename_box: None,
+            hover_request: None, hover_dwell: None, completion_rect: None,
         };
 
         if let Some(path) = initial_lsp_path {
@@ -8872,6 +9327,20 @@ impl App {
                 s.mouse_y = position.y as f32;
                 let mx = s.mouse_x as i32;
                 let my = s.mouse_y as i32;
+
+                // Hover info: shown after the mouse rests; closed once it moves away.
+                if let Some(hv) = &s.hover {
+                    let far = 3 * s.glyphs.cw;
+                    if (mx - hv.at.0).abs() > far || (my - hv.at.1).abs() > s.glyphs.lh {
+                        s.hover = None;
+                        { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                    }
+                }
+                let moved = s.hover_dwell.map_or(true, |(x, y, _)| (x - mx).abs() > 2 || (y - my).abs() > 2);
+                if moved {
+                    s.hover_dwell = (!s.mouse_down).then(|| (mx, my, Instant::now()));
+                    s.hover_request = None;
+                }
 
                 // Explorer border drag
                 if s.explorer_drag {
@@ -9322,6 +9791,7 @@ impl App {
                             let mut items = vec![
                                 ContextMenuItem { label: "Go to Definition",    shortcut: "Cmd+Click / F12", action: CtxAction::GotoDefinition,  enabled: lsp_avail },
                                 ContextMenuItem { label: "Find All References", shortcut: "Cmd+Shift+F12",   action: CtxAction::FindReferences,  enabled: lsp_avail },
+                                ContextMenuItem { label: "Rename Symbol",       shortcut: "F2",              action: CtxAction::RenameSymbol,    enabled: lsp_avail },
                                 ContextMenuItem { label: "Format Document",     shortcut: "Opt+Shift+F",     action: CtxAction::FormatDocument,  enabled: lsp_avail },
                                 ContextMenuItem { label: "Organize Imports",    shortcut: "Opt+Shift+O",     action: CtxAction::OrganizeImports, enabled: lsp_avail },
                                 ContextMenuItem { label: "",                    shortcut: "",                action: CtxAction::Separator,       enabled: true },
@@ -9355,6 +9825,23 @@ impl App {
                 let alt = s.mods.alt_key();
                 let cmd = primary_mod(s.mods);
                 let shift = s.mods.shift_key();
+
+                // LSP popups: a click on a completion accepts it; anywhere else closes them.
+                s.hover = None;
+                s.rename_box = None;
+                if let (Some(_), Some((x, y, cw_px, row_h, first))) = (&s.completion, s.completion_rect) {
+                    let rows = s.completion.as_ref().map_or(0, |c| c.filtered.len().min(COMPLETION_ROWS)) as i32;
+                    if mx >= x && mx < x + cw_px && my >= y && my < y + rows * row_h {
+                        if let Some(c) = s.completion.as_mut() { c.selected = first + ((my - y) / row_h) as usize; }
+                        accept_completion(s);
+                        notify_lsp_change(s);
+                        notify_collab_change(s);
+                        { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                        return;
+                    }
+                }
+                s.completion = None;
+                s.signature = None;
 
                 // Quick finder overlay click (must run before other handlers)
                 if s.quick_finder.open {
@@ -9476,6 +9963,7 @@ impl App {
                                 CtxAction::OpenSettings    => open_settings_tab(s),
                                 CtxAction::GotoDefinition  => execute_command(s, CommandAction::GotoDefinition),
                                 CtxAction::FindReferences  => execute_command(s, CommandAction::FindReferences),
+                                CtxAction::RenameSymbol    => execute_command(s, CommandAction::RenameSymbol),
                                 CtxAction::FormatDocument  => execute_command(s, CommandAction::FormatDocument),
                                 CtxAction::OrganizeImports => execute_command(s, CommandAction::OrganizeImports),
                                 CtxAction::Copy  => { execute_command(s, CommandAction::Copy); }
@@ -10645,6 +11133,8 @@ impl App {
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
+                s.hover = None;
+                s.completion = None;
                 let (dx, dy) = match delta {
                     MouseScrollDelta::LineDelta(x, y) => (-x as i32, -y as i32),
                     MouseScrollDelta::PixelDelta(p)   => {
@@ -11529,6 +12019,70 @@ impl App {
                     return;
                 }
 
+                // ── LSP popups and the rename box ──────────────────────────────
+                if !is_modifier_key(&event.logical_key) { s.hover = None; }
+                if s.rename_box.is_some() {
+                    match &event.logical_key {
+                        Key::Named(NamedKey::Escape) => s.rename_box = None,
+                        Key::Named(NamedKey::Enter)  => submit_rename(s),
+                        key => {
+                            let rb = s.rename_box.as_mut().unwrap();
+                            input_field_edit(&mut rb.text, &mut rb.cursor, &mut rb.sel, key, cmd, alt, ctrl, shift);
+                            for ch in rb.text.clone().chars() { s.glyphs.load(ch); }
+                        }
+                    }
+                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                    return;
+                }
+                let editor_active = active_editor_tab(s).is_some()
+                    && !s.find().input_focused && !sidebar_text_field_focused(s);
+                if editor_active && s.completion.as_ref().is_some_and(|c| c.pane == s.active_pane) && !cmd && !alt {
+                    let consumed = match &event.logical_key {
+                        Key::Named(NamedKey::ArrowDown | NamedKey::ArrowUp | NamedKey::PageDown | NamedKey::PageUp) => {
+                            let c = s.completion.as_mut().unwrap();
+                            let n = c.filtered.len().max(1);
+                            c.selected = match &event.logical_key {
+                                Key::Named(NamedKey::ArrowDown) => (c.selected + 1) % n,
+                                Key::Named(NamedKey::ArrowUp)   => (c.selected + n - 1) % n,
+                                Key::Named(NamedKey::PageDown)  => (c.selected + COMPLETION_ROWS).min(n - 1),
+                                _                               => c.selected.saturating_sub(COMPLETION_ROWS),
+                            };
+                            if c.selected < c.scroll { c.scroll = c.selected; }
+                            if c.selected >= c.scroll + COMPLETION_ROWS { c.scroll = c.selected + 1 - COMPLETION_ROWS; }
+                            true
+                        }
+                        Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Tab) if !shift => {
+                            accept_completion(s);
+                            notify_lsp_change(s);
+                            notify_collab_change(s);
+                            true
+                        }
+                        Key::Named(NamedKey::Escape) => { s.completion = None; true }
+                        _ => false,
+                    };
+                    if consumed {
+                        s.reset_blink();
+                        { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                        return;
+                    }
+                }
+                if editor_active && s.signature.is_some() && matches!(&event.logical_key, Key::Named(NamedKey::Escape)) {
+                    s.signature = None;
+                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                    return;
+                }
+                // Ctrl+Space / Ctrl+Shift+Space (on Linux/Windows `cmd` is Ctrl too).
+                if editor_active && ctrl && (!MACOS || !cmd) && matches!(&event.logical_key, Key::Named(NamedKey::Space)) {
+                    if shift { lsp_request_signature_help(s, None); } else { lsp_request_completion(s, None); }
+                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                    return;
+                }
+                if editor_active && matches!(&event.logical_key, Key::Named(NamedKey::F2)) && !shift && !cmd {
+                    start_rename(s);
+                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                    return;
+                }
+
                 // A visible find bar only intercepts keys while its input owns focus.
                 let find_toggle = (s.mods.alt_key() && !s.mods.shift_key()).then(|| match event.physical_key {
                     PhysicalKey::Code(KeyCode::KeyR) => Some(0),
@@ -11604,6 +12158,7 @@ impl App {
                     let read_only = active_tab_kind != Some(TabKind::Editor) || collab_ro;
 
                     // Main editor keyboard handling
+                    let mut typed_now: Option<String> = None;
                     let handled =
                         if read_only && (cmd || alt || ctrl) && matches!(&event.logical_key,
                             Key::Character(c) if if collab_ro {
@@ -11956,6 +12511,7 @@ impl App {
                                         if let Some(txt) = event.text.as_deref() {
                                             for ch in txt.chars() { s.glyphs.load(ch); }
                                             s.insert_str(txt);
+                                            typed_now = Some(txt.to_owned());
                                         }
                                     }
                                 }
@@ -11964,6 +12520,10 @@ impl App {
                             false
                         };
 
+                    match typed_now {
+                        Some(t) => lsp_after_typing(s, &t),
+                        None => refresh_completion(s),
+                    }
                     notify_lsp_change(s);
                     notify_collab_change(s);
                     send_collab_cursor_if_needed(s);
@@ -11988,6 +12548,12 @@ impl App {
                 notify_collab_change(s);
                 send_collab_cursor_if_needed(s);
             }
+            if let Some((x, y, since)) = s.hover_dwell {
+                if since.elapsed() >= HOVER_DELAY && s.hover.is_none() && s.window_focused {
+                    s.hover_dwell = None;
+                    hover_at_mouse(s, x, y);
+                }
+            }
             if s.last_session_save.elapsed() >= Duration::from_secs(30) {
                 s.last_session_save = Instant::now();
                 save_session(s);
@@ -12002,11 +12568,12 @@ impl App {
                 s.needs_redraw = false;
                 s.win.request_redraw();
             }
-            let next_wake = if let Some(fire_at) = s.global_find.search_fire_at {
+            let mut next_wake = if let Some(fire_at) = s.global_find.search_fire_at {
                 fire_at.min(s.cursor_blink)
             } else {
                 s.cursor_blink
             };
+            if let Some((_, _, since)) = s.hover_dwell { next_wake = next_wake.min(since + HOVER_DELAY); }
             el.set_control_flow(ControlFlow::WaitUntil(next_wake));
         } else {
             el.set_control_flow(ControlFlow::Wait);
@@ -12034,6 +12601,7 @@ impl App {
                     if !srv.initialized {
                         if let Ok(text) = String::from_utf8(data) {
                             if lsp::is_initialize_response(&text) {
+                                srv.caps = lsp::ServerCaps::from_initialize_response(&text);
                                 lsp::send_initialized(srv);
                                 initialized_key = Some((srv.ssh_host.clone(), srv.lang));
                             }
@@ -12061,7 +12629,7 @@ impl App {
                 }
                 s.diagnostics.insert(key, diagnostics);
             }
-            UserEvent::LspResponse { server_id, id, result } => {
+            UserEvent::LspResponse { server_id, id, result, error } => {
                 let (kind, ssh_host) = s.lsp.servers.get_mut(&server_id)
                     .map(|srv| (srv.pending.remove(&id), srv.ssh_host.clone()))
                     .unwrap_or((None, None));
@@ -12096,6 +12664,75 @@ impl App {
                             }
                         } else if changed && save_after {
                             if let Some((pid, ti)) = find_tab_for_path(s, &path) { save_tab(s, pid, ti); }
+                        }
+                    }
+                    Some(lsp::PendingKind::Completion { path, anchor }) => {
+                        let Some((pid, ti, apath, _)) = active_lsp_target(s) else { return };
+                        if !apath.same_file(&path) { return; }
+                        let tab = &s.panes[&pid].tabs[ti];
+                        let pos = tab.primary().head;
+                        // Still typing the same word the request was for?
+                        if word_start_before(&tab.text, pos) != anchor || tab.cursors.len() != 1 { return; }
+                        let items = parse_completion_items(&tab.text, &result);
+                        if items.is_empty() { s.completion = None; return; }
+                        for it in &items { for ch in it.label.chars().chain(it.detail.chars()) { s.glyphs.load(ch); } }
+                        let buf_id = tab.buf_id;
+                        s.completion = Some(CompletionPopup {
+                            pane: pid, buf_id, anchor, items, filtered: Vec::new(), selected: 0, scroll: 0,
+                        });
+                        refresh_completion(s);
+                    }
+                    Some(lsp::PendingKind::Hover { path, pos }) => {
+                        let Some((pid, rpos, at)) = s.hover_request.take() else { return };
+                        if rpos != pos { return; }
+                        let same = s.panes.get(&pid).and_then(|p| p.tab().path.as_ref()).is_some_and(|p| p.same_file(&path));
+                        let text = hover_text(&result["contents"]);
+                        let lines = popup_lines(&text, 90, 18);
+                        if !same || lines.is_empty() { s.hover = None; return; }
+                        for l in &lines { for ch in l.chars() { s.glyphs.load(ch); } }
+                        s.hover = Some(HoverPopup { pane: pid, lines, at });
+                    }
+                    Some(lsp::PendingKind::SignatureHelp { path }) => {
+                        let Some((pid, ti, apath, _)) = active_lsp_target(s) else { return };
+                        if !apath.same_file(&path) { return; }
+                        let sigs = result["signatures"].as_array().cloned().unwrap_or_default();
+                        let idx = result["activeSignature"].as_u64().unwrap_or(0) as usize;
+                        let Some(sig) = sigs.get(idx).or(sigs.first()) else { s.signature = None; return };
+                        let label = sig["label"].as_str().unwrap_or("").to_owned();
+                        let ap = sig["activeParameter"].as_u64().or(result["activeParameter"].as_u64()).unwrap_or(0) as usize;
+                        let active = sig["parameters"].as_array().and_then(|ps| ps.get(ap)).and_then(|p| {
+                            match &p["label"] {
+                                serde_json::Value::String(name) => label.find(name.as_str())
+                                    .map(|b| { let a = label[..b].chars().count(); (a, a + name.chars().count()) }),
+                                serde_json::Value::Array(r) => {
+                                    // UTF-16 offsets into the label.
+                                    let (a, b) = (r.first()?.as_u64()? as usize, r.get(1)?.as_u64()? as usize);
+                                    let to_char = |u: usize| { let mut n = 0; let mut c = 0; for ch in label.chars() { if n >= u { break; } n += ch.len_utf16(); c += 1; } c };
+                                    Some((to_char(a), to_char(b)))
+                                }
+                                _ => None,
+                            }
+                        });
+                        let doc = popup_lines(&hover_text(&sig["documentation"]), 90, 1).into_iter().next().unwrap_or_default();
+                        for ch in label.chars().chain(doc.chars()) { s.glyphs.load(ch); }
+                        let tab = &s.panes[&pid].tabs[ti];
+                        let line = tab.text.char_to_line(tab.primary().head.min(tab.text.len_chars()));
+                        s.signature = Some(SignaturePopup { pane: pid, buf_id: tab.buf_id, label, active, doc, line });
+                    }
+                    Some(lsp::PendingKind::Rename { path, generation }) => {
+                        if let Some(e) = error {
+                            s.status_msg = Some(format!("Rename failed: {e}"));
+                        } else if result.is_null() {
+                            s.status_msg = Some("Nothing to rename here".to_owned());
+                        } else if find_tab_for_path(s, &path).is_some_and(|(p, t)| s.panes[&p].tabs[t].edit_generation != generation) {
+                            s.status_msg = Some("Rename skipped: the file changed while the server was working".to_owned());
+                        } else {
+                            let (files, skipped) = apply_workspace_edit(s, &result, ssh_host.as_ref());
+                            s.status_msg = Some(if skipped > 0 {
+                                format!("Renamed in {files} file(s); {skipped} remote file(s) that aren't open were skipped")
+                            } else {
+                                format!("Renamed in {files} file(s) — review and save")
+                            });
                         }
                     }
                     None => {}
@@ -13682,6 +14319,79 @@ fn render(s: &mut State) {
         (rows, p.selected)
     });
 
+    // ── LSP popups (positions resolved against the active pane's snapshot) ─────
+    struct PopupBox { x: i32, y: i32, w: i32, h: i32 }
+    let win_w = s.w as i32;
+    let win_h = s.h as i32 - status_h;
+    let active_snap = pane_snaps.iter().find(|p| p.is_active && !p.is_settings_tab && !p.is_git_diff_tab);
+    let caret_xy = active_snap.and_then(|sn| snap_xy(sn, sn.cur_line, sn.cur_col, tab_h, lh, cw));
+    // Completion: (box, rows of (tag, tag color, label, detail, selected), first index)
+    let mut completion_snap: Option<(PopupBox, Vec<(char, u32, String, String, bool)>, usize, usize)> = None;
+    s.completion_rect = None;
+    if let (Some(c), Some(sn), Some((cx, cy))) = (&s.completion, active_snap, caret_xy) {
+        if c.pane == sn.id && !c.filtered.is_empty() {
+            let text = &s.panes[&sn.id].tab().text;
+            let a = c.anchor.min(text.len_chars());
+            let aline = text.char_to_line(a);
+            let ax = snap_xy(sn, aline, a - text.line_to_char(aline), tab_h, lh, cw).map_or(cx, |(x, _)| x);
+            let end = (c.scroll + COMPLETION_ROWS).min(c.filtered.len());
+            let rows: Vec<(char, u32, String, String, bool)> = (c.scroll..end).map(|k| {
+                let it = &c.items[c.filtered[k]];
+                let (tag, col) = completion_kind_tag(it.kind);
+                (tag, col, it.label.chars().take(48).collect(), it.detail.chars().take(36).collect(), k == c.selected)
+            }).collect();
+            let label_w = rows.iter().map(|r| r.2.chars().count()).max().unwrap_or(1) as i32;
+            let detail_w = rows.iter().map(|r| r.3.chars().count()).max().unwrap_or(0) as i32;
+            let bw = (2 + label_w + if detail_w > 0 { 2 + detail_w } else { 0 }) * cw + 8;
+            let bh = rows.len() as i32 * lh + 4;
+            let bx = (ax - 2 * cw - 4).min(win_w - bw).max(0);
+            let by = if cy + lh + bh <= win_h { cy + lh } else { (cy - bh).max(0) };
+            s.completion_rect = Some((bx, by + 2, bw, lh, c.scroll));
+            completion_snap = Some((PopupBox { x: bx, y: by, w: bw, h: bh }, rows, c.scroll, c.filtered.len()));
+        }
+    }
+    // Hover: (box, lines)
+    let hover_snap: Option<(PopupBox, Vec<String>)> = s.hover.as_ref().map(|hv| {
+        let tw = hv.lines.iter().map(|l| l.chars().count()).max().unwrap_or(1) as i32;
+        let bw = (tw * cw + 12).min(win_w);
+        let bh = hv.lines.len() as i32 * lh + 8;
+        let bx = (hv.at.0 - cw).min(win_w - bw).max(0);
+        let by = if hv.at.1 + lh + bh <= win_h { hv.at.1 + lh } else { (hv.at.1 - bh - 4).max(0) };
+        let _ = hv.pane;
+        (PopupBox { x: bx, y: by, w: bw, h: bh }, hv.lines.clone())
+    });
+    // Signature help: (box, label, active param char range, doc)
+    let signature_snap: Option<(PopupBox, String, Option<(usize, usize)>, String)> = match (&s.signature, caret_xy, active_snap) {
+        (Some(sg), Some((cx, cy)), Some(sn)) if sg.pane == sn.id => {
+            let label: String = sg.label.chars().take(160).collect();
+            let doc: String = sg.doc.chars().take(160).collect();
+            let tw = label.chars().count().max(doc.chars().count()) as i32;
+            let nlines = if doc.is_empty() { 1 } else { 2 };
+            let bw = (tw * cw + 12).min(win_w);
+            let bh = nlines * lh + 6;
+            let bx = (cx - 2 * cw).min(win_w - bw).max(0);
+            let by = if cy - bh - 2 >= 0 { cy - bh - 2 } else { cy + lh + 2 };
+            Some((PopupBox { x: bx, y: by, w: bw, h: bh }, label, sg.active, doc))
+        }
+        _ => None,
+    };
+    // Rename box: (box, text, cursor chars, selection anchor chars)
+    let rename_snap: Option<(PopupBox, String, usize, Option<usize>)> = s.rename_box.as_ref().and_then(|rb| {
+        let sn = pane_snaps.iter().find(|p| p.id == rb.pane)?;
+        let text = &s.panes.get(&rb.pane)?.tab().text;
+        let p = rb.pos.min(text.len_chars());
+        let line = text.char_to_line(p);
+        let (x, y) = snap_xy(sn, line, p - text.line_to_char(line), tab_h, lh, cw)?;
+        let chars = rb.text.chars().count() as i32;
+        let bw = ((chars + 4).max(24) * cw + 8).min(win_w);
+        let bx = (x - 4).min(win_w - bw).max(0);
+        let by = (y + lh).min(win_h - lh - 6).max(0);
+        let cur = rb.text[..clamp_byte_index(&rb.text, rb.cursor)].chars().count();
+        let sel = rb.sel.map(|a| rb.text[..clamp_byte_index(&rb.text, a)].chars().count());
+        Some((PopupBox { x: bx, y: by, w: bw, h: lh + 6 }, rb.text.clone(), cur, sel))
+    });
+    let hover_tip = if hover_snap.is_some() { None } else { hover_tip };
+
     // SAFETY: render_frame takes FnOnce and calls it synchronously before returning.
     // s.glyphs is alive for the entire duration, and renderer does not alias glyphs.
     let glyphs = &s.glyphs as *const Glyphs;
@@ -15144,6 +15854,68 @@ fn render(s: &mut State) {
             fill(buf, w, h, tip_x + tip_w - 1, tip_y, 1, tip_h, th().border);
             draw_str(buf, w, h, g, &disp, tip_x + 4, tip_y + 2 + asc, th().fg, tip_x + tip_w - 1);
         }
+
+        // ── LSP popups ────────────────────────────────────────────────────
+        let frame = |buf: &mut [u32], b: &PopupBox| {
+            fill(buf, w, h, b.x, b.y, b.w, b.h, th().bg2);
+            fill(buf, w, h, b.x, b.y, b.w, 1, th().border);
+            fill(buf, w, h, b.x, b.y + b.h - 1, b.w, 1, th().border);
+            fill(buf, w, h, b.x, b.y, 1, b.h, th().border);
+            fill(buf, w, h, b.x + b.w - 1, b.y, 1, b.h, th().border);
+        };
+        if let Some((b, label, active, doc)) = &signature_snap {
+            frame(buf, b);
+            let base = b.y + 3 + asc;
+            for (i, ch) in label.chars().enumerate() {
+                let on = active.is_some_and(|(a, z)| i >= a && i < z);
+                let x = b.x + 6 + i as i32 * cw;
+                if x + cw > b.x + b.w { break; }
+                if on { fill(buf, w, h, x, b.y + 3 + lh - 2, cw, 1, th().accent); }
+                if let Some((m, bmap)) = g.get(ch) {
+                    blit(buf, w, h, bmap, m, x, base, if on { th().accent } else { th().fg });
+                }
+            }
+            if !doc.is_empty() {
+                draw_str(buf, w, h, g, doc, b.x + 6, base + lh, th().fg_dim, b.x + b.w - 2);
+            }
+        }
+        if let Some((b, lines)) = &hover_snap {
+            frame(buf, b);
+            for (i, line) in lines.iter().enumerate() {
+                draw_str(buf, w, h, g, line, b.x + 6, b.y + 4 + i as i32 * lh + asc, th().fg, b.x + b.w - 2);
+            }
+        }
+        if let Some((b, rows, first, total)) = &completion_snap {
+            frame(buf, b);
+            for (i, (tag, tag_col, label, detail, sel)) in rows.iter().enumerate() {
+                let ry = b.y + 2 + i as i32 * lh;
+                if *sel { fill(buf, w, h, b.x + 1, ry, b.w - 2, lh, th().sel_bg); }
+                draw_str(buf, w, h, g, &tag.to_string(), b.x + 4, ry + asc, *tag_col, b.x + 4 + cw);
+                draw_str(buf, w, h, g, label, b.x + 4 + 2 * cw, ry + asc, if *sel { th().fg } else { th().fg }, b.x + b.w - 2);
+                if !detail.is_empty() {
+                    let dx = b.x + b.w - 4 - detail.chars().count() as i32 * cw;
+                    draw_str(buf, w, h, g, detail, dx, ry + asc, th().fg_dim, b.x + b.w - 2);
+                }
+            }
+            // Scroll indicator when the list is longer than the box.
+            if *total > rows.len() {
+                let track = b.h - 4;
+                let th_h = (track * rows.len() as i32 / *total as i32).max(4);
+                let ty = b.y + 2 + (track - th_h) * *first as i32 / (*total - rows.len()).max(1) as i32;
+                fill(buf, w, h, b.x + b.w - 3, ty, 2, th_h, th().sb_thumb);
+            }
+        }
+        if let Some((b, text, cur, sel)) = &rename_snap {
+            frame(buf, b);
+            fill(buf, w, h, b.x, b.y + b.h - 1, b.w, 1, th().accent);
+            let tx = b.x + 4;
+            if let Some(a) = sel {
+                let (lo, hi) = ((*a).min(*cur), (*a).max(*cur));
+                if hi > lo { fill(buf, w, h, tx + lo as i32 * cw, b.y + 3, (hi - lo) as i32 * cw, lh, th().sel_bg); }
+            }
+            draw_str(buf, w, h, g, text, tx, b.y + 3 + asc, th().fg, b.x + b.w - 2);
+            fill(buf, w, h, tx + *cur as i32 * cw, b.y + 3, 1, lh, th().accent);
+        }
     });
 }
 
@@ -15278,6 +16050,40 @@ mod tests {
         ));
         std::fs::create_dir(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn snippets_lose_their_placeholders() {
+        assert_eq!(strip_snippet("foo($1)$0"), "foo()");
+        assert_eq!(strip_snippet("for ${1:i} in ${2:iter} {\n\t$0\n}"), "for i in iter {\n\t\n}");
+        assert_eq!(strip_snippet("${1|a,b|}x"), "ax");
+        assert_eq!(strip_snippet("cost \\$5"), "cost $5");
+    }
+
+    #[test]
+    fn completion_items_use_text_edits_and_strip_snippets() {
+        let text = Rope::from_str("let x = foo.ba\n");
+        let result = serde_json::json!({ "isIncomplete": false, "items": [
+            { "label": "bar", "kind": 2, "detail": "fn bar()", "insertTextFormat": 2,
+              "textEdit": { "range": { "start": { "line": 0, "character": 12 }, "end": { "line": 0, "character": 14 } }, "newText": "bar($1)" } },
+            { "label": "baz", "insertText": "baz", "sortText": "1",
+              "additionalTextEdits": [{ "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 0 } }, "newText": "use q;\n" }] },
+        ]});
+        let items = parse_completion_items(&text, &result);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].insert, "bar()");
+        assert_eq!(items[0].edit_start, Some(12));
+        assert_eq!(items[0].detail, "fn bar()");
+        assert_eq!(items[1].additional, vec![(0, 0, "use q;\n".to_owned())]);
+    }
+
+    #[test]
+    fn hover_markdown_becomes_wrapped_plain_lines() {
+        let v = serde_json::json!({ "kind": "markdown", "value": "```rust\nfn f()\n```\n\n\nDocs here" });
+        assert_eq!(popup_lines(&hover_text(&v), 80, 10), vec!["fn f()", "", "Docs here"]);
+        let marked = serde_json::json!(["a", { "language": "rust", "value": "b" }]);
+        assert_eq!(hover_text(&marked), "a\n---\nb");
+        assert_eq!(popup_lines(&"x".repeat(25), 10, 10).len(), 3);
     }
 
     #[test]

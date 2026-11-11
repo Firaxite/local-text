@@ -37,6 +37,12 @@ pub enum PendingKind {
     /// `then_format`: format-on-save also wants formatting; request it after the
     /// import edits land (both can't be computed against the same version).
     OrganizeImports { path: VPath, generation: u64, then_format: bool, save_after: bool },
+    /// `anchor`: char offset where the word being completed starts.
+    Completion { path: VPath, anchor: usize },
+    /// `pos`: char offset the hover was requested for.
+    Hover { path: VPath, pos: usize },
+    SignatureHelp { path: VPath },
+    Rename { path: VPath, generation: u64 },
 }
 
 // ── LspLaunchOverrides ────────────────────────────────────────────────────────
@@ -142,6 +148,39 @@ pub struct LspServer {
     pub pending:        HashMap<u64, PendingKind>,
     /// If Some, this server runs on a remote host via SSH.
     pub ssh_host:       Option<SshHost>,
+    /// From the initialize response: characters that trigger completion / signature
+    /// help, and which optional features the server offers.
+    pub caps:           ServerCaps,
+}
+
+#[derive(Default, Clone, Debug)]
+pub struct ServerCaps {
+    pub completion:          bool,
+    pub completion_triggers: Vec<char>,
+    pub hover:               bool,
+    pub signature_help:      bool,
+    pub signature_triggers:  Vec<char>,
+    pub rename:              bool,
+}
+
+impl ServerCaps {
+    /// Read the capabilities out of an initialize response message.
+    pub fn from_initialize_response(json: &str) -> ServerCaps {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else { return ServerCaps::default() };
+        let c = &v["result"]["capabilities"];
+        let chars = |a: &serde_json::Value| -> Vec<char> {
+            a.as_array().map(|a| a.iter().filter_map(|t| t.as_str()?.chars().next()).collect()).unwrap_or_default()
+        };
+        let enabled = |x: &serde_json::Value| x.is_object() || x.as_bool() == Some(true);
+        ServerCaps {
+            completion: c["completionProvider"].is_object(),
+            completion_triggers: chars(&c["completionProvider"]["triggerCharacters"]),
+            hover: enabled(&c["hoverProvider"]),
+            signature_help: c["signatureHelpProvider"].is_object(),
+            signature_triggers: chars(&c["signatureHelpProvider"]["triggerCharacters"]),
+            rename: enabled(&c["renameProvider"]),
+        }
+    }
 }
 
 // ── LspManager ────────────────────────────────────────────────────────────────
@@ -395,7 +434,8 @@ pub fn start_server(
                     if v["id"].is_u64() && v.get("method").is_none() {
                         let id = v["id"].as_u64().unwrap();
                         let result = v["result"].clone();
-                        let _ = proxy_out.send_event(UserEvent::LspResponse { server_id: opi, id, result });
+                        let error = v["error"]["message"].as_str().map(str::to_owned);
+                        let _ = proxy_out.send_event(UserEvent::LspResponse { server_id: opi, id, result, error });
                     } else if let Some((path, diags)) = parse_diagnostics(&msg, host_for_thread.as_ref()) {
                         let _ = proxy_out.send_event(UserEvent::LspDiagnostics { path, diagnostics: diags });
                     }
@@ -442,6 +482,7 @@ pub fn start_server(
         initialized: false,
         pending: HashMap::new(),
         ssh_host,
+        caps: ServerCaps::default(),
     })
 }
 
@@ -489,6 +530,23 @@ fn initialize_params(process_id: Option<u32>, root_uri: Option<String>) -> serde
                 "definition":         {},
                 "references":         {},
                 "formatting":         {},
+                "completion": {
+                    "completionItem": {
+                        "snippetSupport": false,
+                        "documentationFormat": ["plaintext", "markdown"],
+                        "insertReplaceSupport": false
+                    },
+                    "contextSupport": true
+                },
+                "hover":         { "contentFormat": ["plaintext", "markdown"] },
+                "signatureHelp": {
+                    "signatureInformation": {
+                        "documentationFormat": ["plaintext", "markdown"],
+                        "parameterInformation": { "labelOffsetSupport": true }
+                    },
+                    "contextSupport": true
+                },
+                "rename": { "prepareSupport": false },
                 "codeAction": {
                     "codeActionLiteralSupport": {
                         "codeActionKind": { "valueSet": ["source.organizeImports"] }
@@ -615,12 +673,71 @@ pub fn request_organize_imports(srv: &mut LspServer, path: &VPath, generation: u
     id
 }
 
+fn position_params(path: &VPath, line: usize, col: usize) -> serde_json::Value {
+    serde_json::json!({
+        "textDocument": { "uri": path.to_lsp_uri() },
+        "position": { "line": line, "character": col }
+    })
+}
+
+/// `trigger`: the trigger character typed, if that's what invoked it.
+pub fn request_completion(srv: &mut LspServer, path: &VPath, line: usize, col: usize, anchor: usize, trigger: Option<char>) -> u64 {
+    let mut params = position_params(path, line, col);
+    params["context"] = match trigger {
+        Some(ch) => serde_json::json!({ "triggerKind": 2, "triggerCharacter": ch.to_string() }),
+        None => serde_json::json!({ "triggerKind": 1 }),
+    };
+    let id = send_request(srv, "textDocument/completion", params);
+    srv.pending.insert(id, PendingKind::Completion { path: path.clone(), anchor });
+    id
+}
+
+pub fn request_hover(srv: &mut LspServer, path: &VPath, line: usize, col: usize, pos: usize) -> u64 {
+    let id = send_request(srv, "textDocument/hover", position_params(path, line, col));
+    srv.pending.insert(id, PendingKind::Hover { path: path.clone(), pos });
+    id
+}
+
+pub fn request_signature_help(srv: &mut LspServer, path: &VPath, line: usize, col: usize, trigger: Option<char>) -> u64 {
+    let mut params = position_params(path, line, col);
+    params["context"] = match trigger {
+        Some(ch) => serde_json::json!({ "triggerKind": 2, "triggerCharacter": ch.to_string(), "isRetrigger": false }),
+        None => serde_json::json!({ "triggerKind": 1, "isRetrigger": false }),
+    };
+    let id = send_request(srv, "textDocument/signatureHelp", params);
+    srv.pending.insert(id, PendingKind::SignatureHelp { path: path.clone() });
+    id
+}
+
+pub fn request_rename(srv: &mut LspServer, path: &VPath, line: usize, col: usize, new_name: &str, generation: u64) -> u64 {
+    let mut params = position_params(path, line, col);
+    params["newName"] = serde_json::Value::String(new_name.to_owned());
+    let id = send_request(srv, "textDocument/rename", params);
+    srv.pending.insert(id, PendingKind::Rename { path: path.clone(), generation });
+    id
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn server_capabilities_are_read_from_initialize() {
+        let msg = r#"{"jsonrpc":"2.0","id":1,"result":{"capabilities":{
+            "completionProvider":{"triggerCharacters":[".",":"]},
+            "hoverProvider":true,
+            "signatureHelpProvider":{"triggerCharacters":["(",","]},
+            "renameProvider":{"prepareProvider":true}}}}"#;
+        let c = ServerCaps::from_initialize_response(msg);
+        assert!(c.completion && c.hover && c.signature_help && c.rename);
+        assert_eq!(c.completion_triggers, vec!['.', ':']);
+        assert_eq!(c.signature_triggers, vec!['(', ',']);
+        let none = ServerCaps::from_initialize_response(r#"{"id":1,"result":{"capabilities":{}}}"#);
+        assert!(!none.completion && !none.hover && !none.rename);
+    }
 
     #[test]
     fn read_message_parses_framed() {
