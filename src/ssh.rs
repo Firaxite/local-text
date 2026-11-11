@@ -77,16 +77,35 @@ pub fn base_args(host: &SshHost) -> Vec<String> {
     args
 }
 
-/// A non-interactive `ssh` command for `host` (BatchMode: never prompt) running
-/// the already-quoted `remote_command`.
+/// A non-interactive `ssh` command for `host` running the already-quoted
+/// `remote_command`. With multiplexing it rides on the authenticated master
+/// (BatchMode: never prompt); without (Windows) each command authenticates itself,
+/// asking through the in-app prompt (see `askpass`).
 fn batch_command(host: &SshHost, remote_command: String) -> Command {
     let mut cmd = new_command("ssh");
-    cmd.args(base_args(host))
-       .arg("-o").arg("BatchMode=yes")
-       .arg(host.host_arg())
+    cmd.args(base_args(host));
+    if MULTIPLEX {
+        cmd.arg("-o").arg("BatchMode=yes");
+    } else {
+        crate::askpass::configure(&mut cmd);
+    }
+    cmd.arg(host.host_arg())
        .arg("--")
        .arg(remote_command);
     cmd
+}
+
+/// Keep `ssh` away from the terminal the editor may have been started from, so it
+/// can't prompt there (it uses the askpass helper instead).
+fn detach_from_terminal(cmd: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: setsid is async-signal-safe and only affects the child.
+        unsafe { cmd.pre_exec(|| { libc::setsid(); Ok(()) }); }
+    }
+    #[cfg(not(unix))]
+    let _ = cmd;
 }
 
 /// argv for an interactive `ssh` session in a terminal pane, optionally starting
@@ -541,15 +560,19 @@ fn run_bootstrap(host: &SshHost, proxy: &EventLoopProxy<UserEvent>) {
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 /// Open (or reuse) the ControlMaster socket for `host`.
-/// Blocks until the socket appears (up to 30 s) or the ssh process exits.
+/// Blocks until the socket appears or the ssh process exits. Passwords,
+/// passphrases and new host keys are asked for through the in-app prompt
+/// (`askpass`), so this can wait several minutes for the user.
 fn open_control_master(host: &SshHost) -> Result<(), String> {
     let socket = host.control_path();
     let mut cmd = new_command("ssh");
     cmd.arg("-o").arg("ControlMaster=auto")
        .arg("-o").arg(format!("ControlPath={}", socket.display()))
        .arg("-o").arg("ControlPersist=600")  // keep alive 10 min after last use
-       .arg("-o").arg("BatchMode=yes")        // no interactive prompts
+       .arg("-o").arg("ConnectTimeout=20")
        .arg("-N");                            // don't execute a remote command
+    crate::askpass::configure(&mut cmd);
+    detach_from_terminal(&mut cmd);
     if let Some(port) = host.port {
         cmd.arg("-p").arg(port.to_string());
     }
@@ -561,7 +584,8 @@ fn open_control_master(host: &SshHost) -> Result<(), String> {
         .map_err(|e| format!("Failed to spawn ssh: {e}"))?;
 
     // Poll for the socket file to appear (ssh creates it once handshake done).
-    let deadline = Instant::now() + Duration::from_secs(30);
+    // Long enough for the user to answer password / host-key prompts.
+    let deadline = Instant::now() + Duration::from_secs(600);
     loop {
         if socket.exists() { return Ok(()); }
         // Check if ssh exited (auth failure, host unreachable, etc.)
@@ -609,6 +633,7 @@ pub fn run_ssh_capture_bytes(host: &SshHost, remote_argv: &[&str]) -> Result<Vec
         Ok(output.stdout)
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("Permission denied") { crate::askpass::forget_cached(); }
         Err(format!("ssh error ({}): {}", output.status, stderr.trim()))
     }
 }

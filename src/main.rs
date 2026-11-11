@@ -16,6 +16,7 @@ mod encoding;
 mod search;
 mod theme;
 mod session;
+mod askpass;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -2367,6 +2368,8 @@ pub enum UserEvent {
     CollabError       { msg: String },
     CollabGuestJoined { site_id: u64, peer: collab::PeerInfo },
     CollabGuestLeft   { site_id: u64 },
+    /// ssh needs an answer from the user (password, passphrase, host key).
+    AskPass { prompt: String, kind: askpass::PromptKind, reply: std::sync::mpsc::SyncSender<Option<String>> },
 }
 
 // ── Application state ─────────────────────────────────────────────────────────
@@ -2484,6 +2487,17 @@ struct State {
     hover_dwell:   Option<(i32, i32, Instant)>,
     /// Where the completion list was last drawn: (x, y, w, row height, first item).
     completion_rect: Option<(i32, i32, i32, i32, usize)>,
+    /// ssh prompts waiting for the user (the first is shown).
+    askpass_queue: std::collections::VecDeque<AskPassPrompt>,
+}
+
+struct AskPassPrompt {
+    prompt: String,
+    kind:   askpass::PromptKind,
+    text:   String,
+    cursor: usize,
+    sel:    Option<usize>,
+    reply:  std::sync::mpsc::SyncSender<Option<String>>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -9076,6 +9090,7 @@ impl App {
         #[cfg(target_os = "macos")]
         let attrs = attrs.with_title_hidden(true).with_titlebar_transparent(true);
 
+        askpass::start(self.proxy.clone());
         let loaded_settings = settings::Settings::load();
         layout::set_defaults(loaded_settings.default_indent(), loaded_settings.detect_indentation);
         if !theme::apply(&loaded_settings.theme, &loaded_settings.theme_overrides) {
@@ -9237,6 +9252,7 @@ impl App {
             last_session_save: Instant::now(),
             completion: None, hover: None, signature: None, rename_box: None,
             hover_request: None, hover_dwell: None, completion_rect: None,
+            askpass_queue: std::collections::VecDeque::new(),
         };
 
         if let Some(path) = initial_lsp_path {
@@ -9826,6 +9842,8 @@ impl App {
                 let cmd = primary_mod(s.mods);
                 let shift = s.mods.shift_key();
 
+                // An ssh prompt is modal.
+                if !s.askpass_queue.is_empty() { return; }
                 // LSP popups: a click on a completion accepts it; anywhere else closes them.
                 s.hover = None;
                 s.rename_box = None;
@@ -11293,6 +11311,29 @@ impl App {
                 // next ModifiersChanged (releasing AltGr) restores the real state.
                 if is_altgr_text(&event, s.mods) {
                     s.mods.remove(ModifiersState::CONTROL | ModifiersState::ALT);
+                }
+                // An ssh prompt is modal: it takes every key until answered.
+                if let Some(ap) = s.askpass_queue.front_mut() {
+                    let (cmd, alt, ctrl, shift) = (primary_mod(s.mods), s.mods.alt_key(), s.mods.control_key(), s.mods.shift_key());
+                    match &event.logical_key {
+                        Key::Named(NamedKey::Enter) => {
+                            let ap = s.askpass_queue.pop_front().unwrap();
+                            let _ = ap.reply.send(Some(ap.text));
+                        }
+                        Key::Named(NamedKey::Escape) => {
+                            let ap = s.askpass_queue.pop_front().unwrap();
+                            let _ = ap.reply.send(None);
+                        }
+                        key if ap.kind != askpass::PromptKind::Confirm => {
+                            input_field_edit(&mut ap.text, &mut ap.cursor, &mut ap.sel, key, cmd, alt, ctrl, shift);
+                            if ap.kind == askpass::PromptKind::Plain {
+                                for ch in ap.text.clone().chars() { s.glyphs.load(ch); }
+                            }
+                        }
+                        _ => {}
+                    }
+                    { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
+                    return;
                 }
                 let ctrl  = s.mods.control_key();
                 // App shortcuts use `cmd`: Command on macOS, Control on Linux/Windows (where
@@ -13103,6 +13144,11 @@ impl App {
                 s.needs_redraw = true;
                 self.dirty.store(true, Ordering::Release);
             }
+            UserEvent::AskPass { prompt, kind, reply } => {
+                for ch in prompt.chars() { s.glyphs.load(ch); }
+                s.askpass_queue.push_back(AskPassPrompt { prompt, kind, text: String::new(), cursor: 0, sel: None, reply });
+                s.win.focus_window();
+            }
             UserEvent::RemoteWriteError { path, msg } => {
                 s.status_msg = Some(format!("Save failed ({}): {msg}", path.display_short()));
                 s.needs_redraw = true;
@@ -14391,6 +14437,19 @@ fn render(s: &mut State) {
         Some((PopupBox { x: bx, y: by, w: bw, h: lh + 6 }, rb.text.clone(), cur, sel))
     });
     let hover_tip = if hover_snap.is_some() { None } else { hover_tip };
+    // ssh prompt: (prompt lines, shown field text, cursor chars, kind)
+    let askpass_snap: Option<(Vec<String>, String, usize, askpass::PromptKind)> = s.askpass_queue.front().map(|ap| {
+        let lines = popup_lines(&ap.prompt, 70, 8);
+        let n = ap.text.chars().count();
+        let shown = match ap.kind {
+            askpass::PromptKind::Secret => "•".repeat(n),
+            askpass::PromptKind::Plain => ap.text.clone(),
+            askpass::PromptKind::Confirm => String::new(),
+        };
+        let cur = ap.text[..clamp_byte_index(&ap.text, ap.cursor)].chars().count();
+        (lines, shown, cur, ap.kind)
+    });
+    if askpass_snap.is_some() { s.glyphs.load('•'); }
 
     // SAFETY: render_frame takes FnOnce and calls it synchronously before returning.
     // s.glyphs is alive for the entire duration, and renderer does not alias glyphs.
@@ -15905,6 +15964,31 @@ fn render(s: &mut State) {
                 fill(buf, w, h, b.x + b.w - 3, ty, 2, th_h, th().sb_thumb);
             }
         }
+        if let Some((lines, shown, cur, kind)) = &askpass_snap {
+            darken_buffer(buf, w, h);
+            let tw = lines.iter().map(|l| l.chars().count()).max().unwrap_or(20).max(40) as i32;
+            let bw = (tw * cw + 24).min(w as i32 - 8);
+            let field_rows = if *kind == askpass::PromptKind::Confirm { 0 } else { 1 };
+            let bh = (lines.len() as i32 + field_rows + 2) * lh + 24;
+            let b = PopupBox { x: (w as i32 - bw) / 2, y: (h as i32 - bh) / 3, w: bw, h: bh };
+            frame(buf, &b);
+            fill(buf, w, h, b.x, b.y, b.w, 2, th().accent);
+            draw_str(buf, w, h, g, "SSH", b.x + 12, b.y + 8 + asc, th().accent, b.x + b.w - 8);
+            let mut y = b.y + 8 + lh;
+            for line in lines {
+                draw_str(buf, w, h, g, line, b.x + 12, y + asc, th().fg, b.x + b.w - 8);
+                y += lh;
+            }
+            if field_rows == 1 {
+                y += 4;
+                fill(buf, w, h, b.x + 12, y, b.w - 24, lh + 4, th().bg);
+                fill(buf, w, h, b.x + 12, y + lh + 3, b.w - 24, 1, th().accent);
+                draw_str(buf, w, h, g, shown, b.x + 16, y + 2 + asc, th().fg, b.x + b.w - 14);
+                fill(buf, w, h, b.x + 16 + *cur as i32 * cw, y + 2, 1, lh, th().accent);
+                y += lh + 8;
+            }
+            draw_str(buf, w, h, g, "Enter: OK    Esc: Cancel", b.x + 12, y + asc, th().fg_dim, b.x + b.w - 8);
+        }
         if let Some((b, text, cur, sel)) = &rename_snap {
             frame(buf, b);
             fill(buf, w, h, b.x, b.y + b.h - 1, b.w, 1, th().accent);
@@ -15921,6 +16005,8 @@ fn render(s: &mut State) {
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 fn main() {
+    // Started by ssh to ask for a password? Answer through the running editor.
+    if let Some(code) = askpass::helper_main() { std::process::exit(code); }
     let arg = std::env::args().nth(1);
     let (file_arg, dir_arg) = match arg {
         Some(s) => {
