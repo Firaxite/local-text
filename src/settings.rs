@@ -143,6 +143,10 @@ pub struct Settings {
     pub theme_overrides:    std::collections::HashMap<String, String>,
     /// Reopen the files and split layout of the last session on launch.
     pub restore_session:    bool,
+    /// Extra addresses put in collab invites ahead of the LAN ones — a public
+    /// host name with the port forwarded, a VPN (e.g. Tailscale) name, … — as
+    /// "host" or "host:port".
+    pub collab_advertise_addresses: Vec<String>,
 }
 
 impl Default for Settings {
@@ -179,6 +183,7 @@ impl Default for Settings {
             theme:                    crate::theme::TOKYO_NIGHT.name.to_owned(),
             theme_overrides:          std::collections::HashMap::new(),
             restore_session:          true,
+            collab_advertise_addresses: Vec::new(),
         }
     }
 }

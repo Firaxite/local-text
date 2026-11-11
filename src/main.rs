@@ -532,6 +532,7 @@ enum CommandAction {
     RevertFile,
     SetTheme(usize),
     TriggerSuggest, TriggerParameterHints, RenameSymbol, ShowHover,
+    CollabShareTerminal, CollabUnshareTerminal, CollabOpenHostTerminal, CollabLeave,
     ReopenWithEncoding(encoding::Encoding),
     SaveWithEncoding(encoding::Encoding),
 }
@@ -563,6 +564,10 @@ const COMMANDS: &[CommandEntry] = &[
     CommandEntry { name: "Open Remote Directory…", shortcut: "",              action: CommandAction::OpenRemoteDirectory },
     CommandEntry { name: "Start Collab Session",   shortcut: "",              action: CommandAction::StartCollab },
     CommandEntry { name: "Join Collab Session…",   shortcut: "",              action: CommandAction::JoinCollab },
+    CommandEntry { name: "Collab: Share Active Terminal", shortcut: "",       action: CommandAction::CollabShareTerminal },
+    CommandEntry { name: "Collab: Stop Sharing Active Terminal", shortcut: "", action: CommandAction::CollabUnshareTerminal },
+    CommandEntry { name: "Collab: Open Terminal on Host", shortcut: "",       action: CommandAction::CollabOpenHostTerminal },
+    CommandEntry { name: "Collab: Leave / Stop Session", shortcut: "",        action: CommandAction::CollabLeave },
     CommandEntry { name: "LSP: Manage Servers",    shortcut: "",              action: CommandAction::ManageLspServers },
     CommandEntry { name: "LSP: Edit Project Settings", shortcut: "",          action: CommandAction::EditProjectLspConfig },
     CommandEntry { name: "LSP: Trust Project Settings", shortcut: "",         action: CommandAction::TrustProjectLspConfig },
@@ -2043,6 +2048,8 @@ fn resize_terminal_panes(s: &mut State) {
             let tids: Vec<usize> = s.panes.get(&pid).map(|p| p.term_ids.clone()).unwrap_or_default();
             for tid in tids {
                 if let Some(tp) = s.term_panes.get_mut(&tid) {
+                    // A collab host's terminal keeps the host's size.
+                    if tp.remote.is_some() { continue; }
                     terminal::resize_pty(tp, cols, rows);
                 }
             }
@@ -2366,7 +2373,18 @@ pub enum UserEvent {
     CollabFileListReady { site_id: u64, paths: Vec<String> },
     CollabDisconnected,
     CollabError       { msg: String },
-    CollabGuestJoined { site_id: u64, peer: collab::PeerInfo },
+    CollabGuestJoined { site_id: u64, peer: collab::PeerInfo, resume: Option<String> },
+    /// Guest: the connection dropped; reconnect attempt `attempt` is coming.
+    CollabReconnecting { attempt: u32 },
+    /// Guest: reconnected (the host may have given us a new site id).
+    CollabReconnected {
+        site_id:    u64,
+        peers:      Vec<collab::PeerInfo>,
+        role:       collab::PeerRole,
+        role_perms: collab::RolePermissions,
+        doc:        Option<collab::DocSnapshot>,
+        to_host:    std::sync::mpsc::Sender<Vec<u8>>,
+    },
     CollabGuestLeft   { site_id: u64 },
     /// ssh needs an answer from the user (password, passphrase, host key).
     AskPass { prompt: String, kind: askpass::PromptKind, reply: std::sync::mpsc::SyncSender<Option<String>> },
@@ -6980,6 +6998,7 @@ fn find_tab_by_buf(s: &State, buf_id: usize) -> Option<(usize, usize)> {
 /// WRITE_HIDDEN are read-only; the host would reject the edits anyway.)
 fn collab_tab_read_only(s: &State, tab: &Tab) -> bool {
     let (Some(rel), Some(sess)) = (tab.collab_path.as_deref(), s.collab.as_ref()) else { return false };
+    if sess.reconnecting { return true; }
     match sess.my_role {
         Some(role) => !collab::guest_can_write(rel, role, &sess.role_perms),
         None => false,
@@ -7269,6 +7288,194 @@ fn guest_handle_remote_op(s: &mut State, path: String, rev: u64, op: collab::Tex
     }
 }
 
+fn new_resume_token() -> String {
+    use rand::RngCore;
+    let mut b = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut b);
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+// ── Collab: shared terminals ──────────────────────────────────────────────────
+
+/// Host: the TermShared message for terminal `tid` (with its recent output).
+fn term_shared_msg(s: &State, tid: usize) -> Option<collab::CollabMsg> {
+    let sess = s.collab.as_ref()?;
+    let st = sess.shared_terms.get(&(tid as u64))?;
+    let tp = s.term_panes.get(&tid)?;
+    let history: Vec<u8> = st.history.iter().copied().collect();
+    Some(collab::CollabMsg::TermShared {
+        term_id: tid as u64,
+        title: tp.title.clone(),
+        cols: tp.grid.cols as u16,
+        rows: tp.grid.rows as u16,
+        history: collab::term_encode(&history),
+    })
+}
+
+/// Host: guests that may watch shared terminals.
+fn term_viewers(sess: &collab::CollabSession) -> Vec<u64> {
+    sess.peers.iter()
+        .filter(|p| sess.peer_perms(p.site_id) & collab::perms::VIEW_TERMINALS != 0)
+        .map(|p| p.site_id).collect()
+}
+
+/// Host: send every shared terminal to `site_id` (if its role may see terminals).
+fn host_share_terms_with(s: &State, site_id: u64) {
+    let Some(sess) = s.collab.as_ref() else { return };
+    if !sess.is_host() || sess.peer_perms(site_id) & collab::perms::VIEW_TERMINALS == 0 { return; }
+    let mut ids: Vec<u64> = sess.shared_terms.keys().copied().collect();
+    ids.sort_unstable();
+    for id in ids {
+        if let Some(msg) = term_shared_msg(s, id as usize) { sess.send_to_site(site_id, &msg); }
+    }
+}
+
+/// Host: start sharing terminal `tid` with every guest allowed to see terminals.
+fn host_share_terminal(s: &mut State, tid: usize) {
+    let Some(sess) = s.collab.as_mut() else { return };
+    if !sess.is_host() || !s.term_panes.contains_key(&tid) { return; }
+    let tp = &s.term_panes[&tid];
+    sess.shared_terms.entry(tid as u64).or_insert_with(|| collab::SharedTerm {
+        size: (tp.grid.cols as u16, tp.grid.rows as u16), ..Default::default()
+    });
+    let Some(msg) = term_shared_msg(s, tid) else { return };
+    let sess = s.collab.as_ref().unwrap();
+    let viewers = term_viewers(sess);
+    sess.broadcast_where(None, &msg, |sid| viewers.contains(&sid));
+}
+
+fn host_unshare_terminal(s: &mut State, tid: usize) {
+    let Some(sess) = s.collab.as_mut() else { return };
+    if sess.shared_terms.remove(&(tid as u64)).is_some() {
+        sess.broadcast_except_msg(None, &collab::CollabMsg::TermClosed { term_id: tid as u64 });
+    }
+}
+
+/// Host: terminal output, recorded for late joiners and queued for guests.
+fn host_term_output(s: &mut State, tid: usize, data: &[u8]) {
+    let Some(sess) = s.collab.as_mut() else { return };
+    let Some(st) = sess.shared_terms.get_mut(&(tid as u64)) else { return };
+    st.pending.extend_from_slice(data);
+    st.history.extend(data.iter().copied());
+    let excess = st.history.len().saturating_sub(collab::TERM_HISTORY);
+    if excess > 0 { st.history.drain(..excess); }
+}
+
+/// Once per event-loop turn: send pending shared-terminal output and size changes
+/// (host), notice closed terminals, and send keystrokes typed into remote
+/// terminals (guest).
+fn flush_collab_terminals(s: &mut State) {
+    let remote_input = terminal::take_remote_input();
+    let Some(sess) = s.collab.as_ref() else { return };
+    if !sess.is_host() {
+        let may_type = sess.my_perms() & collab::perms::OPEN_TERMINALS != 0;
+        if !remote_input.is_empty() && (!may_type || sess.reconnecting) {
+            s.status_msg = Some(if sess.reconnecting { "Reconnecting — terminal input dropped" }
+                                else { "Your role can watch this terminal but not type into it" }.to_owned());
+            return;
+        }
+        for (term_id, bytes) in remote_input {
+            sess.send_to_site(0, &collab::CollabMsg::TermInput { term_id, data: collab::term_encode(&bytes) });
+        }
+        // Pane closed locally: stop mirroring it.
+        let gone: Vec<u64> = sess.remote_terms.iter()
+            .filter(|(_, tid)| !s.term_panes.contains_key(tid)).map(|(&id, _)| id).collect();
+        if let Some(sess) = s.collab.as_mut() { for id in gone { sess.remote_terms.remove(&id); } }
+        return;
+    }
+    if sess.shared_terms.is_empty() { return; }
+    let ids: Vec<u64> = sess.shared_terms.keys().copied().collect();
+    let viewers = term_viewers(sess);
+    let mut msgs: Vec<collab::CollabMsg> = Vec::new();
+    let mut closed: Vec<u64> = Vec::new();
+    {
+        let sess = s.collab.as_mut().unwrap();
+        for id in ids {
+            let Some(tp) = s.term_panes.get(&(id as usize)) else { closed.push(id); continue };
+            let st = sess.shared_terms.get_mut(&id).unwrap();
+            let size = (tp.grid.cols as u16, tp.grid.rows as u16);
+            if size != st.size {
+                st.size = size;
+                msgs.push(collab::CollabMsg::TermResized { term_id: id, cols: size.0, rows: size.1 });
+            }
+            if !st.pending.is_empty() {
+                let data = std::mem::take(&mut st.pending);
+                for chunk in data.chunks(48 * 1024) {
+                    msgs.push(collab::CollabMsg::TermData { term_id: id, data: collab::term_encode(chunk) });
+                }
+            }
+        }
+        for id in &closed {
+            sess.shared_terms.remove(id);
+            msgs.push(collab::CollabMsg::TermClosed { term_id: *id });
+        }
+    }
+    let sess = s.collab.as_ref().unwrap();
+    for msg in &msgs {
+        sess.broadcast_where(None, msg, |sid| viewers.contains(&sid));
+    }
+}
+
+/// Guest: show (or refresh after a reconnect) a terminal the host shared.
+fn guest_term_shared(s: &mut State, term_id: u64, title: String, cols: u16, rows: u16, history: &[u8]) {
+    let (cols, rows) = ((cols as usize).clamp(1, 1000), (rows as usize).clamp(1, 500));
+    let existing = s.collab.as_ref().and_then(|c| c.remote_terms.get(&term_id).copied())
+        .filter(|tid| s.term_panes.contains_key(tid));
+    let title = format!("{} (shared)", title.chars().take(40).collect::<String>());
+    for ch in title.chars() { s.glyphs.load(ch); }
+    let tid = match existing {
+        Some(tid) => tid,
+        None => {
+            // A new terminal pane below the current one, without taking the focus.
+            let prev = s.active_pane;
+            let pane_id = s.next_pane_id; s.next_pane_id += 1;
+            let tid = s.next_pane_id; s.next_pane_id += 1;
+            s.panes.insert(pane_id, Pane { id: pane_id, kind: PaneKind::Terminal, tabs: vec![],
+                                           term_ids: vec![tid], active: 0, find: FindBar::new() });
+            let old_tree = std::mem::replace(&mut s.pane_tree, PaneTree::Leaf(0));
+            s.pane_tree = insert_pane(old_tree, prev, pane_id, DropZone::Bottom);
+            s.active_pane = prev;
+            tid
+        }
+    };
+    let mut tp = terminal::new_log_pane(tid, cols, rows, title);
+    tp.remote = Some(term_id);
+    terminal::feed_bytes(&mut tp, history);
+    s.term_panes.insert(tid, tp);
+    if let Some(sess) = s.collab.as_mut() { sess.remote_terms.insert(term_id, tid); }
+}
+
+/// Guest: the session ended (or the host stopped sharing): keep the last screen
+/// as a read-only pane.
+fn guest_term_closed(s: &mut State, term_id: Option<u64>) {
+    let Some(sess) = s.collab.as_mut() else { return };
+    let tids: Vec<usize> = match term_id {
+        Some(id) => sess.remote_terms.remove(&id).into_iter().collect(),
+        None => sess.remote_terms.drain().map(|(_, t)| t).collect(),
+    };
+    for tid in tids {
+        if let Some(tp) = s.term_panes.get_mut(&tid) {
+            tp.remote = None;
+            terminal::feed_bytes(tp, b"\r\n\x1b[0m[local-text] the host stopped sharing this terminal\r\n");
+        }
+    }
+}
+
+/// Host: open a terminal for a guest (in the workspace root) and share it,
+/// without taking the host's focus.
+fn host_open_terminal_for_guest(s: &mut State, from_site_id: u64) {
+    let prev = s.active_pane;
+    let root = s.explorer.as_ref().map(|e| e.root.clone());
+    open_terminal_pane_at(s, root);
+    let new_pane = s.active_pane;
+    s.active_pane = prev;
+    let Some(tid) = s.panes.get(&new_pane).and_then(|p| p.term_ids.first().copied()) else { return };
+    host_share_terminal(s, tid);
+    let name = s.collab.as_ref().and_then(|c| c.peers.iter().find(|p| p.site_id == from_site_id))
+        .map(|p| p.name.clone()).unwrap_or_else(|| "A guest".to_owned());
+    s.status_msg = Some(format!("{name} opened a shared terminal"));
+}
+
 /// Host: build the list of files `site_id` may open, off the UI thread.
 fn spawn_collab_file_list(s: &State, site_id: u64) {
     let (Some(sess), Some(root)) = (
@@ -7307,7 +7514,18 @@ fn host_refresh_guest_access(s: &mut State, only: Option<u64>) {
             sess.send_to_site(sid, &collab::CollabMsg::FileDenied { path: rel });
         }
     }
-    for sid in sites { spawn_collab_file_list(s, sid); }
+    for sid in sites {
+        spawn_collab_file_list(s, sid);
+        // Terminals follow VIEW_TERMINALS: (re)send them, or take them away.
+        let Some(sess) = s.collab.as_ref() else { return };
+        if sess.peer_perms(sid) & collab::perms::VIEW_TERMINALS != 0 {
+            host_share_terms_with(s, sid);
+        } else {
+            for &id in sess.shared_terms.keys() {
+                sess.send_to_site(sid, &collab::CollabMsg::TermClosed { term_id: id });
+            }
+        }
+    }
 }
 
 /// Host: copy role permissions and share globs from settings into the running
@@ -7433,6 +7651,38 @@ fn handle_collab_msg(s: &mut State, from_site_id: u64, msg: collab::CollabMsg) {
                 session.broadcast_except_msg(None, &msg);
             }
             host_refresh_guest_access(s, Some(target_site_id));
+        }
+        CollabMsg::TermShared { term_id, title, cols, rows, history } if !is_host => {
+            if s.collab.as_ref().is_some_and(|c| c.my_perms() & collab::perms::VIEW_TERMINALS != 0) {
+                let bytes = collab::term_decode(&history).unwrap_or_default();
+                guest_term_shared(s, term_id, title, cols, rows, &bytes);
+            }
+        }
+        CollabMsg::TermData { term_id, data } if !is_host => {
+            let tid = s.collab.as_ref().and_then(|c| c.remote_terms.get(&term_id).copied());
+            if let (Some(tid), Some(bytes)) = (tid, collab::term_decode(&data)) {
+                if let Some(tp) = s.term_panes.get_mut(&tid) { terminal::feed_bytes(tp, &bytes); }
+            }
+        }
+        CollabMsg::TermResized { term_id, cols, rows } if !is_host => {
+            let tid = s.collab.as_ref().and_then(|c| c.remote_terms.get(&term_id).copied());
+            if let Some(tp) = tid.and_then(|t| s.term_panes.get_mut(&t)) {
+                tp.grid.resize((cols as usize).clamp(1, 1000), (rows as usize).clamp(1, 500));
+            }
+        }
+        CollabMsg::TermClosed { term_id } if !is_host => guest_term_closed(s, Some(term_id)),
+        CollabMsg::TermInput { term_id, data } if is_host => {
+            let Some(sess) = s.collab.as_ref() else { return };
+            let allowed = sess.peer_perms(from_site_id) & collab::perms::OPEN_TERMINALS != 0
+                && sess.shared_terms.contains_key(&term_id);
+            if !allowed { return; }
+            if let (Some(bytes), Some(tp)) = (collab::term_decode(&data), s.term_panes.get(&(term_id as usize))) {
+                tp.write_input(&bytes);
+            }
+        }
+        CollabMsg::TermOpen if is_host => {
+            let allowed = s.collab.as_ref().is_some_and(|c| c.peer_perms(from_site_id) & collab::perms::OPEN_TERMINALS != 0);
+            if allowed { host_open_terminal_for_guest(s, from_site_id); }
         }
         _ => {} // not valid in this direction: ignore
     }
@@ -8106,6 +8356,52 @@ fn execute_command(s: &mut State, action: CommandAction) {
         }
         CommandAction::CloseTab       => { /* needs the event loop to exit: see quick_finder_accept */ }
         CommandAction::ToggleWordWrap => toggle_word_wrap(s),
+        CommandAction::CollabShareTerminal | CommandAction::CollabUnshareTerminal => {
+            let Some(sess) = s.collab.as_ref() else {
+                s.status_msg = Some("Start a collab session first".to_owned());
+                return;
+            };
+            if !sess.is_host() { s.status_msg = Some("Only the session host can share terminals".to_owned()); return; }
+            let tid = s.panes.get(&s.active_pane)
+                .filter(|p| p.kind == PaneKind::Terminal)
+                .and_then(|p| p.term_ids.get(p.active).copied())
+                .filter(|tid| !s.lsp.servers.contains_key(tid));
+            let Some(tid) = tid else { s.status_msg = Some("Focus a terminal to share it".to_owned()); return };
+            if matches!(action, CommandAction::CollabShareTerminal) {
+                host_share_terminal(s, tid);
+                s.status_msg = Some("Terminal shared — guests with terminal access can see it (and type, if allowed)".to_owned());
+            } else {
+                host_unshare_terminal(s, tid);
+                s.status_msg = Some("Terminal no longer shared".to_owned());
+            }
+        }
+        CommandAction::CollabOpenHostTerminal => match s.collab.as_ref() {
+            Some(sess) if !sess.is_host() => {
+                if sess.my_perms() & collab::perms::OPEN_TERMINALS == 0 {
+                    s.status_msg = Some("Your role can't open terminals on the host".to_owned());
+                } else {
+                    sess.send_to_site(0, &collab::CollabMsg::TermOpen);
+                    s.status_msg = Some("Asked the host for a terminal…".to_owned());
+                }
+            }
+            _ => s.status_msg = Some("Join a collab session first".to_owned()),
+        },
+        CommandAction::CollabLeave => {
+            let Some(mut sess) = s.collab.take() else {
+                s.status_msg = Some("Not in a collab session".to_owned());
+                return;
+            };
+            let host = sess.is_host();
+            sess.shutdown();
+            s.collab = Some(sess);
+            notify_collab_change(s);
+            guest_term_closed(s, None);
+            detach_collab_tabs(s, None);
+            s.collab = None;
+            s.collab_before = None;
+            s.collab_file_list.clear();
+            s.status_msg = Some(if host { "Collab session stopped" } else { "Left the collab session" }.to_owned());
+        }
         CommandAction::TriggerSuggest => lsp_request_completion(s, None),
         CommandAction::TriggerParameterHints => lsp_request_signature_help(s, None),
         CommandAction::RenameSymbol => start_rename(s),
@@ -8351,11 +8647,17 @@ fn execute_command(s: &mut State, action: CommandAction) {
                 s.settings.collab_role_perms.clone(),
                 s.settings.collab_include_globs.clone(),
                 s.settings.collab_exclude_globs.clone(),
+                &s.settings.collab_advertise_addresses,
             ) {
                 Ok(session) => {
                     let invite = session.invite_str().to_owned();
                     s.collab = Some(session);
-                    s.status_msg = Some(format!("Collab: {invite}"));
+                    // The invite lists every address we may be reachable at, so it is
+                    // long: put it on the clipboard to paste to guests.
+                    clipboard_set(&invite);
+                    let n = collab::parse_invite(&invite).map_or(1, |i| i.addrs.len());
+                    s.status_msg = Some(format!("Collab invite copied to the clipboard ({n} address{}): {invite}",
+                        if n == 1 { "" } else { "es" }));
                 }
                 Err(e) => {
                     s.status_msg = Some(format!("Collab error: {e}"));
@@ -12588,6 +12890,7 @@ impl App {
             if s.collab.is_some() && !s.panes.is_empty() {
                 notify_collab_change(s);
                 send_collab_cursor_if_needed(s);
+                flush_collab_terminals(s);
             }
             if let Some((x, y, since)) = s.hover_dwell {
                 if since.elapsed() >= HOVER_DELAY && s.hover.is_none() && s.window_focused {
@@ -12633,6 +12936,9 @@ impl App {
                 if let Some(tp) = s.term_panes.get_mut(&pane_id) {
                     terminal::feed_bytes(tp, &data);
                     schedule_redraw = true;
+                }
+                if s.collab.as_ref().is_some_and(|c| c.is_host() && c.shared_terms.contains_key(&(pane_id as u64))) {
+                    host_term_output(s, pane_id, &data);
                 }
             }
             UserEvent::LspOutput { pane_id, data } => {
@@ -13235,6 +13541,7 @@ impl App {
             }
             UserEvent::CollabDisconnected => {
                 notify_collab_change(s);
+                guest_term_closed(s, None);
                 detach_collab_tabs(s, None);
                 s.collab = None;
                 s.collab_before = None;
@@ -13243,17 +13550,49 @@ impl App {
                 s.needs_redraw = true;
                 self.dirty.store(true, Ordering::Release);
             }
+            UserEvent::CollabReconnecting { attempt } => {
+                if let Some(sess) = s.collab.as_mut() {
+                    sess.reconnecting = true;
+                    s.status_msg = Some(format!("Collab: connection lost — reconnecting (attempt {attempt})…; shared files are read-only meanwhile"));
+                }
+                s.needs_redraw = true;
+                self.dirty.store(true, Ordering::Release);
+            }
+            UserEvent::CollabReconnected { site_id, peers, role, role_perms, doc, to_host } => {
+                let Some(sess) = s.collab.as_mut() else { return };
+                sess.site_id = site_id;
+                sess.peers = peers;
+                sess.my_role = Some(role);
+                sess.role_perms = role_perms;
+                sess.role = collab::CollabRole::Guest { to_host };
+                sess.reconnecting = false;
+                sess.remote_cursors.clear();
+                // Unacknowledged edits died with the old connection: fetch every open
+                // shared document again (the host's copy wins).
+                let open: Vec<String> = sess.client_docs.keys().cloned().collect();
+                for rel in &open {
+                    sess.send_to_site(0, &collab::CollabMsg::FileRequest { path: rel.clone() });
+                }
+                if let Some(doc) = doc { guest_load_doc(s, doc); }
+                s.status_msg = Some("Collab: reconnected".to_owned());
+                s.needs_redraw = true;
+                self.dirty.store(true, Ordering::Release);
+            }
             UserEvent::CollabError { msg } => {
                 s.status_msg = Some(format!("Collab error: {msg}"));
                 s.needs_redraw = true;
                 self.dirty.store(true, Ordering::Release);
             }
-            UserEvent::CollabGuestJoined { site_id, peer } => {
-                // Host: assign the default role, send Welcome (with the session's
-                // document only if this role may see it), then the file list.
+            UserEvent::CollabGuestJoined { site_id, peer, resume } => {
+                // Host: assign the default role (or, for a guest reconnecting with
+                // its resume token, its previous role), send Welcome (with the
+                // session's document only if this role may see it), then the file list.
                 notify_collab_change(s);
                 let Some(sess) = s.collab.as_mut() else { return };
-                let role = sess.role_perms.default_role;
+                let resumed = resume.as_ref().and_then(|t| sess.resume_roles.remove(t).map(|r| (t.clone(), r)));
+                let role = resumed.as_ref().map_or(sess.role_perms.default_role, |(_, r)| *r);
+                let token = resumed.map(|(t, _)| t).unwrap_or_else(new_resume_token);
+                sess.resume_tokens.insert(site_id, token.clone());
                 let new_peer = collab::PeerInfo { role, ..peer };
                 let name = new_peer.name.clone();
                 let all_peers = sess.peers.clone();
@@ -13285,11 +13624,13 @@ impl App {
                         role,
                         role_perms: sess.role_perms.clone(),
                         doc,
+                        resume_token: Some(token),
                     };
                     sess.send_to_site(site_id, &welcome);
                     sess.broadcast_except_msg(Some(site_id), &collab::CollabMsg::PeerJoined { peer: new_peer });
                 }
                 spawn_collab_file_list(s, site_id);
+                host_share_terms_with(s, site_id);
                 s.status_msg = Some(format!("{name} joined the session"));
                 s.needs_redraw = true;
                 self.dirty.store(true, Ordering::Release);
@@ -13307,6 +13648,12 @@ impl App {
                     .map(|p| p.name.clone())
                     .unwrap_or_else(|| format!("Guest {site_id}"));
                 if let Some(session) = s.collab.as_mut() {
+                    // Remember the role so the guest gets it back if it reconnects.
+                    if let (Some(tok), Some(p)) = (session.resume_tokens.remove(&site_id),
+                                                   session.peers.iter().find(|p| p.site_id == site_id)) {
+                        if session.resume_roles.len() >= 64 { session.resume_roles.clear(); }
+                        session.resume_roles.insert(tok, p.role);
+                    }
                     session.peers.retain(|p| p.site_id != site_id);
                     session.remote_cursors.remove(&site_id);
                     session.open_docs.remove(&site_id);

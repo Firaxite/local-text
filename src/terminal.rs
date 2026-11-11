@@ -728,14 +728,36 @@ pub type OutputSink = Box<dyn FnMut(Option<Box<[u8]>>) -> bool + Send>;
 /// write after other borrows of the pane end; only valid while the pane lives
 /// (every use is synchronous, inside the event handler that looked it up).
 #[derive(Clone, Copy)]
-pub struct PtyInput(sys::RawInput);
+pub enum PtyInput {
+    Pty(sys::RawInput),
+    /// A collab host's shared terminal shown on a guest: input is queued for the
+    /// session to send (see `take_remote_input`).
+    Remote(u64),
+}
 
 impl PtyInput {
     /// Send bytes to the program in the terminal. Silently ignored for
     /// display-only panes (LSP output) and once the PTY has closed.
     pub fn write(self, bytes: &[u8]) {
-        sys::write_input(self.0, bytes);
+        match self {
+            PtyInput::Pty(raw) => sys::write_input(raw, bytes),
+            PtyInput::Remote(id) => {
+                let mut q = REMOTE_INPUT.lock().unwrap_or_else(|p| p.into_inner());
+                match q.last_mut() {
+                    Some((last, buf)) if *last == id && buf.len() < 64 * 1024 => buf.extend_from_slice(bytes),
+                    _ => q.push((id, bytes.to_vec())),
+                }
+            }
+        }
     }
+}
+
+/// Keystrokes typed into remote (collab) terminals, waiting to be sent.
+static REMOTE_INPUT: std::sync::Mutex<Vec<(u64, Vec<u8>)>> = std::sync::Mutex::new(Vec::new());
+
+/// Take the queued input for remote terminals: (host terminal id, bytes).
+pub fn take_remote_input() -> Vec<(u64, Vec<u8>)> {
+    std::mem::take(&mut *REMOTE_INPUT.lock().unwrap_or_else(|p| p.into_inner()))
 }
 
 pub struct TermPane {
@@ -747,6 +769,8 @@ pub struct TermPane {
     pub title:   String,
     /// What this pane runs, so "split terminal" can start the same thing.
     pub command: TermCommand,
+    /// Collab guest: the host terminal this pane mirrors (input goes to the host).
+    pub remote:  Option<u64>,
 }
 
 impl TermPane {
@@ -757,7 +781,8 @@ impl TermPane {
 
     /// Where keystrokes for this pane go.
     pub fn input(&self) -> PtyInput {
-        PtyInput(self.pty.as_ref().map_or(sys::NO_INPUT, |p| p.raw_input()))
+        if let Some(id) = self.remote { return PtyInput::Remote(id); }
+        PtyInput::Pty(self.pty.as_ref().map_or(sys::NO_INPUT, |p| p.raw_input()))
     }
 
     /// Shorthand for `self.input().write(bytes)`.
@@ -804,6 +829,7 @@ pub fn spawn_terminal(pane_id: usize, cols: usize, rows: usize,
             _reader: reader,
             title: "Terminal".to_owned(),
             command,
+            remote: None,
         },
         Err(msg) => {
             let mut pane = new_log_pane(pane_id, cols, rows, "Terminal".to_owned());
@@ -826,6 +852,7 @@ pub fn new_log_pane(id: usize, cols: usize, rows: usize, title: String) -> TermP
         _reader: std::thread::spawn(|| {}),
         title,
         command: TermCommand::Argv(Vec::new()),
+        remote:  None,
     }
 }
 
@@ -1458,7 +1485,7 @@ mod tests {
             tx.send(chunk).is_ok()
         })).expect("spawn");
         pty.resize(100, 30);
-        if !input.is_empty() { PtyInput(pty.raw_input()).write(input); }
+        if !input.is_empty() { PtyInput::Pty(pty.raw_input()).write(input); }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut out = Vec::new();
         while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {

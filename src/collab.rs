@@ -129,7 +129,7 @@ impl RolePermissions {
 
 use std::collections::{HashSet, VecDeque};
 use std::net::Shutdown;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 // ── Peer colours (assigned round-robin by host) ───────────────────────────────
 const PEER_COLORS: &[u32] = &[
@@ -409,8 +409,9 @@ pub struct DocSnapshot {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type")]
 pub enum CollabMsg {
-    // Guest → Host
-    Join { peer_name: String },
+    // Guest → Host. `resume`: the token from an earlier Welcome, so a guest that
+    // reconnects after a dropped connection gets its role back.
+    Join { peer_name: String, #[serde(default)] resume: Option<String> },
 
     // Host → Guest (initial sync). `doc` is the host's current document, if the
     // guest's role may see it; the file list follows separately (`FileList`).
@@ -420,6 +421,9 @@ pub enum CollabMsg {
         role:         PeerRole,
         role_perms:   RolePermissions,
         doc:          Option<DocSnapshot>,
+        /// Present this in `Join::resume` when reconnecting.
+        #[serde(default)]
+        resume_token: Option<String>,
     },
 
     /// Guest → Host: a local edit, based on host revision `base_rev` of `path`.
@@ -449,8 +453,45 @@ pub enum CollabMsg {
     PeerRoleChanged { site_id: u64, role: PeerRole },   // Host → all
     RoleChangeRequest { target_site_id: u64, new_role: PeerRole }, // Moderator → Host
 
+    // Shared terminals. Host → guests whose role has VIEW_TERMINALS; input and
+    // new terminals need OPEN_TERMINALS. Terminal bytes travel base64-encoded.
+    /// A terminal is shared (or re-sent after a reconnect / role change), with its
+    /// recent output so the guest can rebuild the screen.
+    TermShared  { term_id: u64, title: String, cols: u16, rows: u16, history: String },
+    TermData    { term_id: u64, data: String },
+    TermResized { term_id: u64, cols: u16, rows: u16 },
+    TermClosed  { term_id: u64 },
+    /// Guest → Host: keystrokes for a shared terminal.
+    TermInput   { term_id: u64, data: String },
+    /// Guest → Host: start a new terminal on the host and share it.
+    TermOpen,
+
     Error { message: String },
 }
+
+/// Terminal bytes ↔ the base64 text carried in terminal messages.
+pub fn term_encode(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+pub fn term_decode(text: &str) -> Option<Vec<u8>> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.decode(text).ok()
+}
+
+/// Host side of a shared terminal.
+#[derive(Default)]
+pub struct SharedTerm {
+    /// Recent output (bounded), replayed to guests that join later.
+    pub history: VecDeque<u8>,
+    /// Output not yet sent to guests (flushed once per event-loop turn).
+    pub pending: Vec<u8>,
+    /// Grid size last announced to guests.
+    pub size:    (u16, u16),
+}
+
+/// How much terminal output is kept for late joiners.
+pub const TERM_HISTORY: usize = 256 * 1024;
 
 // ── Per-document OT state ─────────────────────────────────────────────────────
 
@@ -528,6 +569,19 @@ pub struct CollabSession {
     pub server_docs:      HashMap<String, ServerDoc>,
     /// Host: which documents each guest has open (only they get its edits/cursors).
     pub open_docs:        HashMap<u64, HashSet<String>>,
+    /// Set when the user leaves / stops the session: the host stops accepting and a
+    /// guest stops reconnecting.
+    pub stop:             Arc<AtomicBool>,
+    /// Guest: the connection dropped and is being re-established.
+    pub reconnecting:     bool,
+    /// Host: terminals shared with guests, by terminal id.
+    pub shared_terms:     HashMap<u64, SharedTerm>,
+    /// Guest: host terminal id → local (display-only) terminal id.
+    pub remote_terms:     HashMap<u64, usize>,
+    /// Host: each connected guest's resume token, and the roles of guests that
+    /// dropped (by token), restored if they reconnect.
+    pub resume_tokens:    HashMap<u64, String>,
+    pub resume_roles:     HashMap<String, PeerRole>,
 }
 
 pub enum CollabRole {
@@ -624,6 +678,25 @@ impl CollabSession {
             .filter(|(sid, docs)| docs.contains(path) && self.guest_may_view(**sid, path))
             .map(|(&sid, _)| sid)
             .collect()
+    }
+
+    /// Leave (guest) or stop hosting: no more reconnects / new connections, and
+    /// every connection is closed.
+    pub fn shutdown(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        match &self.role {
+            CollabRole::Host { guest_txs, port, .. } => {
+                // Dropping the senders ends each writer thread, which shuts its socket.
+                lock_recover(guest_txs).clear();
+                // Wake the accept loop so it sees `stop`.
+                let _ = TcpStream::connect_timeout(&std::net::SocketAddr::from(([127, 0, 0, 1], *port)), Duration::from_millis(300));
+            }
+            CollabRole::Guest { .. } => {
+                // Replace the sender: the old writer thread ends and shuts the socket.
+                let (tx, _) = mpsc::channel();
+                self.role = CollabRole::Guest { to_host: tx };
+            }
+        }
     }
 
     /// Invite string (host only; empty string for guests).
@@ -1015,6 +1088,8 @@ const GUEST_QUEUE: usize = 4096;
 const MAX_PENDING_CONNECTIONS: usize = 16;
 static PENDING_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
 
+/// `advertise`: extra host names / addresses for the invite (a public address with
+/// a forwarded port, a VPN name, …), tried by guests before the LAN addresses.
 pub fn start_host(
     port:          u16,
     doc_path:      String,
@@ -1022,18 +1097,22 @@ pub fn start_host(
     role_perms:    RolePermissions,
     include_globs: Vec<String>,
     exclude_globs: Vec<String>,
+    advertise:     &[String],
 ) -> Result<CollabSession, String> {
     // Generate session key
     let mut session_key = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut session_key);
 
-    // Find our LAN IP for the invite string
-    let lan_ip = local_ip_str();
-
-    // Encode key as base64url
-    use base64::Engine;
-    let key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(session_key);
-    let invite_str = format!("lt-collab://{}:{}#{}", lan_ip, port, key_b64);
+    // Every address a guest might reach us at: configured ones first, then this
+    // machine's interface addresses.
+    let mut addrs: Vec<String> = Vec::new();
+    for a in advertise.iter().map(|a| a.trim()).filter(|a| !a.is_empty()) {
+        addrs.push(with_port(a, port));
+    }
+    for ip in local_ips() { addrs.push(with_port(&ip.to_string(), port)); }
+    let mut seen = HashSet::new();
+    addrs.retain(|a| seen.insert(a.clone()));
+    let invite_str = format_invite(&addrs, &session_key);
 
     let guest_txs: GuestTxs = Arc::new(Mutex::new(HashMap::new()));
 
@@ -1045,9 +1124,12 @@ pub fn start_host(
     let guest_txs_accept  = Arc::clone(&guest_txs);
     let proxy_accept      = proxy.clone();
     let session_key_clone = session_key;
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_accept = Arc::clone(&stop);
     std::thread::spawn(move || {
         let mut next_site_id: u64 = 1;  // host is site 0
         for stream in listener.incoming() {
+            if stop_accept.load(Ordering::Acquire) { break; }
             let Ok(stream) = stream else { continue };
             if PENDING_CONNECTIONS.fetch_add(1, Ordering::AcqRel) >= MAX_PENDING_CONNECTIONS {
                 PENDING_CONNECTIONS.fetch_sub(1, Ordering::AcqRel);
@@ -1084,7 +1166,53 @@ pub fn start_host(
         client_docs:    HashMap::new(),
         server_docs:    HashMap::new(),
         open_docs:      HashMap::new(),
+        stop,
+        reconnecting:   false,
+        shared_terms:   HashMap::new(),
+        remote_terms:   HashMap::new(),
+        resume_tokens:  HashMap::new(),
+        resume_roles:   HashMap::new(),
     })
+}
+
+fn with_port(addr: &str, port: u16) -> String {
+    // Already has a port: "host:1234" or "[v6]:1234" (a bare v6 address has more colons).
+    let has_port = if addr.starts_with('[') { addr.contains("]:") } else { addr.matches(':').count() == 1 };
+    if has_port { addr.to_owned() }
+    else if addr.contains(':') { format!("[{addr}]:{port}") }
+    else { format!("{addr}:{port}") }
+}
+
+/// `lt-collab://addr1:port,addr2:port#base64url(key)`
+pub fn format_invite(addrs: &[String], key: &[u8; 32]) -> String {
+    use base64::Engine;
+    let key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key);
+    format!("lt-collab://{}#{}", addrs.join(","), key_b64)
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Invite {
+    pub addrs: Vec<String>,
+    pub key:   [u8; 32],
+}
+
+pub fn parse_invite(invite_str: &str) -> Result<Invite, String> {
+    let rest = invite_str.trim().strip_prefix("lt-collab://")
+        .ok_or("invite string must start with lt-collab://")?;
+    let (addr_part, key_part) = rest.split_once('#')
+        .ok_or("invite string missing # separator before key")?;
+    use base64::Engine;
+    let key_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(key_part)
+        .map_err(|_| "invalid base64 in invite key")?;
+    if key_bytes.len() != 32 {
+        return Err(format!("key must be 32 bytes, got {}", key_bytes.len()));
+    }
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&key_bytes);
+    let addrs: Vec<String> = addr_part.split(',').map(str::trim).filter(|a| !a.is_empty()).map(str::to_owned).collect();
+    if addrs.is_empty() { return Err("invite has no address".to_owned()); }
+    Ok(Invite { addrs, key })
 }
 
 /// Per-guest connection handler (runs on its own thread).
@@ -1124,7 +1252,7 @@ fn handle_guest(
     let join = read_frame(&mut reader, MAX_PREAUTH_FRAME).ok()
         .and_then(|f| opener.open(&f).ok());
     PENDING_CONNECTIONS.fetch_sub(1, Ordering::AcqRel);
-    let Some(CollabMsg::Join { peer_name }) = join else {
+    let Some(CollabMsg::Join { peer_name, resume }) = join else {
         let _ = writer.shutdown(Shutdown::Both);
         return;
     };
@@ -1150,7 +1278,8 @@ fn handle_guest(
         role: PeerRole::Viewer, // placeholder; host assigns real role
         current_file: String::new(),
     };
-    let _ = proxy.send_event(UserEvent::CollabGuestJoined { site_id, peer });
+    let resume = resume.filter(|t| t.len() <= 64);
+    let _ = proxy.send_event(UserEvent::CollabGuestJoined { site_id, peer, resume });
 
     while let Ok(frame) = read_frame(&mut reader, MAX_FRAME) {
         match opener.open(&frame) {
@@ -1173,178 +1302,235 @@ fn handle_guest(
 
 // ── Guest session startup ─────────────────────────────────────────────────────
 
+/// How long a guest keeps trying to reconnect after the connection drops.
+const RECONNECT_FOR: Duration = Duration::from_secs(300);
+
+/// An established, authenticated connection to the host.
+struct GuestConn {
+    reader:  TcpStream,
+    writer:  TcpStream,
+    opener:  FrameCipher,
+    sealer:  FrameCipher,
+    welcome: (u64, Vec<PeerInfo>, PeerRole, RolePermissions, Option<DocSnapshot>, Option<String>),
+}
+
+/// Connect to whichever of the invite's addresses answers first (tried in parallel).
+fn connect_any(addrs: &[String]) -> Result<TcpStream, String> {
+    use std::net::ToSocketAddrs;
+    let (tx, rx) = mpsc::channel::<Result<TcpStream, String>>();
+    for addr in addrs {
+        let (tx, addr) = (tx.clone(), addr.clone());
+        std::thread::spawn(move || {
+            let result = (|| {
+                let resolved: Vec<_> = addr.to_socket_addrs().map_err(|e| format!("{addr}: {e}"))?.collect();
+                let mut last = format!("{addr}: no address");
+                for sa in resolved {
+                    match TcpStream::connect_timeout(&sa, Duration::from_secs(5)) {
+                        Ok(s) => return Ok(s),
+                        Err(e) => last = format!("{addr}: {e}"),
+                    }
+                }
+                Err(last)
+            })();
+            let _ = tx.send(result);
+        });
+    }
+    drop(tx);
+    let mut errors = Vec::new();
+    while let Ok(r) = rx.recv_timeout(Duration::from_secs(12)) {
+        match r {
+            Ok(stream) => return Ok(stream),
+            Err(e) => errors.push(e),
+        }
+    }
+    Err(if errors.is_empty() { "connection timed out".to_owned() } else { errors.join("; ") })
+}
+
+/// Connect, exchange Hello/Join/Welcome, and return the live connection.
+fn guest_handshake(invite: &Invite, peer_name: &str, resume: Option<String>) -> Result<GuestConn, String> {
+    let stream = connect_any(&invite.addrs)?;
+    let _ = stream.set_nodelay(true);
+    let mut reader = stream.try_clone().map_err(|e| format!("socket error: {e}"))?;
+    let mut writer = stream;
+
+    // Hello: the host's connection id, which every frame below is bound to.
+    let _ = reader.set_read_timeout(Some(Duration::from_secs(15)));
+    let hello = read_frame(&mut reader, 64);
+    let conn_id = match hello {
+        Ok(h) if h.len() == HELLO_MAGIC.len() + CONN_ID_LEN && h.starts_with(HELLO_MAGIC) => {
+            let mut id = [0u8; CONN_ID_LEN];
+            id.copy_from_slice(&h[HELLO_MAGIC.len()..]);
+            id
+        }
+        Ok(_) => return Err("host speaks a different collab protocol version".to_owned()),
+        Err(e) => return Err(format!("read error: {e}")),
+    };
+    let mut sealer = FrameCipher::new(&invite.key, conn_id, DIR_GUEST_TO_HOST);
+    let mut opener = FrameCipher::new(&invite.key, conn_id, DIR_HOST_TO_GUEST);
+
+    let join_frame = sealer.seal_msg(&CollabMsg::Join { peer_name: peer_name.to_owned(), resume })
+        .map_err(|e| format!("encrypt error: {e}"))?;
+    write_frame(&mut writer, &join_frame).map_err(|_| "Failed to send Join".to_owned())?;
+
+    // Expect Welcome (the host only answers once the main loop has processed us).
+    let _ = reader.set_read_timeout(Some(Duration::from_secs(30)));
+    let welcome = loop {
+        let frame = read_frame(&mut reader, MAX_FRAME).map_err(|e| format!("read error: {e}"))?;
+        match opener.open(&frame) {
+            Ok(CollabMsg::Welcome { your_site_id, peers, role, role_perms, doc, resume_token }) => {
+                break (your_site_id, peers, role, role_perms, doc, resume_token);
+            }
+            Ok(CollabMsg::Error { message }) => return Err(message),
+            Err(e) => return Err(format!("bad key or corrupted Welcome: {e}")),
+            _ => { /* ignore other messages before Welcome */ }
+        }
+    };
+    let _ = reader.set_read_timeout(None);
+    Ok(GuestConn { reader, writer, opener, sealer, welcome })
+}
+
 pub fn connect_guest(
     invite_str: &str,
     peer_name:  String,
     proxy:      EventLoopProxy<UserEvent>,
 ) -> Result<(), String> {
-    // Parse: lt-collab://IP:PORT#base64url_key
-    let rest = invite_str.strip_prefix("lt-collab://")
-        .ok_or("invite string must start with lt-collab://")?;
-    let (addr_part, key_part) = rest.split_once('#')
-        .ok_or("invite string missing # separator before key")?;
-
-    use base64::Engine;
-    let key_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(key_part)
-        .map_err(|_| "invalid base64 in invite key")?;
-    if key_bytes.len() != 32 {
-        return Err(format!("key must be 32 bytes, got {}", key_bytes.len()));
-    }
-    let mut session_key = [0u8; 32];
-    session_key.copy_from_slice(&key_bytes);
-
-    let addr = addr_part.to_owned();
-
-    std::thread::spawn(move || {
-        let stream = match TcpStream::connect(&addr) {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = proxy.send_event(UserEvent::CollabError {
-                    msg: format!("Failed to connect to {addr}: {e}"),
-                });
-                return;
-            }
-        };
-        let _ = stream.set_nodelay(true);
-
-        let Ok(mut reader) = stream.try_clone() else {
-            let _ = proxy.send_event(UserEvent::CollabError { msg: "socket error".to_owned() });
-            return;
-        };
-        let mut writer = stream;
-
-        // Hello: the host's connection id, which every frame below is bound to.
-        let _ = reader.set_read_timeout(Some(Duration::from_secs(15)));
-        let hello = read_frame(&mut reader, 64);
-        let _ = reader.set_read_timeout(None);
-        let conn_id = match hello {
-            Ok(h) if h.len() == HELLO_MAGIC.len() + CONN_ID_LEN && h.starts_with(HELLO_MAGIC) => {
-                let mut id = [0u8; CONN_ID_LEN];
-                id.copy_from_slice(&h[HELLO_MAGIC.len()..]);
-                id
-            }
-            Ok(_) => {
-                let _ = proxy.send_event(UserEvent::CollabError {
-                    msg: "host speaks a different collab protocol version".to_owned(),
-                });
-                return;
-            }
-            Err(e) => {
-                let _ = proxy.send_event(UserEvent::CollabError { msg: format!("read error: {e}") });
-                return;
-            }
-        };
-        let mut sealer = FrameCipher::new(&session_key, conn_id, DIR_GUEST_TO_HOST);
-        let mut opener = FrameCipher::new(&session_key, conn_id, DIR_HOST_TO_GUEST);
-
-        // Send Join
-        let join_msg = CollabMsg::Join { peer_name };
-        let join_frame = match sealer.seal_msg(&join_msg) {
-            Ok(f) => f,
-            Err(e) => {
-                let _ = proxy.send_event(UserEvent::CollabError { msg: format!("encrypt error: {e}") });
-                return;
-            }
-        };
-        if write_frame(&mut writer, &join_frame).is_err() {
-            let _ = proxy.send_event(UserEvent::CollabError { msg: "Failed to send Join".to_owned() });
-            return;
-        }
-
-        // Expect Welcome
-        let welcome = loop {
-            let frame = match read_frame(&mut reader, MAX_FRAME) {
-                Ok(f) => f,
-                Err(e) => {
-                    let _ = proxy.send_event(UserEvent::CollabError { msg: format!("read error: {e}") });
-                    return;
-                }
-            };
-            match opener.open(&frame) {
-                Ok(CollabMsg::Welcome { your_site_id, peers, role, role_perms, doc }) => {
-                    break (your_site_id, peers, role, role_perms, doc);
-                }
-                Ok(CollabMsg::Error { message }) => {
-                    let _ = proxy.send_event(UserEvent::CollabError { msg: message });
-                    return;
-                }
-                Err(e) => {
-                    let _ = proxy.send_event(UserEvent::CollabError {
-                        msg: format!("bad key or corrupted Welcome: {e}"),
-                    });
-                    return;
-                }
-                _ => { /* ignore other messages before Welcome */ }
-            }
-        };
-        let (site_id, peers, my_role, role_perms, doc) = welcome;
-
-        // Writer thread
-        let (tx, rx) = mpsc::channel::<Vec<u8>>();
-        std::thread::spawn(move || {
-            for payload in rx {
-                let Ok(frame) = sealer.seal(&payload) else { break };
-                if write_frame(&mut writer, &frame).is_err() { break; }
-            }
-            let _ = writer.shutdown(Shutdown::Both);
-        });
-
-        let session = Box::new(CollabSession {
-            site_id,
-            role:            CollabRole::Guest { to_host: tx },
-            peers,
-            remote_cursors:  HashMap::new(),
-            doc_path:        String::new(),
-            session_key,
-            last_cursor_sent: Instant::now(),
-            role_perms,
-            my_role:         Some(my_role),
-            include_globs:   Vec::new(), // host-side only; guests receive a filtered FileList
-            exclude_globs:   Vec::new(),
-            client_docs:     HashMap::new(),
-            server_docs:     HashMap::new(),
-            open_docs:       HashMap::new(),
-        });
-
-        let _ = proxy.send_event(UserEvent::CollabConnected { session, doc });
-
-        // Reader loop
-        loop {
-            let frame = match read_frame(&mut reader, MAX_FRAME) {
-                Ok(f) => f,
-                Err(_) => {
-                    let _ = proxy.send_event(UserEvent::CollabDisconnected);
-                    break;
-                }
-            };
-            match opener.open(&frame) {
-                Ok(msg) => {
-                    let _ = proxy.send_event(UserEvent::CollabMessage { from_site_id: 0, msg });
-                }
-                Err(e) => {
-                    // Out of sequence (replayed/injected) or tampered: disconnect.
-                    eprintln!("collab: dropping connection to host: {e}");
-                    let _ = reader.shutdown(Shutdown::Both);
-                    let _ = proxy.send_event(UserEvent::CollabDisconnected);
-                    break;
-                }
-            }
-        }
-    });
-
+    let invite = parse_invite(invite_str)?;
+    std::thread::spawn(move || guest_loop(invite, peer_name, proxy));
     Ok(())
 }
 
-// ── LAN IP detection ──────────────────────────────────────────────────────────
+/// The guest's connection thread: connect, relay messages, and after an
+/// unexpected drop keep reconnecting (with backoff) for `RECONNECT_FOR`.
+fn guest_loop(invite: Invite, peer_name: String, proxy: EventLoopProxy<UserEvent>) {
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut resume: Option<String> = None;
+    let mut first = true;
+    let mut lost_at: Option<Instant> = None;
+    let mut attempt: u32 = 0;
+    loop {
+        match guest_handshake(&invite, &peer_name, resume.clone()) {
+            Ok(GuestConn { mut reader, mut writer, mut opener, mut sealer, welcome }) => {
+                let (site_id, peers, my_role, role_perms, doc, token) = welcome;
+                if token.is_some() { resume = token; }
+                attempt = 0;
 
-fn local_ip_str() -> String {
-    // Connect a UDP socket to a public IP (doesn't actually send anything)
-    // to determine which local interface would be used.
-    std::net::UdpSocket::bind("0.0.0.0:0")
+                // Writer thread
+                let (tx, rx) = mpsc::channel::<Vec<u8>>();
+                std::thread::spawn(move || {
+                    for payload in rx {
+                        let Ok(frame) = sealer.seal(&payload) else { break };
+                        if write_frame(&mut writer, &frame).is_err() { break; }
+                    }
+                    let _ = writer.shutdown(Shutdown::Both);
+                });
+
+                if first {
+                    let session = Box::new(CollabSession {
+                        site_id,
+                        role:            CollabRole::Guest { to_host: tx },
+                        peers,
+                        remote_cursors:  HashMap::new(),
+                        doc_path:        String::new(),
+                        session_key:     invite.key,
+                        last_cursor_sent: Instant::now(),
+                        role_perms,
+                        my_role:         Some(my_role),
+                        include_globs:   Vec::new(), // host-side only; guests receive a filtered FileList
+                        exclude_globs:   Vec::new(),
+                        client_docs:     HashMap::new(),
+                        server_docs:     HashMap::new(),
+                        open_docs:       HashMap::new(),
+                        stop:            Arc::clone(&stop),
+                        reconnecting:    false,
+                        shared_terms:    HashMap::new(),
+                        remote_terms:    HashMap::new(),
+                        resume_tokens:   HashMap::new(),
+                        resume_roles:    HashMap::new(),
+                    });
+                    first = false;
+                    let _ = proxy.send_event(UserEvent::CollabConnected { session, doc });
+                } else {
+                    let _ = proxy.send_event(UserEvent::CollabReconnected {
+                        site_id, peers, role: my_role, role_perms, doc, to_host: tx,
+                    });
+                }
+
+                // Reader loop: until the connection ends.
+                while let Ok(frame) = read_frame(&mut reader, MAX_FRAME) {
+                    match opener.open(&frame) {
+                        Ok(msg) => {
+                            let _ = proxy.send_event(UserEvent::CollabMessage { from_site_id: 0, msg });
+                        }
+                        Err(e) => {
+                            // Out of sequence (replayed/injected) or tampered: disconnect.
+                            eprintln!("collab: dropping connection to host: {e}");
+                            break;
+                        }
+                    }
+                }
+                let _ = reader.shutdown(Shutdown::Both);
+                if stop.load(Ordering::Acquire) { return; }
+                lost_at = Some(Instant::now());
+            }
+            Err(e) => {
+                if first {
+                    let _ = proxy.send_event(UserEvent::CollabError { msg: e });
+                    return;
+                }
+                if stop.load(Ordering::Acquire) { return; }
+            }
+        }
+        if lost_at.map_or(true, |t| t.elapsed() > RECONNECT_FOR) {
+            let _ = proxy.send_event(UserEvent::CollabDisconnected);
+            return;
+        }
+        attempt += 1;
+        let _ = proxy.send_event(UserEvent::CollabReconnecting { attempt });
+        let wait = Duration::from_secs((1u64 << attempt.min(4)).min(15));
+        let until = Instant::now() + wait;
+        while Instant::now() < until {
+            if stop.load(Ordering::Acquire) { return; }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+}
+
+// ── Local address detection ───────────────────────────────────────────────────
+
+/// This machine's non-loopback IPv4 addresses (the host listens on IPv4), with the
+/// one that routes to the internet first.
+fn local_ips() -> Vec<std::net::IpAddr> {
+    let mut ips: Vec<std::net::IpAddr> = Vec::new();
+    // The interface the default route uses (connecting a UDP socket sends nothing).
+    if let Ok(a) = std::net::UdpSocket::bind("0.0.0.0:0")
         .and_then(|s| { s.connect("8.8.8.8:80")?; s.local_addr() })
-        .map(|a| a.ip().to_string())
-        .unwrap_or_else(|_| "127.0.0.1".to_owned())
+    {
+        if !a.ip().is_loopback() && !a.ip().is_unspecified() { ips.push(a.ip()); }
+    }
+    #[cfg(unix)]
+    unsafe {
+        // SAFETY: getifaddrs allocates a list we walk read-only and free once.
+        let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut list) == 0 {
+            let mut cur = list;
+            while !cur.is_null() {
+                let ifa = &*cur;
+                if !ifa.ifa_addr.is_null() && (*ifa.ifa_addr).sa_family as i32 == libc::AF_INET {
+                    let sin = &*(ifa.ifa_addr as *const libc::sockaddr_in);
+                    let ip = std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
+                    if !ip.is_loopback() && !ip.is_link_local() && !ip.is_unspecified() {
+                        ips.push(std::net::IpAddr::V4(ip));
+                    }
+                }
+                cur = ifa.ifa_next;
+            }
+            libc::freeifaddrs(list);
+        }
+    }
+    let mut seen = HashSet::new();
+    ips.retain(|ip| seen.insert(*ip));
+    if ips.is_empty() { ips.push(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)); }
+    ips
 }
 
 #[cfg(test)]
@@ -1376,6 +1562,63 @@ mod tests {
             assert!(!is_safe_rel_path("dir\\.secret\\file"));
             assert!(!is_safe_rel_path("file.txt:stream"));
         }
+    }
+
+    #[test]
+    fn invites_carry_several_addresses() {
+        let key = [9u8; 32];
+        let addrs = vec![with_port("example.org", 7777), with_port("10.0.0.5", 7777),
+                         with_port("fd00::1", 7777), with_port("host:9000", 7777)];
+        assert_eq!(addrs, vec!["example.org:7777", "10.0.0.5:7777", "[fd00::1]:7777", "host:9000"]);
+        let inv = parse_invite(&format_invite(&addrs, &key)).unwrap();
+        assert_eq!(inv, Invite { addrs, key });
+        // The single-address form of older invites still parses.
+        let old = format_invite(&["1.2.3.4:7777".to_owned()], &key);
+        assert_eq!(parse_invite(&old).unwrap().addrs, vec!["1.2.3.4:7777"]);
+        assert!(parse_invite("lt-collab://#AAAA").is_err());
+    }
+
+    #[test]
+    fn guest_handshake_tries_every_invite_address_and_gets_a_resume_token() {
+        let key = [5u8; 32];
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let live = listener.local_addr().unwrap().to_string();
+        // A port nothing listens on (bound then dropped) goes first in the invite.
+        let dead = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().to_string();
+        let host = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = stream.try_clone().unwrap();
+            let mut writer = stream;
+            let conn_id = [7u8; CONN_ID_LEN];
+            let hello = [&HELLO_MAGIC[..], &conn_id[..]].concat();
+            let mut frame = (hello.len() as u32).to_be_bytes().to_vec();
+            frame.extend_from_slice(&hello);
+            write_frame(&mut writer, &frame).unwrap();
+            let mut opener = FrameCipher::new(&key, conn_id, DIR_GUEST_TO_HOST);
+            let mut sealer = FrameCipher::new(&key, conn_id, DIR_HOST_TO_GUEST);
+            let join = opener.open(&read_frame(&mut reader, MAX_PREAUTH_FRAME).unwrap()).unwrap();
+            let CollabMsg::Join { peer_name, resume } = join else { panic!("expected Join") };
+            assert_eq!((peer_name.as_str(), resume.as_deref()), ("alice", Some("tok-1")));
+            let welcome = CollabMsg::Welcome {
+                your_site_id: 3, peers: vec![], role: PeerRole::Contributor,
+                role_perms: RolePermissions::default(), doc: None, resume_token: Some("tok-2".into()),
+            };
+            write_frame(&mut writer, &sealer.seal_msg(&welcome).unwrap()).unwrap();
+        });
+        let invite = Invite { addrs: vec![dead, live], key };
+        let conn = guest_handshake(&invite, "alice", Some("tok-1".into())).unwrap();
+        let (site, _, role, _, _, token) = conn.welcome;
+        assert_eq!((site, role, token.as_deref()), (3, PeerRole::Contributor, Some("tok-2")));
+        host.join().unwrap();
+        // A wrong key fails cleanly rather than hanging.
+        let bad = Invite { addrs: vec!["127.0.0.1:1".into()], key };
+        assert!(guest_handshake(&bad, "x", None).is_err());
+    }
+
+    #[test]
+    fn terminal_bytes_round_trip() {
+        let bytes: Vec<u8> = (0u8..=255).collect();
+        assert_eq!(term_decode(&term_encode(&bytes)).unwrap(), bytes);
     }
 
     #[cfg(unix)]
@@ -1419,7 +1662,7 @@ mod tests {
     fn frame_from_another_connection_or_direction_is_rejected() {
         let key = [7u8; 32];
         let mut tx = FrameCipher::new(&key, [1; CONN_ID_LEN], DIR_GUEST_TO_HOST);
-        let join = tx.seal_msg(&CollabMsg::Join { peer_name: "x".into() }).unwrap();
+        let join = tx.seal_msg(&CollabMsg::Join { peer_name: "x".into(), resume: None }).unwrap();
         // A captured Join replayed on a new connection (new id from the host).
         let mut other_conn = FrameCipher::new(&key, [2; CONN_ID_LEN], DIR_GUEST_TO_HOST);
         assert!(other_conn.open(body(&join)).is_err());
