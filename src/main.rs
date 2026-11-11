@@ -15,6 +15,7 @@ mod layout;
 mod encoding;
 mod search;
 mod theme;
+mod session;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -2463,6 +2464,9 @@ struct State {
     /// "Save again to overwrite": a save of this file was refused because it
     /// changed on disk; a second save within a few seconds overwrites it.
     overwrite_armed: Option<(VPath, Instant)>,
+    /// The last session written (skip rewriting an unchanged one), and when.
+    last_session_json: String,
+    last_session_save: Instant,
 }
 
 #[derive(Clone, PartialEq)]
@@ -7439,6 +7443,145 @@ fn invalidate_color_caches(s: &mut State) {
     s.needs_redraw = true;
 }
 
+/// Leave the app: remember the session, then close.
+fn quit_app(s: &mut State, el: &ActiveEventLoop) {
+    save_session(s);
+    s.panes.clear();
+    el.exit();
+}
+
+// ── Session restore ───────────────────────────────────────────────────────────
+
+fn session_key(s: &State) -> String {
+    s.explorer.as_ref().map(|e| vpath_session_string(&e.root)).unwrap_or_default()
+}
+
+fn vpath_session_string(p: &VPath) -> String {
+    match p {
+        VPath::Local(l) => l.to_string_lossy().into_owned(),
+        VPath::Remote { .. } => remote_uri(p).unwrap_or_default(),
+    }
+}
+
+fn capture_session(s: &State) -> session::Session {
+    fn node(s: &State, t: &PaneTree, leaves: &mut Vec<usize>) -> Option<session::SessionNode> {
+        match t {
+            PaneTree::Leaf(id) => {
+                let p = s.panes.get(id)?;
+                if p.kind != PaneKind::Editor { return None; }
+                let mut tabs = Vec::new();
+                let mut active = 0;
+                for (i, tab) in p.tabs.iter().enumerate() {
+                    if tab.kind != TabKind::Editor || tab.collab_path.is_some() { continue; }
+                    let Some(path) = &tab.path else { continue };
+                    if i == p.active { active = tabs.len(); }
+                    tabs.push(session::SessionTab {
+                        path: vpath_session_string(path),
+                        cursor: tab.primary().head,
+                        scroll: tab.scroll,
+                    });
+                }
+                leaves.push(*id);
+                Some(session::SessionNode::Leaf { tabs, active })
+            }
+            PaneTree::Split { axis, ratio, a, b } => {
+                match (node(s, a, leaves), node(s, b, leaves)) {
+                    (Some(x), Some(y)) => Some(session::SessionNode::Split {
+                        vertical: *axis == Axis::V, ratio: *ratio, a: Box::new(x), b: Box::new(y),
+                    }),
+                    (x, y) => x.or(y),
+                }
+            }
+        }
+    }
+    let mut leaves = Vec::new();
+    let layout = node(s, &s.pane_tree, &mut leaves);
+    session::Session {
+        version: 1,
+        root: s.explorer.as_ref().map(|e| vpath_session_string(&e.root)),
+        layout,
+        active_leaf: leaves.iter().position(|&id| id == s.active_pane).unwrap_or(0),
+    }
+}
+
+/// Write the session (skipped while a collab guest: those tabs belong to the host).
+fn save_session(s: &mut State) {
+    if !s.settings.restore_session || s.panes.is_empty() { return; }
+    if s.collab.as_ref().is_some_and(|c| !c.is_host()) { return; }
+    let sess = capture_session(s);
+    let text = serde_json::to_string(&sess).unwrap_or_default();
+    if text == s.last_session_json { return; }
+    session::save(&session_key(s), &sess);
+    s.last_session_json = text;
+}
+
+/// Rebuild the saved layout and reopen its files (replacing the startup pane).
+fn restore_session(s: &mut State, sess: session::Session) {
+    let Some(layout) = sess.layout else { return };
+    let mut bufs: HashMap<VPath, usize> = HashMap::new();
+    let mut panes: HashMap<usize, Pane> = HashMap::new();
+    let mut leaves: Vec<usize> = Vec::new();
+    let mut hosts: Vec<vpath::SshHost> = Vec::new();
+    let mut opened: Vec<VPath> = Vec::new();
+
+    fn build(s: &mut State, n: session::SessionNode, panes: &mut HashMap<usize, Pane>, leaves: &mut Vec<usize>,
+             bufs: &mut HashMap<VPath, usize>, hosts: &mut Vec<vpath::SshHost>, opened: &mut Vec<VPath>) -> PaneTree {
+        match n {
+            session::SessionNode::Split { vertical, ratio, a, b } => PaneTree::Split {
+                axis: if vertical { Axis::V } else { Axis::H },
+                ratio: ratio.clamp(0.05, 0.95),
+                a: Box::new(build(s, *a, panes, leaves, bufs, hosts, opened)),
+                b: Box::new(build(s, *b, panes, leaves, bufs, hosts, opened)),
+            },
+            session::SessionNode::Leaf { tabs, active } => {
+                let id = s.next_pane_id;
+                s.next_pane_id += 1;
+                let mut pane = Pane::new(id, s.next_buf_id);
+                s.next_buf_id += 1;
+                pane.tabs.clear();
+                let mut active_idx = 0;
+                for (i, st) in tabs.into_iter().enumerate() {
+                    let path = VPath::parse(&st.path);
+                    let buf_id = *bufs.entry(path.clone()).or_insert_with(|| { s.next_buf_id += 1; s.next_buf_id - 1 });
+                    let mut tab = Tab::untitled(buf_id);
+                    match tab.load_file(path.clone()) {
+                        Ok(()) => {
+                            tab.cursors = vec![Cursor::new(st.cursor.min(tab.text.len_chars()))];
+                            tab.scroll = st.scroll.min(tab.text.len_lines().saturating_sub(1));
+                            if !opened.contains(&path) { opened.push(path.clone()); }
+                        }
+                        Err(LoadError::Remote) => {
+                            if let Some(h) = path.ssh_host() {
+                                if !hosts.contains(h) { hosts.push(h.clone()); }
+                            }
+                        }
+                        Err(_) => continue, // deleted or unreadable since: drop the tab
+                    }
+                    if i == active { active_idx = pane.tabs.len(); }
+                    pane.tabs.push(tab);
+                }
+                if pane.tabs.is_empty() {
+                    pane.tabs.push(Tab::untitled(s.next_buf_id));
+                    s.next_buf_id += 1;
+                }
+                pane.active = active_idx.min(pane.tabs.len() - 1);
+                panes.insert(id, pane);
+                leaves.push(id);
+                PaneTree::Leaf(id)
+            }
+        }
+    }
+
+    let tree = build(s, layout, &mut panes, &mut leaves, &mut bufs, &mut hosts, &mut opened);
+    if panes.values().all(|p| p.tabs.iter().all(|t| t.is_empty_untitled())) { return; }
+    s.panes = panes;
+    s.pane_tree = tree;
+    s.active_pane = leaves.get(sess.active_leaf).or(leaves.first()).copied().unwrap_or(0);
+    for host in hosts { ssh::ensure_control_master(host, s.proxy.clone()); }
+    for path in opened { notify_lsp_open(s, &path); }
+    s.last_session_json = serde_json::to_string(&capture_session(s)).unwrap_or_default();
+}
+
 fn toggle_word_wrap(s: &mut State) {
     s.settings.word_wrap = !s.settings.word_wrap;
     s.settings.save();
@@ -8500,6 +8643,7 @@ impl App {
         let mut startup_status: Option<String> = None;
         let file_arg = self.file_arg.take();
         let dir_arg  = self.dir_arg.take();
+        let (launched_with_file, launched_with_dir) = (file_arg.is_some(), dir_arg.is_some());
 
         // Kick off SSH ControlMaster for any remote path before trying to open it.
         let remote_host = file_arg.as_ref().and_then(|p| p.ssh_host().cloned())
@@ -8636,10 +8780,30 @@ impl App {
             window_focused:  true,
             last_disk_check: Instant::now(),
             overwrite_armed: None,
+            last_session_json: String::new(),
+            last_session_save: Instant::now(),
         };
 
         if let Some(path) = initial_lsp_path {
             notify_lsp_open(&mut s, &path);
+        }
+        // Reopen the previous session: the one for the folder given on the command
+        // line, or with no arguments the last workspace used (folder included).
+        if s.settings.restore_session && !launched_with_file {
+            let key = if launched_with_dir { Some(session_key(&s)) } else { session::last_key() };
+            if let Some(sess) = key.as_deref().and_then(session::load) {
+                if !launched_with_dir {
+                    if let Some(root) = sess.root.as_deref().map(VPath::parse) {
+                        if root.as_local_path().map_or(true, |p| p.is_dir()) {
+                            if let Some(host) = root.ssh_host() {
+                                ssh::ensure_control_master(host.clone(), self.proxy.clone());
+                            }
+                            s.explorer = Some(FileExplorer::new(root));
+                        }
+                    }
+                }
+                restore_session(&mut s, sess);
+            }
         }
         if let Some(root) = s.explorer.as_ref().map(|ex| ex.root.clone()) {
             start_lsp_for_project(&mut s, &root);
@@ -8658,7 +8822,8 @@ impl App {
     fn handle_exiting(&mut self, _el: &ActiveEventLoop) {
         // Exits that bypass our close prompt (e.g. Cmd+Q from the macOS app menu)
         // still must not lose work: dump unsaved buffers to the recovery folder.
-        if let Some(s) = self.state.as_ref() {
+        if let Some(s) = self.state.as_mut() {
+            save_session(s);
             write_recovery_files(s);
         }
         // Best-effort: remove our registry entries + control socket. The liveness
@@ -8675,8 +8840,7 @@ impl App {
         match event {
             WindowEvent::CloseRequested => {
                 if request_quit(s) {
-                    s.panes.clear();
-                    el.exit();
+                    quit_app(s, el);
                 }
                 s.needs_redraw = true;
             }
@@ -9229,8 +9393,7 @@ impl App {
                         if let Some(sel) = target {
                             s.quick_finder.selected = sel;
                             if quick_finder_accept(s) {
-                                s.panes.clear();
-                                el.exit();
+                                quit_app(s, el);
                                 return;
                             }
                         }
@@ -9544,8 +9707,7 @@ impl App {
                                     if let Some((pid, ti)) = tab_source {
                                         s.active_pane = pid;
                                         if request_close_editor_tab(s, pid, ti) == Some(true) {
-                                            s.panes.clear();
-                                            el.exit();
+                                            quit_app(s, el);
                                         }
                                     }
                                 }
@@ -9926,8 +10088,7 @@ impl App {
                                     if s.lsp.servers.contains_key(&clicked_pane_id) {
                                         hide_lsp_output_pane(s, clicked_pane_id);
                                     } else if close_terminal_tab(s, clicked_pane_id, i) {
-                                        s.panes.clear();
-                                        el.exit();
+                                        quit_app(s, el);
                                         { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                                         return;
                                     }
@@ -9962,8 +10123,7 @@ impl App {
                                 s.active_pane = clicked_pane_id;
                                 let pane_id = clicked_pane_id;
                                 if request_close_editor_tab(s, pane_id, i) == Some(true) {
-                                    s.panes.clear();
-                                    el.exit();
+                                    quit_app(s, el);
                                 }
                                 { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
                                 return;
@@ -10672,8 +10832,7 @@ impl App {
                     && matches!(&event.logical_key, Key::Character(c) if c.eq_ignore_ascii_case("q"))
                 {
                     if request_quit(s) {
-                        s.panes.clear();
-                        el.exit();
+                        quit_app(s, el);
                         return;
                     }
                     { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
@@ -10837,8 +10996,7 @@ impl App {
                         }
                         Key::Named(NamedKey::Enter) => {
                             if quick_finder_accept(s) {
-                                s.panes.clear();
-                                el.exit();
+                                quit_app(s, el);
                                 return;
                             }
                         }
@@ -11193,8 +11351,7 @@ impl App {
                 // In a focused terminal on Linux Ctrl+W is the shell's: Ctrl+Shift+W.
                 if cmd && shift == shell_keys && matches!(&event.logical_key, Key::Character(c) if c.eq_ignore_ascii_case("w")) {
                     if close_active_tab(s) {
-                        s.panes.clear();
-                        el.exit();
+                        quit_app(s, el);
                         return;
                     }
                     { s.needs_redraw = true; self.dirty.store(true, Ordering::Release); }
@@ -11830,6 +11987,10 @@ impl App {
             if s.collab.is_some() && !s.panes.is_empty() {
                 notify_collab_change(s);
                 send_collab_cursor_if_needed(s);
+            }
+            if s.last_session_save.elapsed() >= Duration::from_secs(30) {
+                s.last_session_save = Instant::now();
+                save_session(s);
             }
             if s.window_focused && s.last_disk_check.elapsed() >= Duration::from_secs(2) {
                 check_disk_changes(s, false);

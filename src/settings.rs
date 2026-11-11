@@ -141,6 +141,8 @@ pub struct Settings {
     /// Per-color overrides on top of the theme: field name (e.g. "bg", "accent",
     /// "hl_keyword", "ansi1") → "#RRGGBB".
     pub theme_overrides:    std::collections::HashMap<String, String>,
+    /// Reopen the files and split layout of the last session on launch.
+    pub restore_session:    bool,
 }
 
 impl Default for Settings {
@@ -176,6 +178,7 @@ impl Default for Settings {
             word_wrap:                false,
             theme:                    crate::theme::TOKYO_NIGHT.name.to_owned(),
             theme_overrides:          std::collections::HashMap::new(),
+            restore_session:          true,
         }
     }
 }
