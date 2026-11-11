@@ -136,6 +136,11 @@ pub struct Settings {
     pub detect_indentation: bool,
     /// Soft-wrap long lines at the window edge.
     pub word_wrap:          bool,
+    /// Color theme: one of the built-in names (see `theme::BUILTIN`).
+    pub theme:              String,
+    /// Per-color overrides on top of the theme: field name (e.g. "bg", "accent",
+    /// "hl_keyword", "ansi1") → "#RRGGBB".
+    pub theme_overrides:    std::collections::HashMap<String, String>,
 }
 
 impl Default for Settings {
@@ -169,6 +174,8 @@ impl Default for Settings {
             insert_spaces:            true,
             detect_indentation:       true,
             word_wrap:                false,
+            theme:                    crate::theme::TOKYO_NIGHT.name.to_owned(),
+            theme_overrides:          std::collections::HashMap::new(),
         }
     }
 }

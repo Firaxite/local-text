@@ -15,27 +15,19 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use crate::UserEvent;
 
 // ── Color palette defaults (TokyoNight) ──────────────────────────────────────
-const DEFAULT_FG: u32 = 0xA9B1D6;
-const DEFAULT_BG: u32 = 0x1A1B26;
+/// Cell colors are 0x00RRGGBB, except these sentinels, which the renderer resolves
+/// through the current theme (`theme::term_color`) so a theme switch recolors
+/// output that is already on screen: the default fg/bg, and ANSI colors 0–15
+/// (`ANSI_FLAG | index`).
+pub const DEFAULT_FG: u32 = 0x0100_0000;
+pub const DEFAULT_BG: u32 = 0x0200_0000;
+pub const ANSI_FLAG:  u32 = 0x0400_0000;
 
-// Standard 16 ANSI colors mapped to TokyoNight equivalents.
 const ANSI16: [u32; 16] = [
-    0x15161E, // 0  black
-    0xF7768E, // 1  red
-    0x9ECE6A, // 2  green
-    0xE0AF68, // 3  yellow
-    0x7AA2F7, // 4  blue
-    0xBB9AF7, // 5  magenta
-    0x7DCFFF, // 6  cyan
-    0xA9B1D6, // 7  white
-    0x414868, // 8  bright black
-    0xF7768E, // 9  bright red
-    0x9ECE6A, // 10 bright green
-    0xE0AF68, // 11 bright yellow
-    0x7AA2F7, // 12 bright blue
-    0xBB9AF7, // 13 bright magenta
-    0x7DCFFF, // 14 bright cyan
-    0xC0CAF5, // 15 bright white
+    ANSI_FLAG, ANSI_FLAG | 1, ANSI_FLAG | 2, ANSI_FLAG | 3,
+    ANSI_FLAG | 4, ANSI_FLAG | 5, ANSI_FLAG | 6, ANSI_FLAG | 7,
+    ANSI_FLAG | 8, ANSI_FLAG | 9, ANSI_FLAG | 10, ANSI_FLAG | 11,
+    ANSI_FLAG | 12, ANSI_FLAG | 13, ANSI_FLAG | 14, ANSI_FLAG | 15,
 ];
 
 // ── Cell ─────────────────────────────────────────────────────────────────────

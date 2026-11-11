@@ -14,6 +14,7 @@ mod collab;
 mod layout;
 mod encoding;
 mod search;
+mod theme;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -48,36 +49,9 @@ macro_rules! dlog {
     }
 }
 
-// ── TokyoNight palette (0x00RRGGBB) ──────────────────────────────────────────
-const BG:     u32 = 0x1A1B26;
-const BG2:    u32 = 0x24283B;
-const FG:     u32 = 0xA9B1D6;
-const FG_DIM: u32 = 0x565F89;
-const ACCENT: u32 = 0x7AA2F7;
-const BORDER: u32 = 0x3B4261;
-const SEL_BG: u32 = 0x2D3149;
-
-// ── Syntax highlight colors (TokyoNight) ─────────────────────────────────────
-const HL_KEYWORD: u32 = 0xBB9AF7;
-const HL_STRING:  u32 = 0x9ECE6A;
-const HL_NUMBER:  u32 = 0xFF9E64;
-const HL_COMMENT: u32 = 0x565F89;
-const HL_TYPE:    u32 = 0x2AC3DE;
-const HL_FUNC:    u32 = 0x7AA2F7;
-
-// ── Find highlight colors ─────────────────────────────────────────────────────
-const HL_MATCH:        u32 = 0x3D3557; // subtle purple — inactive find matches
-const HL_MATCH_ACTIVE: u32 = 0x524175; // brighter purple — active match
-
-// ── Git diff colors ───────────────────────────────────────────────────────────
-const DIFF_ADD_FG: u32 = 0x9ECE6A;  // green  – added line text
-const DIFF_DEL_FG: u32 = 0xF7768E;  // red    – removed line text
-const DIFF_ADD_BG: u32 = 0x20322E;  // dark green tint – added line background
-const DIFF_DEL_BG: u32 = 0x32201E;  // dark red tint   – removed line background
-const DIFF_HUNK:   u32 = 0x7DCFFF;  // cyan   – @@ hunk header
-
-// ── Rainbow bracket colors (depth-cycled) ────────────────────────────────────
-const RAINBOW: [u32; 6] = [0xFF79C6, 0xFFB86C, 0xF1FA8C, 0x50FA7B, 0x8BE9FD, 0xBD93F9];
+// ── Colors: see theme.rs (the active theme is read on every frame) ───────────
+#[inline]
+fn th() -> &'static theme::Theme { theme::current() }
 
 // ── Language detection ────────────────────────────────────────────────────────
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -182,7 +156,6 @@ enum MlState {
 const FONT_PX:  f32 = 14.0;
 const ED_LPAD:  i32 = 6;
 const SB_W:       i32 = 6;
-const SB_THUMB:   u32 = 0x414868;
 
 // ── Glyph cache ───────────────────────────────────────────────────────────────
 
@@ -554,6 +527,7 @@ enum CommandAction {
     ToggleWordWrap,
     IndentSpaces, IndentTabs, TabSize(usize), DetectIndent,
     RevertFile,
+    SetTheme(usize),
     ReopenWithEncoding(encoding::Encoding),
     SaveWithEncoding(encoding::Encoding),
 }
@@ -596,6 +570,10 @@ const COMMANDS: &[CommandEntry] = &[
     CommandEntry { name: "Indentation: Tab Size 8", shortcut: "",             action: CommandAction::TabSize(8) },
     CommandEntry { name: "Indentation: Detect from Content", shortcut: "",    action: CommandAction::DetectIndent },
     CommandEntry { name: "File: Revert to Disk Version", shortcut: "",        action: CommandAction::RevertFile },
+    CommandEntry { name: "Theme: Tokyo Night",   shortcut: "", action: CommandAction::SetTheme(0) },
+    CommandEntry { name: "Theme: Midnight",      shortcut: "", action: CommandAction::SetTheme(1) },
+    CommandEntry { name: "Theme: Paper Light",   shortcut: "", action: CommandAction::SetTheme(2) },
+    CommandEntry { name: "Theme: High Contrast", shortcut: "", action: CommandAction::SetTheme(3) },
     CommandEntry { name: "File Encoding: Reopen as UTF-8", shortcut: "", action: CommandAction::ReopenWithEncoding(encoding::Encoding::Utf8) },
     CommandEntry { name: "File Encoding: Reopen as UTF-8 with BOM", shortcut: "", action: CommandAction::ReopenWithEncoding(encoding::Encoding::Utf8Bom) },
     CommandEntry { name: "File Encoding: Reopen as UTF-16 LE", shortcut: "", action: CommandAction::ReopenWithEncoding(encoding::Encoding::Utf16Le) },
@@ -1324,7 +1302,6 @@ fn explorer_entry_vpath(ex: &FileExplorer, path: PathBuf) -> VPath {
 }
 
 // ── Pane layout types ─────────────────────────────────────────────────────────
-const DRAG_ZONE: u32 = 0x2A3F6F;
 
 #[derive(Clone, Copy)]
 struct Rect { x: i32, y: i32, w: i32, h: i32 }
@@ -4253,11 +4230,11 @@ fn is_type_kw(word: &str, lang: Lang) -> bool {
 }
 
 fn classify_word(word: &str, lang: Lang, is_call: bool) -> u32 {
-    if is_keyword(word, lang)  { return HL_KEYWORD; }
-    if is_type_kw(word, lang)  { return HL_TYPE; }
-    if word.chars().next().map_or(false, |c| c.is_uppercase()) { return HL_TYPE; }
-    if is_call                 { return HL_FUNC; }
-    FG
+    if is_keyword(word, lang)  { return th().hl_keyword; }
+    if is_type_kw(word, lang)  { return th().hl_type; }
+    if word.chars().next().map_or(false, |c| c.is_uppercase()) { return th().hl_type; }
+    if is_call                 { return th().hl_func; }
+    th().fg
 }
 
 fn strip_jsonc_comments(src: &str) -> String {
@@ -4470,36 +4447,36 @@ fn format_json_document(s: &mut State) {
 
 fn highlight_json_line(chars: &[char], jsonc: bool, mut state: MlState, rainbow: bool, mut bracket_depth: i32) -> (Vec<u32>, MlState, i32) {
     let len = chars.len();
-    let mut out = vec![FG; len];
+    let mut out = vec![th().fg; len];
     let mut i = 0;
     macro_rules! fill { ($from:expr, $to:expr, $color:expr) => { for k in $from..($to).min(len) { out[k] = $color; } }; }
     while i < len {
         match state {
             MlState::BlockComment => {
                 if i + 1 < len && chars[i] == '*' && chars[i + 1] == '/' {
-                    fill!(i, i + 2, HL_COMMENT);
+                    fill!(i, i + 2, th().hl_comment);
                     i += 2;
                     state = MlState::Normal;
                 } else {
-                    out[i] = HL_COMMENT;
+                    out[i] = th().hl_comment;
                     i += 1;
                 }
             }
             _ => {
                 // JSONC line comment
                 if jsonc && i + 1 < len && chars[i] == '/' && chars[i + 1] == '/' {
-                    fill!(i, len, HL_COMMENT);
+                    fill!(i, len, th().hl_comment);
                     i = len;
                     continue;
                 }
                 // JSONC block comment
                 if jsonc && i + 1 < len && chars[i] == '/' && chars[i + 1] == '*' {
-                    fill!(i, i + 2, HL_COMMENT);
+                    fill!(i, i + 2, th().hl_comment);
                     i += 2;
                     state = MlState::BlockComment;
                     continue;
                 }
-                // String — color as key (HL_FUNC) if followed by ':', else value (HL_STRING)
+                // String — color as key (th().hl_func) if followed by ':', else value (th().hl_string)
                 if chars[i] == '"' {
                     let start = i;
                     i += 1;
@@ -4510,7 +4487,7 @@ fn highlight_json_line(chars: &[char], jsonc: bool, mut state: MlState, rainbow:
                     }
                     let mut j = i;
                     while j < len && (chars[j] == ' ' || chars[j] == '\t') { j += 1; }
-                    let color = if j < len && chars[j] == ':' { HL_FUNC } else { HL_STRING };
+                    let color = if j < len && chars[j] == ':' { th().hl_func } else { th().hl_string };
                     fill!(start, i, color);
                     continue;
                 }
@@ -4520,7 +4497,7 @@ fn highlight_json_line(chars: &[char], jsonc: bool, mut state: MlState, rainbow:
                     while i < len && (chars[i].is_ascii_digit() || matches!(chars[i], '.' | 'e' | 'E' | '+' | '-')) {
                         i += 1;
                     }
-                    fill!(start, i, HL_NUMBER);
+                    fill!(start, i, th().hl_number);
                     continue;
                 }
                 // Keywords: true, false, null
@@ -4529,20 +4506,20 @@ fn highlight_json_line(chars: &[char], jsonc: bool, mut state: MlState, rainbow:
                     while i < len && chars[i].is_ascii_alphabetic() { i += 1; }
                     let word: String = chars[start..i].iter().collect();
                     if matches!(word.as_str(), "true" | "false" | "null") {
-                        fill!(start, i, HL_KEYWORD);
+                        fill!(start, i, th().hl_keyword);
                     }
                     continue;
                 }
                 // Structural punctuation: dim it
                 if matches!(chars[i], ':' | ',' | '{' | '}' | '[' | ']') {
                     if rainbow && matches!(chars[i], '[' | '{') {
-                        out[i] = RAINBOW[(bracket_depth.max(0) as usize) % RAINBOW.len()];
+                        out[i] = th().rainbow[(bracket_depth.max(0) as usize) % th().rainbow.len()];
                         bracket_depth += 1;
                     } else if rainbow && matches!(chars[i], ']' | '}') {
                         bracket_depth = bracket_depth.saturating_sub(1);
-                        out[i] = RAINBOW[(bracket_depth.max(0) as usize) % RAINBOW.len()];
+                        out[i] = th().rainbow[(bracket_depth.max(0) as usize) % th().rainbow.len()];
                     } else {
-                        out[i] = FG_DIM;
+                        out[i] = th().fg_dim;
                     }
                     i += 1;
                     continue;
@@ -4556,17 +4533,17 @@ fn highlight_json_line(chars: &[char], jsonc: bool, mut state: MlState, rainbow:
 
 fn highlight_markdown_line(chars: &[char], state: MlState, _rainbow: bool, bracket_depth: i32) -> (Vec<u32>, MlState, i32) {
     let len = chars.len();
-    let mut out = vec![FG; len];
+    let mut out = vec![th().fg; len];
     macro_rules! fill_range { ($from:expr, $to:expr, $color:expr) => { for k in $from..($to).min(len) { out[k] = $color; } }; }
 
     // Inside a fenced code block
     if state == MlState::CodeFence {
         let is_fence = len >= 3 && chars[0] == '`' && chars[1] == '`' && chars[2] == '`';
         if is_fence {
-            fill_range!(0, len, HL_COMMENT);
+            fill_range!(0, len, th().hl_comment);
             return (out, MlState::Normal, bracket_depth);
         }
-        fill_range!(0, len, HL_NUMBER);
+        fill_range!(0, len, th().hl_number);
         return (out, MlState::CodeFence, bracket_depth);
     }
 
@@ -4580,19 +4557,19 @@ fn highlight_markdown_line(chars: &[char], state: MlState, _rainbow: bool, brack
     if heading_hashes >= 1 && heading_hashes <= 6
         && (len == heading_hashes || chars[heading_hashes] == ' ')
     {
-        fill_range!(0, len, HL_FUNC);
+        fill_range!(0, len, th().hl_func);
         return (out, MlState::Normal, bracket_depth);
     }
 
     // Fenced code block opening: line starts with ```
     if len >= 3 && chars[0] == '`' && chars[1] == '`' && chars[2] == '`' {
-        fill_range!(0, len, HL_COMMENT);
+        fill_range!(0, len, th().hl_comment);
         return (out, MlState::CodeFence, bracket_depth);
     }
 
     // Blockquote: starts with '>'
     if chars[0] == '>' {
-        fill_range!(0, len, HL_COMMENT);
+        fill_range!(0, len, th().hl_comment);
         return (out, MlState::Normal, bracket_depth);
     }
 
@@ -4600,7 +4577,7 @@ fn highlight_markdown_line(chars: &[char], state: MlState, _rainbow: bool, brack
     {
         let trimmed: Vec<char> = chars.iter().filter(|&&c| !c.is_whitespace()).cloned().collect();
         if trimmed.len() >= 3 && trimmed.iter().all(|&c| c == trimmed[0]) && matches!(trimmed[0], '-' | '*' | '_') {
-            fill_range!(0, len, FG_DIM);
+            fill_range!(0, len, th().fg_dim);
             return (out, MlState::Normal, bracket_depth);
         }
     }
@@ -4624,7 +4601,7 @@ fn highlight_markdown_line(chars: &[char], state: MlState, _rainbow: bool, brack
         }
         if is_unordered || is_ordered {
             let marker_end = if is_unordered { marker_start + 1 } else { li };
-            fill_range!(marker_start, marker_end + 1, FG_DIM);
+            fill_range!(marker_start, marker_end + 1, th().fg_dim);
             // rest gets inline scan below — but for simplicity just color rest FG (already set)
             // We still need to scan the rest for inline markup, so don't return here
         }
@@ -4639,7 +4616,7 @@ fn highlight_markdown_line(chars: &[char], state: MlState, _rainbow: bool, brack
             i += 4;
             while i + 2 < len && !(chars[i] == '-' && chars[i+1] == '-' && chars[i+2] == '>') { i += 1; }
             let end = (i + 3).min(len);
-            fill_range!(start, end, HL_COMMENT);
+            fill_range!(start, end, th().hl_comment);
             i = end;
             continue;
         }
@@ -4649,26 +4626,26 @@ fn highlight_markdown_line(chars: &[char], state: MlState, _rainbow: bool, brack
             i += 1;
             while i < len && chars[i] != '`' { i += 1; }
             let end = (i + 1).min(len);
-            fill_range!(start, end, HL_STRING);
+            fill_range!(start, end, th().hl_string);
             i = end;
             continue;
         }
         // Image: ![alt](url)
         if chars[i] == '!' && i + 1 < len && chars[i+1] == '[' {
-            out[i] = FG_DIM;
+            out[i] = th().fg_dim;
             i += 1;
             let start = i;
             i += 1;
             while i < len && chars[i] != ']' { i += 1; }
-            fill_range!(start, i + 1, HL_FUNC);
+            fill_range!(start, i + 1, th().hl_func);
             i = (i + 1).min(len);
             if i < len && chars[i] == '(' {
                 let url_open = i;
                 i += 1;
                 while i < len && chars[i] != ')' { i += 1; }
-                out[url_open] = FG_DIM;
-                fill_range!(url_open + 1, i, HL_COMMENT);
-                if i < len { out[i] = FG_DIM; i += 1; }
+                out[url_open] = th().fg_dim;
+                fill_range!(url_open + 1, i, th().hl_comment);
+                if i < len { out[i] = th().fg_dim; i += 1; }
             }
             continue;
         }
@@ -4677,15 +4654,15 @@ fn highlight_markdown_line(chars: &[char], state: MlState, _rainbow: bool, brack
             let start = i;
             i += 1;
             while i < len && chars[i] != ']' { i += 1; }
-            fill_range!(start, i + 1, HL_FUNC);
+            fill_range!(start, i + 1, th().hl_func);
             i = (i + 1).min(len);
             if i < len && chars[i] == '(' {
                 let url_open = i;
                 i += 1;
                 while i < len && chars[i] != ')' { i += 1; }
-                out[url_open] = FG_DIM;
-                fill_range!(url_open + 1, i, HL_COMMENT);
-                if i < len { out[i] = FG_DIM; i += 1; }
+                out[url_open] = th().fg_dim;
+                fill_range!(url_open + 1, i, th().hl_comment);
+                if i < len { out[i] = th().fg_dim; i += 1; }
             }
             continue;
         }
@@ -4698,7 +4675,7 @@ fn highlight_markdown_line(chars: &[char], state: MlState, _rainbow: bool, brack
             i += 3;
             while i + 2 < len && !(chars[i] == delim && chars[i+1] == delim && chars[i+2] == delim) { i += 1; }
             let end = (i + 3).min(len);
-            fill_range!(start, end, HL_FUNC);
+            fill_range!(start, end, th().hl_func);
             i = end;
             continue;
         }
@@ -4709,7 +4686,7 @@ fn highlight_markdown_line(chars: &[char], state: MlState, _rainbow: bool, brack
             i += 2;
             while i + 1 < len && !(chars[i] == delim && chars[i+1] == delim) { i += 1; }
             let end = (i + 2).min(len);
-            fill_range!(start, end, HL_TYPE);
+            fill_range!(start, end, th().hl_type);
             i = end;
             continue;
         }
@@ -4721,7 +4698,7 @@ fn highlight_markdown_line(chars: &[char], state: MlState, _rainbow: bool, brack
             i += 1;
             while i < len && chars[i] != '*' { i += 1; }
             let end = (i + 1).min(len);
-            fill_range!(start, end, HL_STRING);
+            fill_range!(start, end, th().hl_string);
             i = end;
             continue;
         }
@@ -4733,7 +4710,7 @@ fn highlight_markdown_line(chars: &[char], state: MlState, _rainbow: bool, brack
             i += 1;
             while i < len && chars[i] != '_' { i += 1; }
             let end = (i + 1).min(len);
-            fill_range!(start, end, HL_STRING);
+            fill_range!(start, end, th().hl_string);
             i = end;
             continue;
         }
@@ -4758,7 +4735,7 @@ fn render_markdown_to_lines(text: &ropey::Rope) -> Vec<(String, Vec<u32>)> {
 // ── CSS / Less / SCSS highlighter ────────────────────────────────────────────
 fn highlight_css_line(chars: &[char], mut state: MlState, mut bracket_depth: i32) -> (Vec<u32>, MlState, i32) {
     let len = chars.len();
-    let mut out = vec![FG; len];
+    let mut out = vec![th().fg; len];
     let mut i = 0;
 
     macro_rules! fill {
@@ -4770,9 +4747,9 @@ fn highlight_css_line(chars: &[char], mut state: MlState, mut bracket_depth: i32
     // Continue a block comment carried from the previous line
     if state == MlState::BlockComment {
         while i < len {
-            out[i] = HL_COMMENT;
+            out[i] = th().hl_comment;
             if chars[i] == '*' && i + 1 < len && chars[i+1] == '/' {
-                out[i+1] = HL_COMMENT; i += 2;
+                out[i+1] = th().hl_comment; i += 2;
                 state = MlState::Normal;
                 break;
             }
@@ -4785,12 +4762,12 @@ fn highlight_css_line(chars: &[char], mut state: MlState, mut bracket_depth: i32
 
         // /* ... */ block comment
         if ch == '/' && i + 1 < len && chars[i+1] == '*' {
-            fill!(i, i + 2, HL_COMMENT); i += 2;
+            fill!(i, i + 2, th().hl_comment); i += 2;
             state = MlState::BlockComment;
             while i < len {
-                out[i] = HL_COMMENT;
+                out[i] = th().hl_comment;
                 if chars[i] == '*' && i + 1 < len && chars[i+1] == '/' {
-                    out[i+1] = HL_COMMENT; i += 2;
+                    out[i+1] = th().hl_comment; i += 2;
                     state = MlState::Normal;
                     break;
                 }
@@ -4801,17 +4778,17 @@ fn highlight_css_line(chars: &[char], mut state: MlState, mut bracket_depth: i32
 
         // // line comment (Less / SCSS)
         if ch == '/' && i + 1 < len && chars[i+1] == '/' {
-            fill!(i, len, HL_COMMENT);
+            fill!(i, len, th().hl_comment);
             break;
         }
 
         // String literals
         if ch == '"' || ch == '\'' {
             let q = ch;
-            out[i] = HL_STRING; i += 1;
+            out[i] = th().hl_string; i += 1;
             while i < len {
-                out[i] = HL_STRING;
-                if chars[i] == '\\' && i + 1 < len { out[i+1] = HL_STRING; i += 2; }
+                out[i] = th().hl_string;
+                if chars[i] == '\\' && i + 1 < len { out[i+1] = th().hl_string; i += 2; }
                 else if chars[i] == q { i += 1; break; }
                 else { i += 1; }
             }
@@ -4825,7 +4802,7 @@ fn highlight_css_line(chars: &[char], mut state: MlState, mut bracket_depth: i32
             while i < len && (chars[i].is_alphanumeric() || chars[i] == '-' || chars[i] == '_') {
                 i += 1;
             }
-            fill!(start, i, HL_KEYWORD);
+            fill!(start, i, th().hl_keyword);
             continue;
         }
 
@@ -4836,7 +4813,7 @@ fn highlight_css_line(chars: &[char], mut state: MlState, mut bracket_depth: i32
             while i < len && (chars[i].is_alphanumeric() || chars[i] == '-' || chars[i] == '_') {
                 i += 1;
             }
-            fill!(start, i, HL_TYPE);
+            fill!(start, i, th().hl_type);
             continue;
         }
 
@@ -4850,9 +4827,9 @@ fn highlight_css_line(chars: &[char], mut state: MlState, mut bracket_depth: i32
             let word_len = i - hex_start;
             let all_hex = chars[hex_start..i].iter().all(|c| c.is_ascii_hexdigit());
             if all_hex && (word_len == 3 || word_len == 4 || word_len == 6 || word_len == 8) {
-                fill!(start, i, HL_NUMBER); // color literal
+                fill!(start, i, th().hl_number); // color literal
             } else {
-                fill!(start, i, HL_FUNC);  // #id selector
+                fill!(start, i, th().hl_func);  // #id selector
             }
             continue;
         }
@@ -4866,15 +4843,15 @@ fn highlight_css_line(chars: &[char], mut state: MlState, mut bracket_depth: i32
             let start = i;
             i += 1;
             while i < len && chars[i].is_alphabetic() { i += 1; }
-            fill!(start, i, HL_KEYWORD);
+            fill!(start, i, th().hl_keyword);
             continue;
         }
 
         // . class selector or : / :: pseudo-class/element
         if ch == '.' || ch == ':' {
-            let color = if ch == ':' { HL_TYPE } else { HL_FUNC };
+            let color = if ch == ':' { th().hl_type } else { th().hl_func };
             out[i] = color; i += 1;
-            if ch == ':' && i < len && chars[i] == ':' { out[i] = HL_TYPE; i += 1; } // ::pseudo
+            if ch == ':' && i < len && chars[i] == ':' { out[i] = th().hl_type; i += 1; } // ::pseudo
             let _start = i;
             while i < len && (chars[i].is_alphanumeric() || chars[i] == '-' || chars[i] == '_') {
                 out[i] = color; i += 1;
@@ -4888,7 +4865,7 @@ fn highlight_css_line(chars: &[char], mut state: MlState, mut bracket_depth: i32
             i += 1;
             while i < len && chars[i] != ']' { i += 1; }
             if i < len { i += 1; }
-            fill!(start, i, HL_TYPE);
+            fill!(start, i, th().hl_type);
             continue;
         }
 
@@ -4898,7 +4875,7 @@ fn highlight_css_line(chars: &[char], mut state: MlState, mut bracket_depth: i32
             while i < len && (chars[i].is_alphanumeric() || chars[i] == '-' || chars[i] == '_') {
                 i += 1;
             }
-            fill!(start, i, HL_TYPE);
+            fill!(start, i, th().hl_type);
             continue;
         }
 
@@ -4906,12 +4883,12 @@ fn highlight_css_line(chars: &[char], mut state: MlState, mut bracket_depth: i32
         if ch.is_ascii_digit() || (ch == '.' && i + 1 < len && chars[i+1].is_ascii_digit()) {
             let start = i;
             while i < len && (chars[i].is_ascii_digit() || chars[i] == '.') { i += 1; }
-            fill!(start, i, HL_NUMBER);
+            fill!(start, i, th().hl_number);
             // unit immediately following
             let unit_start = i;
             while i < len && chars[i].is_alphabetic() { i += 1; }
-            if i > unit_start { fill!(unit_start, i, HL_TYPE); }
-            if i < len && chars[i] == '%' { out[i] = HL_TYPE; i += 1; }
+            if i > unit_start { fill!(unit_start, i, th().hl_type); }
+            if i < len && chars[i] == '%' { out[i] = th().hl_type; i += 1; }
             continue;
         }
 
@@ -4929,7 +4906,7 @@ fn highlight_css_line(chars: &[char], mut state: MlState, mut bracket_depth: i32
             let followed_by_colon = j < len && chars[j] == ':' && j + 1 < len && chars[j+1] != ':';
 
             let color = if bracket_depth > 0 && followed_by_colon {
-                HL_FUNC // CSS property name
+                th().hl_func // CSS property name
             } else if bracket_depth > 0 {
                 // Value keyword or unit
                 match word.as_str() {
@@ -4953,16 +4930,16 @@ fn highlight_css_line(chars: &[char], mut state: MlState, mut bracket_depth: i32
                     // common color names
                     "black" | "white" | "red" | "green" | "blue" | "yellow" |
                     "orange" | "purple" | "pink" | "gray" | "grey" | "cyan" | "magenta"
-                        => HL_KEYWORD,
+                        => th().hl_keyword,
                     // units (standalone without preceding number, e.g. in calc())
                     "px" | "em" | "rem" | "vh" | "vw" | "vmin" | "vmax" |
                     "pt" | "cm" | "mm" | "in" | "ex" | "ch" | "fr" |
                     "deg" | "rad" | "turn" | "ms" | "s" | "dpi" | "dpcm" | "dppx"
-                        => HL_TYPE,
-                    _ => FG
+                        => th().hl_type,
+                    _ => th().fg
                 }
             } else {
-                FG // element name in selector — keep as foreground
+                th().fg // element name in selector — keep as foreground
             };
             fill!(start, i, color);
             continue;
@@ -4977,7 +4954,7 @@ fn highlight_css_line(chars: &[char], mut state: MlState, mut bracket_depth: i32
 // ── HTML / SVG / XML highlighter ─────────────────────────────────────────────
 fn highlight_html_line(chars: &[char], mut state: MlState) -> (Vec<u32>, MlState, i32) {
     let len = chars.len();
-    let mut out = vec![FG; len];
+    let mut out = vec![th().fg; len];
     let mut i = 0;
 
     macro_rules! fill {
@@ -4991,10 +4968,10 @@ fn highlight_html_line(chars: &[char], mut state: MlState) -> (Vec<u32>, MlState
             MlState::HtmlComment => {
                 // Scan for -->
                 if i + 2 < len && chars[i] == '-' && chars[i+1] == '-' && chars[i+2] == '>' {
-                    fill!(i, i + 3, HL_COMMENT); i += 3;
+                    fill!(i, i + 3, th().hl_comment); i += 3;
                     state = MlState::Normal;
                 } else {
-                    out[i] = HL_COMMENT; i += 1;
+                    out[i] = th().hl_comment; i += 1;
                 }
             }
             MlState::HtmlTag => {
@@ -5002,13 +4979,13 @@ fn highlight_html_line(chars: &[char], mut state: MlState) -> (Vec<u32>, MlState
                 if chars[i] == '>' {
                     i += 1; state = MlState::Normal;
                 } else if chars[i] == '/' && i + 1 < len && chars[i+1] == '>' {
-                    fill!(i, i + 2, FG); i += 2; state = MlState::Normal;
+                    fill!(i, i + 2, th().fg); i += 2; state = MlState::Normal;
                 } else if chars[i] == '"' || chars[i] == '\'' {
                     let q = chars[i];
-                    out[i] = HL_STRING; i += 1;
+                    out[i] = th().hl_string; i += 1;
                     while i < len {
-                        out[i] = HL_STRING;
-                        if chars[i] == '\\' && i + 1 < len { out[i+1] = HL_STRING; i += 2; }
+                        out[i] = th().hl_string;
+                        if chars[i] == '\\' && i + 1 < len { out[i+1] = th().hl_string; i += 2; }
                         else if chars[i] == q { i += 1; break; }
                         else { i += 1; }
                     }
@@ -5019,7 +4996,7 @@ fn highlight_html_line(chars: &[char], mut state: MlState) -> (Vec<u32>, MlState
                     while i < len && (chars[i].is_alphanumeric() || matches!(chars[i], '_' | '-' | ':' | '.')) {
                         i += 1;
                     }
-                    fill!(start, i, HL_TYPE); // attribute name
+                    fill!(start, i, th().hl_type); // attribute name
                 } else {
                     i += 1;
                 }
@@ -5028,7 +5005,7 @@ fn highlight_html_line(chars: &[char], mut state: MlState) -> (Vec<u32>, MlState
                 // Normal / any other state — parse HTML content
                 // <!-- comment -->
                 if i + 3 < len && chars[i] == '<' && chars[i+1] == '!' && chars[i+2] == '-' && chars[i+3] == '-' {
-                    fill!(i, i + 4, HL_COMMENT); i += 4;
+                    fill!(i, i + 4, th().hl_comment); i += 4;
                     state = MlState::HtmlComment;
                     continue;
                 }
@@ -5038,15 +5015,15 @@ fn highlight_html_line(chars: &[char], mut state: MlState) -> (Vec<u32>, MlState
                     i += 2;
                     while i < len && chars[i] != '>' { i += 1; }
                     if i < len { i += 1; }
-                    fill!(start, i, HL_KEYWORD);
+                    fill!(start, i, th().hl_keyword);
                     continue;
                 }
                 // </closing-tag>
                 if chars[i] == '<' && i + 1 < len && chars[i+1] == '/' {
-                    out[i] = FG; out[i+1] = FG; i += 2;
+                    out[i] = th().fg; out[i+1] = th().fg; i += 2;
                     let _start = i;
                     while i < len && (chars[i].is_alphanumeric() || matches!(chars[i], '-' | '_' | ':' | '.')) {
-                        out[i] = HL_FUNC; i += 1;
+                        out[i] = th().hl_func; i += 1;
                     }
                     // consume rest up to >
                     while i < len && chars[i] != '>' { i += 1; }
@@ -5055,10 +5032,10 @@ fn highlight_html_line(chars: &[char], mut state: MlState) -> (Vec<u32>, MlState
                 }
                 // <opening-tag
                 if chars[i] == '<' && i + 1 < len && chars[i+1].is_alphabetic() {
-                    out[i] = FG; i += 1;
+                    out[i] = th().fg; i += 1;
                     let _start = i;
                     while i < len && (chars[i].is_alphanumeric() || matches!(chars[i], '-' | '_' | ':' | '.')) {
-                        out[i] = HL_FUNC; i += 1;
+                        out[i] = th().hl_func; i += 1;
                     }
                     state = MlState::HtmlTag;
                     continue;
@@ -5068,8 +5045,8 @@ fn highlight_html_line(chars: &[char], mut state: MlState) -> (Vec<u32>, MlState
                     let start = i;
                     i += 1;
                     while i < len && chars[i] != ';' && chars[i] != ' ' && i - start < 12 { i += 1; }
-                    if i < len && chars[i] == ';' { i += 1; fill!(start, i, HL_KEYWORD); }
-                    else { fill!(start, i, FG); } // not a valid entity, leave as-is
+                    if i < len && chars[i] == ';' { i += 1; fill!(start, i, th().hl_keyword); }
+                    else { fill!(start, i, th().fg); } // not a valid entity, leave as-is
                     continue;
                 }
                 i += 1;
@@ -5094,7 +5071,7 @@ fn highlight_line(chars: &[char], lang: Lang, mut state: MlState, rainbow: bool,
         return highlight_html_line(chars, state);
     }
     let len = chars.len();
-    let mut out = vec![FG; len];
+    let mut out = vec![th().fg; len];
     let mut i = 0;
 
     macro_rules! fill {
@@ -5107,27 +5084,27 @@ fn highlight_line(chars: &[char], lang: Lang, mut state: MlState, rainbow: bool,
         match state {
             MlState::BlockComment => {
                 if i + 1 < len && chars[i] == '*' && chars[i + 1] == '/' {
-                    fill!(i, i + 2, HL_COMMENT);
+                    fill!(i, i + 2, th().hl_comment);
                     i += 2;
                     state = MlState::Normal;
                 } else {
-                    out[i] = HL_COMMENT;
+                    out[i] = th().hl_comment;
                     i += 1;
                 }
             }
             MlState::TemplateStr => {
-                out[i] = HL_STRING;
+                out[i] = th().hl_string;
                 if chars[i] == '`' { state = MlState::Normal; }
                 i += 1;
             }
             MlState::PyTripleSingle | MlState::PyTripleDouble => {
                 let q = if state == MlState::PyTripleSingle { '\'' } else { '"' };
                 if i + 2 < len && chars[i] == q && chars[i+1] == q && chars[i+2] == q {
-                    fill!(i, i + 3, HL_STRING);
+                    fill!(i, i + 3, th().hl_string);
                     i += 3;
                     state = MlState::Normal;
                 } else {
-                    out[i] = HL_STRING;
+                    out[i] = th().hl_string;
                     i += 1;
                 }
             }
@@ -5139,11 +5116,11 @@ fn highlight_line(chars: &[char], lang: Lang, mut state: MlState, rainbow: bool,
             // TypeScript/JSX path for multi-line JSX tags and HTML comments in TSX.
             MlState::HtmlComment => {
                 if i + 2 < len && chars[i] == '-' && chars[i+1] == '-' && chars[i+2] == '>' {
-                    fill!(i, i + 3, HL_COMMENT);
+                    fill!(i, i + 3, th().hl_comment);
                     i += 3;
                     state = MlState::Normal;
                 } else {
-                    out[i] = HL_COMMENT;
+                    out[i] = th().hl_comment;
                     i += 1;
                 }
             }
@@ -5153,20 +5130,20 @@ fn highlight_line(chars: &[char], lang: Lang, mut state: MlState, rainbow: bool,
                     i += 1;
                     state = MlState::Normal;
                 } else if chars[i] == '/' && i + 1 < len && chars[i+1] == '>' {
-                    fill!(i, i + 2, FG);
+                    fill!(i, i + 2, th().fg);
                     i += 2;
                     state = MlState::Normal;
                 } else if chars[i] == '"' || chars[i] == '\'' {
                     let q = chars[i];
-                    out[i] = HL_STRING; i += 1;
+                    out[i] = th().hl_string; i += 1;
                     while i < len {
-                        out[i] = HL_STRING;
-                        if chars[i] == '\\' && i + 1 < len { out[i+1] = HL_STRING; i += 2; }
+                        out[i] = th().hl_string;
+                        if chars[i] == '\\' && i + 1 < len { out[i+1] = th().hl_string; i += 2; }
                         else if chars[i] == q { i += 1; break; }
                         else { i += 1; }
                     }
                 } else if chars[i] == '{' {
-                    // JSX expression in attribute — leave as FG, exit tag mode to handle braces
+                    // JSX expression in attribute — leave as th().fg, exit tag mode to handle braces
                     i += 1;
                     state = MlState::Normal;
                 } else if chars[i].is_alphabetic() || chars[i] == '_' || chars[i] == '-' {
@@ -5175,7 +5152,7 @@ fn highlight_line(chars: &[char], lang: Lang, mut state: MlState, rainbow: bool,
                         i += 1;
                     }
                     // Check if this is an attribute name (followed by = or whitespace or >)
-                    fill!(start, i, HL_TYPE);
+                    fill!(start, i, th().hl_type);
                 } else {
                     i += 1;
                 }
@@ -5185,7 +5162,7 @@ fn highlight_line(chars: &[char], lang: Lang, mut state: MlState, rainbow: bool,
                 let rs_comment = (lang == Lang::Rust || lang == Lang::TypeScript)
                     && i + 1 < len && chars[i] == '/' && chars[i + 1] == '/';
                 if py_comment || rs_comment {
-                    fill!(i, len, HL_COMMENT);
+                    fill!(i, len, th().hl_comment);
                     i = len;
                     continue;
                 }
@@ -5193,7 +5170,7 @@ fn highlight_line(chars: &[char], lang: Lang, mut state: MlState, rainbow: bool,
                 if (lang == Lang::Rust || lang == Lang::TypeScript)
                     && i + 1 < len && chars[i] == '/' && chars[i + 1] == '*'
                 {
-                    fill!(i, i + 2, HL_COMMENT);
+                    fill!(i, i + 2, th().hl_comment);
                     i += 2;
                     state = MlState::BlockComment;
                     continue;
@@ -5207,17 +5184,17 @@ fn highlight_line(chars: &[char], lang: Lang, mut state: MlState, rainbow: bool,
                 {
                     let q = chars[i];
                     let ml = if q == '\'' { MlState::PyTripleSingle } else { MlState::PyTripleDouble };
-                    fill!(i, i + 3, HL_STRING);
+                    fill!(i, i + 3, th().hl_string);
                     i += 3;
                     state = ml;
                     while i < len {
                         if i + 2 < len && chars[i] == q && chars[i+1] == q && chars[i+2] == q {
-                            fill!(i, i + 3, HL_STRING);
+                            fill!(i, i + 3, th().hl_string);
                             i += 3;
                             state = MlState::Normal;
                             break;
                         }
-                        out[i] = HL_STRING;
+                        out[i] = th().hl_string;
                         i += 1;
                     }
                     continue;
@@ -5237,25 +5214,25 @@ fn highlight_line(chars: &[char], lang: Lang, mut state: MlState, rainbow: bool,
                             j += 1;
                         }
                         if found_close {
-                            fill!(i, j + 1, HL_STRING);
+                            fill!(i, j + 1, th().hl_string);
                             i = j + 1;
                         } else {
-                            out[i] = HL_TYPE;
+                            out[i] = th().hl_type;
                             i += 1;
                             while i < len && (chars[i].is_alphanumeric() || chars[i] == '_') {
-                                out[i] = HL_TYPE;
+                                out[i] = th().hl_type;
                                 i += 1;
                             }
                         }
                         continue;
                     }
 
-                    out[i] = HL_STRING;
+                    out[i] = th().hl_string;
                     i += 1;
                     while i < len {
-                        out[i] = HL_STRING;
+                        out[i] = th().hl_string;
                         if chars[i] == '\\' && i + 1 < len {
-                            out[i + 1] = HL_STRING;
+                            out[i + 1] = th().hl_string;
                             i += 2;
                         } else if chars[i] == q {
                             i += 1;
@@ -5268,7 +5245,7 @@ fn highlight_line(chars: &[char], lang: Lang, mut state: MlState, rainbow: bool,
                 }
 
                 if lang == Lang::TypeScript && chars[i] == '`' {
-                    out[i] = HL_STRING;
+                    out[i] = th().hl_string;
                     i += 1;
                     state = MlState::TemplateStr;
                     continue;
@@ -5281,10 +5258,10 @@ fn highlight_line(chars: &[char], lang: Lang, mut state: MlState, rainbow: bool,
                     let next = chars.get(i + 1).copied();
                     if next == Some('/') {
                         // Closing tag </Foo> or </div>
-                        out[i] = FG; out[i+1] = FG; i += 2;
+                        out[i] = th().fg; out[i+1] = th().fg; i += 2;
                         let _start = i;
                         while i < len && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '.' || chars[i] == '-') {
-                            out[i] = HL_FUNC; i += 1;
+                            out[i] = th().hl_func; i += 1;
                         }
                         continue;
                     } else if next.map_or(false, |c| c.is_alphabetic()) {
@@ -5301,8 +5278,8 @@ fn highlight_line(chars: &[char], lang: Lang, mut state: MlState, rainbow: bool,
                             || j == len; // tag name goes to end of line (multi-line JSX)
                         if is_jsx_tag {
                             let is_component = chars[tag_start].is_uppercase();
-                            let tag_color = if is_component { HL_TYPE } else { HL_FUNC };
-                            out[i] = FG; i += 1; // '<'
+                            let tag_color = if is_component { th().hl_type } else { th().hl_func };
+                            out[i] = th().fg; i += 1; // '<'
                             fill!(i, j, tag_color);
                             i = j;
                             state = MlState::HtmlTag;
@@ -5318,7 +5295,7 @@ fn highlight_line(chars: &[char], lang: Lang, mut state: MlState, rainbow: bool,
                     while i < len && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '.') {
                         i += 1;
                     }
-                    fill!(start, i, HL_NUMBER);
+                    fill!(start, i, th().hl_number);
                     continue;
                 }
 
@@ -5328,7 +5305,7 @@ fn highlight_line(chars: &[char], lang: Lang, mut state: MlState, rainbow: bool,
                         i += 1;
                     }
                     if lang == Lang::Rust && i < len && chars[i] == '!' {
-                        fill!(start, i + 1, HL_FUNC);
+                        fill!(start, i + 1, th().hl_func);
                         i += 1;
                         continue;
                     }
@@ -5345,19 +5322,19 @@ fn highlight_line(chars: &[char], lang: Lang, mut state: MlState, rainbow: bool,
                     while i < len && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '.') {
                         i += 1;
                     }
-                    fill!(start, i, HL_TYPE);
+                    fill!(start, i, th().hl_type);
                     continue;
                 }
 
                 if rainbow && matches!(chars[i], '(' | '[' | '{') {
-                    out[i] = RAINBOW[(bracket_depth.max(0) as usize) % RAINBOW.len()];
+                    out[i] = th().rainbow[(bracket_depth.max(0) as usize) % th().rainbow.len()];
                     bracket_depth += 1;
                     i += 1;
                     continue;
                 }
                 if rainbow && matches!(chars[i], ')' | ']' | '}') {
                     bracket_depth = bracket_depth.saturating_sub(1);
-                    out[i] = RAINBOW[(bracket_depth.max(0) as usize) % RAINBOW.len()];
+                    out[i] = th().rainbow[(bracket_depth.max(0) as usize) % th().rainbow.len()];
                     i += 1;
                     continue;
                 }
@@ -7452,6 +7429,16 @@ fn revert_to_disk(s: &mut State, pid: usize, ti: usize, enc: Option<encoding::En
     }
 }
 
+/// Drop every cached color (syntax highlighting, markdown previews) after the
+/// theme or highlighting options change.
+fn invalidate_color_caches(s: &mut State) {
+    for pane in s.panes.values_mut() {
+        for tab in pane.tabs.iter_mut() { tab.hl_color_cache.clear(); tab.hl_dirty_from = 0; }
+    }
+    for md in s.md_panes.values_mut() { md.source_edit_gen = u64::MAX; }
+    s.needs_redraw = true;
+}
+
 fn toggle_word_wrap(s: &mut State) {
     s.settings.word_wrap = !s.settings.word_wrap;
     s.settings.save();
@@ -7521,6 +7508,14 @@ fn execute_command(s: &mut State, action: CommandAction) {
         }
         CommandAction::CloseTab       => { /* needs the event loop to exit: see quick_finder_accept */ }
         CommandAction::ToggleWordWrap => toggle_word_wrap(s),
+        CommandAction::SetTheme(i) => {
+            let Some(t) = theme::BUILTIN.get(i) else { return };
+            s.settings.theme = t.name.to_owned();
+            s.settings.save();
+            theme::apply(&s.settings.theme, &s.settings.theme_overrides);
+            invalidate_color_caches(s);
+            s.status_msg = Some(format!("Theme: {}", t.name));
+        }
         CommandAction::RevertFile => {
             let Some(ti) = active_editor_tab(s) else { return };
             let pid = s.active_pane;
@@ -8487,6 +8482,9 @@ impl App {
 
         let loaded_settings = settings::Settings::load();
         layout::set_defaults(loaded_settings.default_indent(), loaded_settings.detect_indentation);
+        if !theme::apply(&loaded_settings.theme, &loaded_settings.theme_overrides) {
+            eprintln!("local-text: unknown theme or theme override in settings; using what could be applied");
+        }
 
         let win = Arc::new(el.create_window(attrs).unwrap());
         let renderer = match loaded_settings.renderer {
@@ -13093,7 +13091,7 @@ fn render(s: &mut State) {
                 bracket_depth = bd;
                 c
             } else {
-                vec![FG; char_buf.len()]
+                vec![th().fg; char_buf.len()]
             };
             let starts = layout::wrap_rows(&char_buf, lay);
             let first_row = if li == scroll { scroll_sub.min(starts.len() - 1) } else { 0 };
@@ -13106,7 +13104,7 @@ fn render(s: &mut State) {
                     li, first: r == 0, last: r + 1 == starts.len(), line_start,
                     seg_lo: lo, seg_hi: hi,
                     chars: seg.to_vec(),
-                    colors: (lo..hi).map(|i| colors.get(i).copied().unwrap_or(FG)).collect(),
+                    colors: (lo..hi).map(|i| colors.get(i).copied().unwrap_or(th().fg)).collect(),
                     vx: layout::vcols(seg, lay.tab_w),
                 });
             }
@@ -13531,15 +13529,15 @@ fn render(s: &mut State) {
         // SAFETY: glyphs points into s.glyphs which outlives this synchronous closure; no mutation occurs during the frame.
         let g = unsafe { &*glyphs };
 
-        for p in buf.iter_mut() { *p = BG; }
+        for p in buf.iter_mut() { *p = th().bg; }
 
         // ── Activity bar + left panel ─────────────────────────────────────
         if let Some(entries) = &explorer_snap {
             let panel_h = h as i32 - status_h;
 
             // Activity bar (narrow strip at x=0)
-            fill(buf, w, h, 0, 0, act_w, panel_h, BG);
-            fill(buf, w, h, act_w - 1, 0, 1, panel_h, BORDER);
+            fill(buf, w, h, 0, 0, act_w, panel_h, th().bg);
+            fill(buf, w, h, act_w - 1, 0, 1, panel_h, th().border);
 
             let icon_size = lh;
             let file_icon_y = 8;
@@ -13552,66 +13550,66 @@ fn render(s: &mut State) {
 
             // File tree icon
             let ft_active = left_view == LeftView::FileTree && left_panel_visible;
-            if ft_active { fill(buf, w, h, 0, file_icon_y, 2, icon_size, ACCENT); }
-            let ft_bg = if ft_active { SEL_BG } else { BG };
+            if ft_active { fill(buf, w, h, 0, file_icon_y, 2, icon_size, th().accent); }
+            let ft_bg = if ft_active { th().sel_bg } else { th().bg };
             fill(buf, w, h, 2, file_icon_y, act_w - 3, icon_size, ft_bg);
-            draw_str(buf, w, h, g, " [F]", 2, file_icon_y + asc, if ft_active { ACCENT } else { FG_DIM }, act_w - 1);
+            draw_str(buf, w, h, g, " [F]", 2, file_icon_y + asc, if ft_active { th().accent } else { th().fg_dim }, act_w - 1);
 
             // Search icon
             let gs_active = left_view == LeftView::GlobalSearch && left_panel_visible;
-            if gs_active { fill(buf, w, h, 0, srch_icon_y, 2, icon_size, ACCENT); }
-            let gs_bg = if gs_active { SEL_BG } else { BG };
+            if gs_active { fill(buf, w, h, 0, srch_icon_y, 2, icon_size, th().accent); }
+            let gs_bg = if gs_active { th().sel_bg } else { th().bg };
             fill(buf, w, h, 2, srch_icon_y, act_w - 3, icon_size, gs_bg);
-            draw_str(buf, w, h, g, " [S]", 2, srch_icon_y + asc, if gs_active { ACCENT } else { FG_DIM }, act_w - 1);
+            draw_str(buf, w, h, g, " [S]", 2, srch_icon_y + asc, if gs_active { th().accent } else { th().fg_dim }, act_w - 1);
 
             // Diagnostics icon
             let dg_active = left_view == LeftView::Diagnostics && left_panel_visible;
-            if dg_active { fill(buf, w, h, 0, diag_icon_y, 2, icon_size, ACCENT); }
-            let dg_bg = if dg_active { SEL_BG } else { BG };
+            if dg_active { fill(buf, w, h, 0, diag_icon_y, 2, icon_size, th().accent); }
+            let dg_bg = if dg_active { th().sel_bg } else { th().bg };
             fill(buf, w, h, 2, diag_icon_y, act_w - 3, icon_size, dg_bg);
             let dg_label = if err_count > 0 {
                 format!("[!{}]", err_count.min(99))
             } else {
                 "[!]".to_owned()
             };
-            let dg_color = if err_count > 0 { 0xFF5555u32 } else if dg_active { ACCENT } else { FG_DIM };
+            let dg_color = if err_count > 0 { th().error } else if dg_active { th().accent } else { th().fg_dim };
             draw_str(buf, w, h, g, &dg_label, 2, diag_icon_y + asc, dg_color, act_w - 1);
 
             // Git icon
             let gt_active = left_view == LeftView::Git && left_panel_visible;
-            if gt_active { fill(buf, w, h, 0, git_icon_y, 2, icon_size, ACCENT); }
-            let gt_bg = if gt_active { SEL_BG } else { BG };
+            if gt_active { fill(buf, w, h, 0, git_icon_y, 2, icon_size, th().accent); }
+            let gt_bg = if gt_active { th().sel_bg } else { th().bg };
             fill(buf, w, h, 2, git_icon_y, act_w - 3, icon_size, gt_bg);
-            draw_str(buf, w, h, g, " [G]", 2, git_icon_y + asc, if gt_active { ACCENT } else { FG_DIM }, act_w - 1);
+            draw_str(buf, w, h, g, " [G]", 2, git_icon_y + asc, if gt_active { th().accent } else { th().fg_dim }, act_w - 1);
 
             // Collab icon — only visible when a session is active
             if collab_session_active {
                 let co_active = left_view == LeftView::Collab && left_panel_visible;
-                if co_active { fill(buf, w, h, 0, collab_icon_y, 2, icon_size, ACCENT); }
-                let co_bg = if co_active { SEL_BG } else { BG };
+                if co_active { fill(buf, w, h, 0, collab_icon_y, 2, icon_size, th().accent); }
+                let co_bg = if co_active { th().sel_bg } else { th().bg };
                 fill(buf, w, h, 2, collab_icon_y, act_w - 3, icon_size, co_bg);
-                let co_color = if co_active { ACCENT } else { 0x55_AA_FF_u32 };
+                let co_color = if co_active { th().accent } else { 0x55_AA_FF_u32 };
                 draw_str(buf, w, h, g, " [C]", 2, collab_icon_y + asc, co_color, act_w - 1);
             }
 
             // Gear icon — centered, full-width
-            fill(buf, w, h, 2, gear_y, act_w - 3, icon_size, SEL_BG);
+            fill(buf, w, h, 2, gear_y, act_w - 3, icon_size, th().sel_bg);
             let gear_x = 2 + (act_w - 3 - cw) / 2;
-            draw_str(buf, w, h, g, "⚙", gear_x, gear_y + asc, FG, act_w - 1);
+            draw_str(buf, w, h, g, "⚙", gear_x, gear_y + asc, th().fg, act_w - 1);
 
             if left_panel_visible {
             // Left panel area (file tree, global search, diagnostics, or git)
             let px = act_w; // panel x
             let pw = explorer_w; // panel width
-            fill(buf, w, h, px, 0, pw, panel_h, BG2);
-            let border_col = if explorer_drag { ACCENT } else { BORDER };
+            fill(buf, w, h, px, 0, pw, panel_h, th().bg2);
+            let border_col = if explorer_drag { th().accent } else { th().border };
             fill(buf, w, h, px + pw - 1, 0, 1, panel_h, border_col);
 
             if left_view == LeftView::FileTree {
                 // Row 0: hidden-files toggle
                 let toggle_label = if show_hidden { " [x] .hidden" } else { " [ ] .hidden" };
-                draw_str(buf, w, h, g, toggle_label, px, asc, FG_DIM, px + pw - 1);
-                fill(buf, w, h, px, lh - 1, pw - 1, 1, BORDER);
+                draw_str(buf, w, h, g, toggle_label, px, asc, th().fg_dim, px + pw - 1);
+                fill(buf, w, h, px, lh - 1, pw - 1, 1, th().border);
 
                 // Row 1: tree search box
                 let ts_empty_str   = String::new();
@@ -13621,10 +13619,10 @@ fn render(s: &mut State) {
                     .unwrap_or((&ts_empty_str, false, true, &ts_empty_items, 0, 0, None));
                 let fuzzy_label = if ts_fuzzy { "[~]" } else { "[=]" };
                 let toggle_w = fuzzy_label.chars().count() as i32 * cw + 4;
-                draw_str(buf, w, h, g, fuzzy_label, px + 2, lh + asc, FG_DIM, px + toggle_w);
+                draw_str(buf, w, h, g, fuzzy_label, px + 2, lh + asc, th().fg_dim, px + toggle_w);
                 let sx = px + toggle_w;
                 let sw = (pw - toggle_w - 2).max(0);
-                if ts_focused { fill(buf, w, h, sx, lh, sw, lh, SEL_BG); }
+                if ts_focused { fill(buf, w, h, sx, lh, sw, lh, th().sel_bg); }
                 let ts_vis = ((sw - 4) / cw).max(0) as usize;
                 let ts_hscroll = ts_cursor.saturating_sub(ts_vis.saturating_sub(1));
                 let ts_disp: String = ts_query.chars().skip(ts_hscroll).take(ts_vis + 1).collect();
@@ -13635,17 +13633,17 @@ fn render(s: &mut State) {
                         if mn < mx {
                             let x0 = sx + 2 + (mn.saturating_sub(ts_hscroll)) as i32 * cw;
                             let x1 = sx + 2 + ((mx - ts_hscroll).min(ts_vis + 1)) as i32 * cw;
-                            fill(buf, w, h, x0, lh, (x1 - x0).max(0), lh, SEL_BG);
+                            fill(buf, w, h, x0, lh, (x1 - x0).max(0), lh, th().sel_bg);
                         }
                     }
                 }
-                draw_str(buf, w, h, g, &ts_disp, sx + 2, lh + asc, FG, sx + sw);
+                draw_str(buf, w, h, g, &ts_disp, sx + 2, lh + asc, th().fg, sx + sw);
                 if ts_focused {
                     let cur_x = (sx + 2 + (ts_cursor - ts_hscroll) as i32 * cw).min(sx + sw - 1);
-                    fill(buf, w, h, cur_x, lh, 1, lh, ACCENT);
-                    fill(buf, w, h, sx, 2 * lh - 1, sw, 1, ACCENT);
+                    fill(buf, w, h, cur_x, lh, 1, lh, th().accent);
+                    fill(buf, w, h, sx, 2 * lh - 1, sw, 1, th().accent);
                 }
-                fill(buf, w, h, px, 2 * lh - 1, pw - 1, 1, BORDER);
+                fill(buf, w, h, px, 2 * lh - 1, pw - 1, 1, th().border);
 
                 // Rows 2+: entries or filtered search results
                 let entries_start = 2 * lh;
@@ -13655,21 +13653,21 @@ fn render(s: &mut State) {
                         if ey + lh <= entries_start { continue; } // scrolled above top
                         if ey + lh > h as i32 - status_h { break; }
                         let baseline = ey + asc;
-                        if *selected { fill(buf, w, h, px, ey, pw - 1, lh, SEL_BG); }
+                        if *selected { fill(buf, w, h, px, ey, pw - 1, lh, th().sel_bg); }
                         let prefix = if *is_dir { if *expanded { "▼ " } else { "▶ " } } else { "  " };
                         let indent = px + *depth as i32 * 10 + 4;
                         let label  = format!("{prefix}{name}");
-                        draw_str(buf, w, h, g, &label, indent, baseline, FG, px + pw - 1);
+                        draw_str(buf, w, h, g, &label, indent, baseline, th().fg, px + pw - 1);
                     }
                 } else {
                     for (i, (name, dir)) in ts_items.iter().enumerate() {
                         let ey = entries_start + i as i32 * lh;
                         if ey + lh > h as i32 - status_h { break; }
                         let baseline = ey + asc;
-                        if i == ts_sel { fill(buf, w, h, px, ey, pw - 1, lh, SEL_BG); }
+                        if i == ts_sel { fill(buf, w, h, px, ey, pw - 1, lh, th().sel_bg); }
                         let dir_w = dir.chars().count() as i32 * cw;
-                        draw_str(buf, w, h, g, name, px + 4, baseline, FG, px + pw - dir_w - cw - 2);
-                        draw_str(buf, w, h, g, dir, px + pw - dir_w - 2, baseline, FG_DIM, px + pw - 1);
+                        draw_str(buf, w, h, g, name, px + 4, baseline, th().fg, px + pw - dir_w - cw - 2);
+                        draw_str(buf, w, h, g, dir, px + pw - dir_w - 2, baseline, th().fg_dim, px + pw - 1);
                     }
                 }
             } else if let Some(ref gf) = gf_snap {
@@ -13692,16 +13690,16 @@ fn render(s: &mut State) {
                         // The query row's label area holds the [Aa] / [.*] toggles
                         // (click offsets in the sidebar click handler).
                         draw_str(buf, w, h, g, if gf.case_sensitive { "[Aa]" } else { "[aa]" }, px + 2, fy + asc,
-                                 if gf.case_sensitive { ACCENT } else { FG_DIM }, field_x);
+                                 if gf.case_sensitive { th().accent } else { th().fg_dim }, field_x);
                         draw_str(buf, w, h, g, "[.*]", px + 2 + 4 * cw, fy + asc,
-                                 if gf.regex { ACCENT } else { FG_DIM }, field_x);
+                                 if gf.regex { th().accent } else { th().fg_dim }, field_x);
                     } else {
-                        draw_str(buf, w, h, g, label, px + 2, fy + asc, FG_DIM, field_x);
+                        draw_str(buf, w, h, g, label, px + 2, fy + asc, th().fg_dim, field_x);
                     }
                     let is_active = gf.focus == *foc;
-                    let bg = if is_active { SEL_BG } else { BG };
+                    let bg = if is_active { th().sel_bg } else { th().bg };
                     fill(buf, w, h, field_x, fy, field_w, lh, bg);
-                    if is_active { fill(buf, w, h, field_x, fy + lh - 1, field_w, 1, ACCENT); }
+                    if is_active { fill(buf, w, h, field_x, fy + lh - 1, field_w, 1, th().accent); }
                     let vis = ((field_w - 4) / cw).max(0) as usize;
                     let hscroll = cursor_chars.saturating_sub(vis.saturating_sub(1));
                     if let Some(anc) = sel_anc {
@@ -13710,14 +13708,14 @@ fn render(s: &mut State) {
                         if mn < mx {
                             let x0 = field_x + 2 + (mn.saturating_sub(hscroll)) as i32 * cw;
                             let x1 = field_x + 2 + ((mx - hscroll).min(vis + 1)) as i32 * cw;
-                            fill(buf, w, h, x0, fy, (x1 - x0).max(0), lh, HL_MATCH);
+                            fill(buf, w, h, x0, fy, (x1 - x0).max(0), lh, th().hl_match);
                         }
                     }
                     let disp: String = value.chars().skip(hscroll).take(vis + 1).collect();
-                    draw_str(buf, w, h, g, &disp, field_x + 2, fy + asc, FG, field_x + field_w);
+                    draw_str(buf, w, h, g, &disp, field_x + 2, fy + asc, th().fg, field_x + field_w);
                     if is_active {
                         let cx = field_x + 2 + (cursor_chars - hscroll) as i32 * cw;
-                        fill(buf, w, h, cx.min(field_x + field_w - 2), fy, 1, lh, ACCENT);
+                        fill(buf, w, h, cx.min(field_x + field_w - 2), fy, 1, lh, th().accent);
                     }
                     fy += row_h;
                 }
@@ -13726,22 +13724,22 @@ fn render(s: &mut State) {
                 fy += 2;
                 // Live/Submit toggle (in label area, left of field_x)
                 let live_label = if gf.live_search { "[~] live" } else { "[ ] live" };
-                let live_col   = if gf.live_search { ACCENT } else { FG_DIM };
+                let live_col   = if gf.live_search { th().accent } else { th().fg_dim };
                 draw_str(buf, w, h, g, live_label, px + 2, fy + asc, live_col, field_x);
                 // Search + Replace All buttons
                 let search_label = "[Search]";
                 let sl = search_label.chars().count() as i32 * cw;
-                fill(buf, w, h, field_x, fy, sl, lh, SEL_BG);
-                draw_str(buf, w, h, g, search_label, field_x, fy + asc, ACCENT, field_x + sl);
+                fill(buf, w, h, field_x, fy, sl, lh, th().sel_bg);
+                draw_str(buf, w, h, g, search_label, field_x, fy + asc, th().accent, field_x + sl);
                 if !gf.replace.is_empty() && !gf.results.is_empty() {
                     let ra_label = "[Repl All]";
                     let rl = ra_label.chars().count() as i32 * cw;
                     let rx = field_x + sl + cw;
-                    fill(buf, w, h, rx, fy, rl, lh, SEL_BG);
-                    draw_str(buf, w, h, g, ra_label, rx, fy + asc, ACCENT, rx + rl);
+                    fill(buf, w, h, rx, fy, rl, lh, th().sel_bg);
+                    draw_str(buf, w, h, g, ra_label, rx, fy + asc, th().accent, rx + rl);
                 }
                 fy += row_h + 4;
-                fill(buf, w, h, px, fy - 1, pw - 1, 1, BORDER);
+                fill(buf, w, h, px, fy - 1, pw - 1, 1, th().border);
 
                 // Results
                 let res_h = (h as i32 - status_h - fy).max(0);
@@ -13753,21 +13751,21 @@ fn render(s: &mut State) {
                 } else {
                     format!(" {} match(es)", gf.results.len())
                 };
-                draw_str(buf, w, h, g, &count_str, px, fy + asc, FG_DIM, px + pw - 1);
+                draw_str(buf, w, h, g, &count_str, px, fy + asc, th().fg_dim, px + pw - 1);
                 fy += lh;
                 for (ri, (name, line_num, line_text, _match_col, _match_len)) in gf.results[start..end].iter().enumerate() {
                     let ry = fy + ri as i32 * lh;
                     if ry + lh > h as i32 - status_h { break; }
                     let is_sel = start + ri == gf.selected;
                     if is_sel {
-                        fill(buf, w, h, px, ry, pw - 1, lh, SEL_BG);
-                        if sidebar_list_focused { fill(buf, w, h, px, ry, 2, lh, ACCENT); }
+                        fill(buf, w, h, px, ry, pw - 1, lh, th().sel_bg);
+                        if sidebar_list_focused { fill(buf, w, h, px, ry, 2, lh, th().accent); }
                     }
                     let header = format!("{}:{}", name, line_num + 1);
-                    draw_str(buf, w, h, g, &header, px + 2, ry + asc, ACCENT, px + pw - 1);
+                    draw_str(buf, w, h, g, &header, px + 2, ry + asc, th().accent, px + pw - 1);
                     let hlen = header.chars().count() as i32 * cw + 4;
                     let preview: String = line_text.trim().chars().take(((pw - hlen) / cw).max(0) as usize).collect();
-                    draw_str(buf, w, h, g, &preview, px + 2 + hlen, ry + asc, FG_DIM, px + pw - 1);
+                    draw_str(buf, w, h, g, &preview, px + 2 + hlen, ry + asc, th().fg_dim, px + pw - 1);
                 }
             } else if let Some(ref dp) = diag_panel_snap {
                 // Diagnostics panel
@@ -13777,28 +13775,28 @@ fn render(s: &mut State) {
                 } else {
                     " Diagnostics".to_owned()
                 };
-                draw_str(buf, w, h, g, &label, px, ry + asc, if err_count > 0 { 0xFF5555u32 } else { FG }, px + pw - 1);
+                draw_str(buf, w, h, g, &label, px, ry + asc, if err_count > 0 { th().error } else { th().fg }, px + pw - 1);
                 ry += lh + 2;
-                fill(buf, w, h, px, ry, pw - 1, 1, BORDER);
+                fill(buf, w, h, px, ry, pw - 1, 1, th().border);
                 ry += 4;
                 for (i, (name, line_num, sev, msg, _path)) in dp.iter().enumerate() {
                     if ry + lh > panel_h { break; }
                     let is_sel = i == diag_panel_sel;
                     if is_sel {
-                        fill(buf, w, h, px, ry, pw - 1, lh, SEL_BG);
-                        if sidebar_list_focused { fill(buf, w, h, px, ry, 2, lh, ACCENT); }
+                        fill(buf, w, h, px, ry, pw - 1, lh, th().sel_bg);
+                        if sidebar_list_focused { fill(buf, w, h, px, ry, 2, lh, th().accent); }
                     }
                     let (icon, sev_color) = match sev {
-                        DiagSeverity::Error   => ("[!]", 0xFF5555u32),
-                        DiagSeverity::Warning => ("[~]", 0xE0AF68u32),
-                        _                     => ("[-]", FG_DIM),
+                        DiagSeverity::Error   => ("[!]", th().error),
+                        DiagSeverity::Warning => ("[~]", th().warning),
+                        _                     => ("[-]", th().fg_dim),
                     };
                     let header = format!("{} {}:{} ", icon, name, line_num + 1);
                     let hlen   = header.chars().count() as i32 * cw;
                     draw_str(buf, w, h, g, &header, px + 2, ry + asc, sev_color, px + hlen + 2);
                     let avail  = ((pw - hlen - 4) / cw).max(0) as usize;
                     let preview: String = msg.trim().chars().take(avail).collect();
-                    draw_str(buf, w, h, g, &preview, px + 2 + hlen, ry + asc, FG_DIM, px + pw - 1);
+                    draw_str(buf, w, h, g, &preview, px + 2 + hlen, ry + asc, th().fg_dim, px + pw - 1);
                     ry += lh;
                 }
             } else if let Some(ref gs) = git_snap {
@@ -13807,25 +13805,25 @@ fn render(s: &mut State) {
                 let pw = explorer_w;
                 if !gs.is_git_repo {
                     if let Some(ref err) = gs.remote_error {
-                        draw_str(buf, w, h, g, &format!(" Error: {}", err.lines().next().unwrap_or(err)), px + 2, asc + 4, FG_DIM, px + pw - 1);
+                        draw_str(buf, w, h, g, &format!(" Error: {}", err.lines().next().unwrap_or(err)), px + 2, asc + 4, th().fg_dim, px + pw - 1);
                     } else {
-                        draw_str(buf, w, h, g, " Not a git repo", px + 2, asc + 4, FG_DIM, px + pw - 1);
+                        draw_str(buf, w, h, g, " Not a git repo", px + 2, asc + 4, th().fg_dim, px + pw - 1);
                     }
                 } else if gs.loading {
-                    draw_str(buf, w, h, g, " Loading...", px + 2, asc + 4, FG_DIM, px + pw - 1);
+                    draw_str(buf, w, h, g, " Loading...", px + 2, asc + 4, th().fg_dim, px + pw - 1);
                 } else {
                     let scroll_px = gs.scroll as i32 * lh;
                     let mut ry = 4i32 - scroll_px;
                     let commit_area_top = panel_h - lh * 3 - 8;
                     // STAGED header
                     if ry + lh > 0 && ry < commit_area_top {
-                        draw_str(buf, w, h, g, " STAGED", px + 2, ry + asc, FG_DIM, px + pw - 1);
-                        fill(buf, w, h, px, ry + lh - 1, pw - 1, 1, BORDER);
+                        draw_str(buf, w, h, g, " STAGED", px + 2, ry + asc, th().fg_dim, px + pw - 1);
+                        fill(buf, w, h, px, ry + lh - 1, pw - 1, 1, th().border);
                     }
                     ry += lh;
                     if gs.staged.is_empty() {
                         if ry + lh > 0 && ry < commit_area_top {
-                            draw_str(buf, w, h, g, "  (none)", px + 2, ry + asc, FG_DIM, px + pw - 1);
+                            draw_str(buf, w, h, g, "  (none)", px + 2, ry + asc, th().fg_dim, px + pw - 1);
                         }
                         ry += lh;
                     } else {
@@ -13833,11 +13831,11 @@ fn render(s: &mut State) {
                             if ry + lh > commit_area_top { break; }
                             if ry + lh > 0 {
                                 let is_sel = gs.sel == GitSel::Staged(i);
-                                if is_sel { fill(buf, w, h, px, ry, pw - 1, lh, SEL_BG); }
+                                if is_sel { fill(buf, w, h, px, ry, pw - 1, lh, th().sel_bg); }
                                 let avail = ((pw - 6) / cw).max(0) as usize;
                                 let label = format!("  {} {}", entry.xy.0, entry.path);
                                 let disp: String = label.chars().take(avail).collect();
-                                draw_str(buf, w, h, g, &disp, px + 2, ry + asc, FG, px + pw - 1);
+                                draw_str(buf, w, h, g, &disp, px + 2, ry + asc, th().fg, px + pw - 1);
                             }
                             ry += lh;
                         }
@@ -13846,59 +13844,59 @@ fn render(s: &mut State) {
                     // CHANGES header
                     ry += 2;
                     if ry + lh > 0 && ry < commit_area_top {
-                        draw_str(buf, w, h, g, " CHANGES", px + 2, ry + asc, FG_DIM, px + pw - 1);
-                        fill(buf, w, h, px, ry + lh - 1, pw - 1, 1, BORDER);
+                        draw_str(buf, w, h, g, " CHANGES", px + 2, ry + asc, th().fg_dim, px + pw - 1);
+                        fill(buf, w, h, px, ry + lh - 1, pw - 1, 1, th().border);
                     }
                     ry += lh;
                     if gs.unstaged.is_empty() {
                         if ry + lh > 0 && ry < commit_area_top {
-                            draw_str(buf, w, h, g, "  (none)", px + 2, ry + asc, FG_DIM, px + pw - 1);
+                            draw_str(buf, w, h, g, "  (none)", px + 2, ry + asc, th().fg_dim, px + pw - 1);
                         }
                     } else {
                         for (i, entry) in gs.unstaged.iter().enumerate() {
                             if ry + lh > commit_area_top { break; }
                             if ry + lh > 0 {
                                 let is_sel = gs.sel == GitSel::Unstaged(i);
-                                if is_sel { fill(buf, w, h, px, ry, pw - 1, lh, SEL_BG); }
+                                if is_sel { fill(buf, w, h, px, ry, pw - 1, lh, th().sel_bg); }
                                 let avail = ((pw - 6) / cw).max(0) as usize;
                                 let xy_char = if entry.xy.0 == '?' { '?' } else { entry.xy.1 };
                                 let label = format!("  {} {}", xy_char, entry.path);
                                 let disp: String = label.chars().take(avail).collect();
-                                draw_str(buf, w, h, g, &disp, px + 2, ry + asc, FG, px + pw - 1);
+                                draw_str(buf, w, h, g, &disp, px + 2, ry + asc, th().fg, px + pw - 1);
                             }
                             ry += lh;
                         }
                     }
 
                     // COMMIT area (anchored from bottom)
-                    fill(buf, w, h, px, commit_area_top, pw - 1, 1, BORDER);
+                    fill(buf, w, h, px, commit_area_top, pw - 1, 1, th().border);
                     let ca = commit_area_top + 4;
-                    draw_str(buf, w, h, g, " COMMIT", px + 2, ca + asc, FG_DIM, px + pw - 1);
+                    draw_str(buf, w, h, g, " COMMIT", px + 2, ca + asc, th().fg_dim, px + pw - 1);
                     let ca = ca + lh;
                     // Commit message field
-                    let field_bg = if gs.commit_focused { SEL_BG } else { BG };
+                    let field_bg = if gs.commit_focused { th().sel_bg } else { th().bg };
                     fill(buf, w, h, px + 2, ca, pw - 4, lh, field_bg);
                     let vis = ((pw - 8) / cw).max(0) as usize;
                     let commit_cursor_chars = gs.commit_msg[..gs.commit_cursor].chars().count();
                     let hscroll = commit_cursor_chars.saturating_sub(vis.saturating_sub(1));
                     let disp_msg: String = gs.commit_msg.chars().skip(hscroll).take(vis).collect();
                     if disp_msg.is_empty() && !gs.commit_focused {
-                        draw_str(buf, w, h, g, "commit message", px + 4, ca + asc, FG_DIM, px + pw - 3);
+                        draw_str(buf, w, h, g, "commit message", px + 4, ca + asc, th().fg_dim, px + pw - 3);
                     } else {
-                        draw_str(buf, w, h, g, &disp_msg, px + 4, ca + asc, FG, px + pw - 3);
+                        draw_str(buf, w, h, g, &disp_msg, px + 4, ca + asc, th().fg, px + pw - 3);
                     }
                     if gs.commit_focused {
                         let cur_col = (commit_cursor_chars - hscroll) as i32;
-                        fill(buf, w, h, px + 4 + cur_col * cw, ca, 1, lh, ACCENT);
-                        fill(buf, w, h, px + 2, ca + lh - 1, pw - 4, 1, ACCENT);
+                        fill(buf, w, h, px + 4 + cur_col * cw, ca, 1, lh, th().accent);
+                        fill(buf, w, h, px + 2, ca + lh - 1, pw - 4, 1, th().accent);
                     }
                     // Buttons row
                     let btn_y = ca + lh + 2;
                     let can_commit = !gs.staged.is_empty() && !gs.commit_msg.is_empty();
-                    let commit_btn_fg = if can_commit { ACCENT } else { FG_DIM };
+                    let commit_btn_fg = if can_commit { th().accent } else { th().fg_dim };
                     draw_str(buf, w, h, g, "[Commit]", px + 2, btn_y + asc, commit_btn_fg, px + pw / 2);
                     let has_unstaged = !gs.unstaged.is_empty();
-                    let stage_all_fg = if has_unstaged { FG } else { FG_DIM };
+                    let stage_all_fg = if has_unstaged { th().fg } else { th().fg_dim };
                     draw_str(buf, w, h, g, "[Stage All]", px + pw / 2, btn_y + asc, stage_all_fg, px + pw - 1);
                 }
             }
@@ -13908,27 +13906,27 @@ fn render(s: &mut State) {
                 let mut cy = 0i32;
                 // Header row
                 let role_label = if collab_is_host { " 👑 Hosting" } else { " 🔒 Connected" };
-                draw_str(buf, w, h, g, role_label, px, cy + asc, ACCENT, px + pw - 1);
+                draw_str(buf, w, h, g, role_label, px, cy + asc, th().accent, px + pw - 1);
                 cy += lh;
-                fill(buf, w, h, px, cy - 1, pw - 1, 1, BORDER);
+                fill(buf, w, h, px, cy - 1, pw - 1, 1, th().border);
 
                 // Invite string (host only)
                 if let Some(ref invite) = collab_invite_str {
                     let avail = ((pw - 4) / cw).max(0) as usize;
                     let disp: String = invite.chars().take(avail).collect();
-                    draw_str(buf, w, h, g, &disp, px + 2, cy + asc, FG_DIM, px + pw - 1);
+                    draw_str(buf, w, h, g, &disp, px + 2, cy + asc, th().fg_dim, px + pw - 1);
                     cy += lh;
                 }
 
                 // Peer list header
-                fill(buf, w, h, px, cy, pw - 1, lh, BG2);
-                draw_str(buf, w, h, g, " Name / File", px, cy + asc, FG_DIM, px + pw * 2 / 3);
-                draw_str(buf, w, h, g, " Role", px + pw * 2 / 3, cy + asc, FG_DIM, px + pw - 1);
+                fill(buf, w, h, px, cy, pw - 1, lh, th().bg2);
+                draw_str(buf, w, h, g, " Name / File", px, cy + asc, th().fg_dim, px + pw * 2 / 3);
+                draw_str(buf, w, h, g, " Role", px + pw * 2 / 3, cy + asc, th().fg_dim, px + pw - 1);
                 cy += lh;
-                fill(buf, w, h, px, cy - 1, pw - 1, 1, BORDER);
+                fill(buf, w, h, px, cy - 1, pw - 1, 1, th().border);
 
                 if collab_peers_snap.is_empty() {
-                    draw_str(buf, w, h, g, " (no peers)", px + 2, cy + asc, FG_DIM, px + pw - 1);
+                    draw_str(buf, w, h, g, " (no peers)", px + 2, cy + asc, th().fg_dim, px + pw - 1);
                     cy += lh;
                 }
                 for (_sid, ref name, color, role, ref cur_file) in &collab_peers_snap {
@@ -13938,10 +13936,10 @@ fn render(s: &mut State) {
                     // Name
                     let name_avail = ((pw * 2 / 3 - 6) / cw).max(0) as usize;
                     let name_disp: String = name.chars().take(name_avail).collect();
-                    draw_str(buf, w, h, g, &format!(" {}", name_disp), px + 4, cy + asc, FG, px + pw * 2 / 3);
+                    draw_str(buf, w, h, g, &format!(" {}", name_disp), px + 4, cy + asc, th().fg, px + pw * 2 / 3);
                     // Role badge
                     let role_lbl = role.label();
-                    draw_str(buf, w, h, g, role_lbl, px + pw * 2 / 3, cy + asc, FG_DIM, px + pw - 1);
+                    draw_str(buf, w, h, g, role_lbl, px + pw * 2 / 3, cy + asc, th().fg_dim, px + pw - 1);
                     cy += lh;
                     // Current file (dimmed, indented)
                     if !cur_file.is_empty() && cy < panel_h {
@@ -13949,7 +13947,7 @@ fn render(s: &mut State) {
                         // Take the basename only to save space
                         let basename = cur_file.rsplit('/').next().unwrap_or(cur_file.as_str());
                         let fdisp: String = basename.chars().take(fav).collect();
-                        draw_str(buf, w, h, g, &format!("   {}", fdisp), px, cy + asc, FG_DIM, px + pw - 1);
+                        draw_str(buf, w, h, g, &format!("   {}", fdisp), px, cy + asc, th().fg_dim, px + pw - 1);
                         cy += lh;
                     }
                 }
@@ -13968,24 +13966,24 @@ fn render(s: &mut State) {
             let clip_r   = r.x + r.w;
 
             // Tab bar
-            fill(buf, w, h, r.x, r.y, r.w, tab_h, BG2);
-            fill(buf, w, h, r.x, r.y + tab_h - 1, r.w, 1, BORDER);
+            fill(buf, w, h, r.x, r.y, r.w, tab_h, th().bg2);
+            fill(buf, w, h, r.x, r.y + tab_h - 1, r.w, 1, th().border);
             if snap.is_active {
-                fill(buf, w, h, r.x, r.y, 2, tab_h - 1, ACCENT);
+                fill(buf, w, h, r.x, r.y, 2, tab_h - 1, th().accent);
             }
             let mut tx = r.x;
             for (i, (name, dirty_tab)) in snap.tab_info.iter().enumerate() {
                 let label    = if *dirty_tab { format!(" {}• ", name) } else { format!(" {}  ", name) };
                 let tw       = label.chars().count() as i32 * cw;
                 let is_act   = i == snap.active_tab;
-                let tab_bg   = if is_act { BG } else { BG2 };
+                let tab_bg   = if is_act { th().bg } else { th().bg2 };
                 fill(buf, w, h, tx, r.y, tw, tab_h - 1, tab_bg);
-                if is_act { fill(buf, w, h, tx, r.y + tab_h - 2, tw, 2, ACCENT); }
-                draw_str(buf, w, h, g, &label, tx, r.y + tab_h * 3 / 4, FG, (tx + tw - cw).min(clip_r));
+                if is_act { fill(buf, w, h, tx, r.y + tab_h - 2, tw, 2, th().accent); }
+                draw_str(buf, w, h, g, &label, tx, r.y + tab_h * 3 / 4, th().fg, (tx + tw - cw).min(clip_r));
                 // × close button (last character cell)
-                let x_col = if is_act { FG } else { FG_DIM };
+                let x_col = if is_act { th().fg } else { th().fg_dim };
                 draw_str(buf, w, h, g, "×", tx + tw - cw, r.y + tab_h * 3 / 4, x_col, (tx + tw).min(clip_r));
-                fill(buf, w, h, tx + tw, r.y, 1, tab_h, BORDER);
+                fill(buf, w, h, tx + tw, r.y, 1, tab_h, th().border);
                 tx += tw + 1;
             }
 
@@ -13998,7 +13996,7 @@ fn render(s: &mut State) {
                 let btn_x     = r.x + 14 * cw;
 
                 // Clear content area background
-                fill(buf, w, h, r.x, clip_top, r.w, clip_bot - clip_top, BG);
+                fill(buf, w, h, r.x, clip_top, r.w, clip_bot - clip_top, th().bg);
 
                 let row_vis = |y: i32| y + lh > clip_top && y < clip_bot;
                 // fc = fill clipped to content area
@@ -14009,26 +14007,26 @@ fn render(s: &mut State) {
                 // Title separator
                 let title_y = content_y - scroll_px;
                 if row_vis(title_y) {
-                    draw_str(buf, w, h, g, "  Settings", r.x, title_y + asc, FG, r.x + r.w);
+                    draw_str(buf, w, h, g, "  Settings", r.x, title_y + asc, th().fg, r.x + r.w);
                 }
-                fc(buf, r.x, content_y + lh - scroll_px, r.w, 1, BORDER);
+                fc(buf, r.x, content_y + lh - scroll_px, r.w, 1, th().border);
 
                 // Renderer row
                 let ry = content_y + lh + 8 - scroll_px;
                 if row_vis(ry) {
-                    draw_str(buf, w, h, g, "  Renderer", r.x, ry + asc, FG, btn_x - cw);
-                    let (cpu_bg, cpu_fg) = if !renderer_is_gpu { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
+                    draw_str(buf, w, h, g, "  Renderer", r.x, ry + asc, th().fg, btn_x - cw);
+                    let (cpu_bg, cpu_fg) = if !renderer_is_gpu { (th().accent, th().bg) } else { (th().sel_bg, th().fg_dim) };
                     fc(buf, btn_x,          ry, 5 * cw, lh, cpu_bg);
                     draw_str(buf, w, h, g, " CPU ", btn_x,          ry + asc, cpu_fg, btn_x + 5 * cw);
-                    let (gpu_bg, gpu_fg) = if  renderer_is_gpu { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
+                    let (gpu_bg, gpu_fg) = if  renderer_is_gpu { (th().accent, th().bg) } else { (th().sel_bg, th().fg_dim) };
                     fc(buf, btn_x + 6 * cw, ry, 5 * cw, lh, gpu_bg);
                     draw_str(buf, w, h, g, " GPU ", btn_x + 6 * cw, ry + asc, gpu_fg, btn_x + 11 * cw);
                 }
                 // CPU Double-Buffer row
                 let cpu_db_y = ry + lh + 4;
                 if row_vis(cpu_db_y) {
-                    draw_str(buf, w, h, g, "  CPU Double-Buffer", r.x, cpu_db_y + asc, FG, btn_x - cw);
-                    let (db_bg, db_fg) = if cpu_double_buffer { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
+                    draw_str(buf, w, h, g, "  CPU Double-Buffer", r.x, cpu_db_y + asc, th().fg, btn_x - cw);
+                    let (db_bg, db_fg) = if cpu_double_buffer { (th().accent, th().bg) } else { (th().sel_bg, th().fg_dim) };
                     let db_label = if cpu_double_buffer { " [x] On " } else { " [ ] Off" };
                     fc(buf, btn_x, cpu_db_y, 8 * cw, lh, db_bg);
                     draw_str(buf, w, h, g, db_label, btn_x, cpu_db_y + asc, db_fg, btn_x + 8 * cw);
@@ -14036,11 +14034,11 @@ fn render(s: &mut State) {
                 // GPU Drawables row
                 let gpu_dc_y = cpu_db_y + lh + 4;
                 if row_vis(gpu_dc_y) {
-                    draw_str(buf, w, h, g, "  GPU Drawables", r.x, gpu_dc_y + asc, FG, btn_x - cw);
+                    draw_str(buf, w, h, g, "  GPU Drawables", r.x, gpu_dc_y + asc, th().fg, btn_x - cw);
                     for (i, &count) in [2u8, 3u8].iter().enumerate() {
                         let off = i as i32 * 4;
                         let active = gpu_drawable_count == count;
-                        let (bg, fg) = if active { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
+                        let (bg, fg) = if active { (th().accent, th().bg) } else { (th().sel_bg, th().fg_dim) };
                         let label = if count == 2 { " 2 " } else { " 3 " };
                         fc(buf, btn_x + off * cw, gpu_dc_y, 3 * cw, lh, bg);
                         draw_str(buf, w, h, g, label, btn_x + off * cw, gpu_dc_y + asc, fg, btn_x + (off + 3) * cw);
@@ -14049,8 +14047,8 @@ fn render(s: &mut State) {
                 // VSync row
                 let vy = gpu_dc_y + lh + 4;
                 if row_vis(vy) {
-                    draw_str(buf, w, h, g, "  VSync", r.x, vy + asc, FG, btn_x - cw);
-                    let (vs_bg, vs_fg) = if vsync_on { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
+                    draw_str(buf, w, h, g, "  VSync", r.x, vy + asc, th().fg, btn_x - cw);
+                    let (vs_bg, vs_fg) = if vsync_on { (th().accent, th().bg) } else { (th().sel_bg, th().fg_dim) };
                     let vs_label = if vsync_on { " [x] On " } else { " [ ] Off" };
                     fc(buf, btn_x, vy, 8 * cw, lh, vs_bg);
                     draw_str(buf, w, h, g, vs_label, btn_x, vy + asc, vs_fg, btn_x + 8 * cw);
@@ -14058,22 +14056,22 @@ fn render(s: &mut State) {
                 // UI Scale row
                 let sy = vy + lh + 4;
                 if row_vis(sy) {
-                    draw_str(buf, w, h, g, "  UI Scale", r.x, sy + asc, FG, btn_x - cw);
+                    draw_str(buf, w, h, g, "  UI Scale", r.x, sy + asc, th().fg, btn_x - cw);
                     let scale_str = format!("  {:.0}%  ({})", ui_scale * 100.0, key_label("Cmd+= / Cmd+-"));
-                    draw_str(buf, w, h, g, &scale_str, btn_x, sy + asc, FG_DIM, r.x + r.w);
+                    draw_str(buf, w, h, g, &scale_str, btn_x, sy + asc, th().fg_dim, r.x + r.w);
                 }
                 // Rainbow Brackets row
                 let rb_y = sy + lh + 4;
                 if row_vis(rb_y) {
-                    draw_str(buf, w, h, g, "  Rainbow Brackets", r.x, rb_y + asc, FG, btn_x - cw);
-                    let (rb_bg, rb_fg) = if rainbow_brackets { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
+                    draw_str(buf, w, h, g, "  Rainbow Brackets", r.x, rb_y + asc, th().fg, btn_x - cw);
+                    let (rb_bg, rb_fg) = if rainbow_brackets { (th().accent, th().bg) } else { (th().sel_bg, th().fg_dim) };
                     fc(buf, btn_x, rb_y, 8 * cw, lh, rb_bg);
                     draw_str(buf, w, h, g, if rainbow_brackets { " [x] On " } else { " [ ] Off" }, btn_x, rb_y + asc, rb_fg, btn_x + 8 * cw);
                 }
                 // Glyph Cache row
                 let gc_y = rb_y + lh + 4;
                 if row_vis(gc_y) {
-                    draw_str(buf, w, h, g, "  Glyph Cache", r.x, gc_y + asc, FG, btn_x - cw);
+                    draw_str(buf, w, h, g, "  Glyph Cache", r.x, gc_y + asc, th().fg, btn_x - cw);
                     // Button offsets (in cw from btn_x), widths, labels — must match GlyphCacheLimit::ALL order
                     let gc_btns: [(i32, i32, &str); 5] = [
                         (0, 11, " Unlimited "),
@@ -14084,7 +14082,7 @@ fn render(s: &mut State) {
                     ];
                     for (i, (off, wid, label)) in gc_btns.iter().enumerate() {
                         let active = glyph_cache_limit == settings::GlyphCacheLimit::ALL[i];
-                        let (bg, fg) = if active { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
+                        let (bg, fg) = if active { (th().accent, th().bg) } else { (th().sel_bg, th().fg_dim) };
                         fc(buf, btn_x + off * cw, gc_y, wid * cw, lh, bg);
                         draw_str(buf, w, h, g, label, btn_x + off * cw, gc_y + asc, fg, btn_x + (off + wid) * cw);
                     }
@@ -14092,9 +14090,9 @@ fn render(s: &mut State) {
                 // Undo History toggle row
                 let ul_y = gc_y + lh + 4;
                 if row_vis(ul_y) {
-                    draw_str(buf, w, h, g, "  Undo History", r.x, ul_y + asc, FG, btn_x - cw);
+                    draw_str(buf, w, h, g, "  Undo History", r.x, ul_y + asc, th().fg, btn_x - cw);
                     let unlimited = undo_limit.is_none();
-                    let (ul_bg, ul_fg) = if unlimited { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
+                    let (ul_bg, ul_fg) = if unlimited { (th().accent, th().bg) } else { (th().sel_bg, th().fg_dim) };
                     fc(buf, btn_x, ul_y, 12 * cw, lh, ul_bg);
                     draw_str(buf, w, h, g, if unlimited { " [x] Unlimited" } else { " [ ] Unlimited" }, btn_x, ul_y + asc, ul_fg, btn_x + 12 * cw);
                 }
@@ -14102,13 +14100,13 @@ fn render(s: &mut State) {
                 if let Some(lim) = undo_limit {
                     let ul_num_y = ul_y + lh + 4;
                     if row_vis(ul_num_y) {
-                        draw_str(buf, w, h, g, "  Undo Limit", r.x, ul_num_y + asc, FG, btn_x - cw);
-                        fc(buf, btn_x, ul_num_y, 3 * cw, lh, SEL_BG);
-                        draw_str(buf, w, h, g, " - ", btn_x, ul_num_y + asc, FG, btn_x + 3 * cw);
+                        draw_str(buf, w, h, g, "  Undo Limit", r.x, ul_num_y + asc, th().fg, btn_x - cw);
+                        fc(buf, btn_x, ul_num_y, 3 * cw, lh, th().sel_bg);
+                        draw_str(buf, w, h, g, " - ", btn_x, ul_num_y + asc, th().fg, btn_x + 3 * cw);
                         let lim_str = format!("  {}  ", lim);
-                        draw_str(buf, w, h, g, &lim_str, btn_x + 3 * cw, ul_num_y + asc, FG_DIM, btn_x + 11 * cw);
-                        fc(buf, btn_x + 11 * cw, ul_num_y, 3 * cw, lh, SEL_BG);
-                        draw_str(buf, w, h, g, " + ", btn_x + 11 * cw, ul_num_y + asc, FG, btn_x + 14 * cw);
+                        draw_str(buf, w, h, g, &lim_str, btn_x + 3 * cw, ul_num_y + asc, th().fg_dim, btn_x + 11 * cw);
+                        fc(buf, btn_x + 11 * cw, ul_num_y, 3 * cw, lh, th().sel_bg);
+                        draw_str(buf, w, h, g, " + ", btn_x + 11 * cw, ul_num_y + asc, th().fg, btn_x + 14 * cw);
                     }
                 }
                 // Info row
@@ -14119,20 +14117,20 @@ fn render(s: &mut State) {
                 };
                 let info_y = if undo_limit.is_some() { ul_y + lh * 2 + 8 } else { ul_y + lh + 4 };
                 if row_vis(info_y) {
-                    draw_str(buf, w, h, g, info, r.x, info_y + asc, FG_DIM, r.x + r.w);
+                    draw_str(buf, w, h, g, info, r.x, info_y + asc, th().fg_dim, r.x + r.w);
                 }
 
                 // ── Terminal section ───────────────────────────────────────────
                 let term_sec_y = info_y + lh + 8;
                 if row_vis(term_sec_y) {
-                    draw_str(buf, w, h, g, "  Terminal", r.x, term_sec_y + asc, FG, btn_x - cw);
+                    draw_str(buf, w, h, g, "  Terminal", r.x, term_sec_y + asc, th().fg, btn_x - cw);
                 }
-                fc(buf, r.x + cw, term_sec_y + lh - 1, r.w - 2 * cw, 1, BORDER);
+                fc(buf, r.x + cw, term_sec_y + lh - 1, r.w - 2 * cw, 1, th().border);
 
                 let tcp_y = term_sec_y + lh + 4;
                 if row_vis(tcp_y) {
-                    draw_str(buf, w, h, g, &key_label("  Copy/Paste (Cmd+C / Cmd+V)"), r.x, tcp_y + asc, FG, btn_x - cw);
-                    let (tcp_bg, tcp_fg) = if term_copy_paste { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
+                    draw_str(buf, w, h, g, &key_label("  Copy/Paste (Cmd+C / Cmd+V)"), r.x, tcp_y + asc, th().fg, btn_x - cw);
+                    let (tcp_bg, tcp_fg) = if term_copy_paste { (th().accent, th().bg) } else { (th().sel_bg, th().fg_dim) };
                     fc(buf, btn_x, tcp_y, 8 * cw, lh, tcp_bg);
                     draw_str(buf, w, h, g, if term_copy_paste { " [x] On " } else { " [ ] Off" }, btn_x, tcp_y + asc, tcp_fg, btn_x + 8 * cw);
                 }
@@ -14140,28 +14138,28 @@ fn render(s: &mut State) {
                 let tcb_y = tcp_y + lh + 4;
                 if row_vis(tcb_y) {
                     let kill_line = if MACOS { "  Cmd+Backspace \u{2192} \\x15" } else { "  Ctrl+Shift+Backspace \u{2192} \\x15" };
-                    draw_str(buf, w, h, g, kill_line, r.x, tcb_y + asc, FG, btn_x - cw);
-                    let (tcb_bg, tcb_fg) = if term_cmd_bs { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
+                    draw_str(buf, w, h, g, kill_line, r.x, tcb_y + asc, th().fg, btn_x - cw);
+                    let (tcb_bg, tcb_fg) = if term_cmd_bs { (th().accent, th().bg) } else { (th().sel_bg, th().fg_dim) };
                     fc(buf, btn_x, tcb_y, 8 * cw, lh, tcb_bg);
                     draw_str(buf, w, h, g, if term_cmd_bs { " [x] On " } else { " [ ] Off" }, btn_x, tcb_y + asc, tcb_fg, btn_x + 8 * cw);
                 }
 
                 let tab_y = tcb_y + lh + 4;
                 if row_vis(tab_y) {
-                    draw_str(buf, w, h, g, "  Alt+Backspace \u{2192} \\x17", r.x, tab_y + asc, FG, btn_x - cw);
-                    let (tab_bg, tab_fg) = if term_alt_bs { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
+                    draw_str(buf, w, h, g, "  Alt+Backspace \u{2192} \\x17", r.x, tab_y + asc, th().fg, btn_x - cw);
+                    let (tab_bg, tab_fg) = if term_alt_bs { (th().accent, th().bg) } else { (th().sel_bg, th().fg_dim) };
                     fc(buf, btn_x, tab_y, 8 * cw, lh, tab_bg);
                     draw_str(buf, w, h, g, if term_alt_bs { " [x] On " } else { " [ ] Off" }, btn_x, tab_y + asc, tab_fg, btn_x + 8 * cw);
                 }
 
                 let tws_y = tab_y + lh + 4;
                 if row_vis(tws_y) {
-                    draw_str(buf, w, h, g, "  Double-click", r.x, tws_y + asc, FG, btn_x - cw);
+                    draw_str(buf, w, h, g, "  Double-click", r.x, tws_y + asc, th().fg, btn_x - cw);
                     let ws_is_active = term_word_select == settings::TermWordSelect::Whitespace;
-                    let (ws_bg, ws_fg) = if ws_is_active { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
+                    let (ws_bg, ws_fg) = if ws_is_active { (th().accent, th().bg) } else { (th().sel_bg, th().fg_dim) };
                     fc(buf, btn_x, tws_y, 11 * cw, lh, ws_bg);
                     draw_str(buf, w, h, g, " Whitespace ", btn_x, tws_y + asc, ws_fg, btn_x + 11 * cw);
-                    let (wd_bg, wd_fg) = if !ws_is_active { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
+                    let (wd_bg, wd_fg) = if !ws_is_active { (th().accent, th().bg) } else { (th().sel_bg, th().fg_dim) };
                     fc(buf, btn_x + 12 * cw, tws_y, 6 * cw, lh, wd_bg);
                     draw_str(buf, w, h, g, " Word ", btn_x + 12 * cw, tws_y + asc, wd_fg, btn_x + 18 * cw);
                 }
@@ -14169,33 +14167,33 @@ fn render(s: &mut State) {
                 // ── Language Servers section ───────────────────────────────────
                 let lsp_sec_y = tws_y + lh + 8;
                 if row_vis(lsp_sec_y) {
-                    draw_str(buf, w, h, g, &format!("  Language Servers ({lsp_scope_label})"), r.x, lsp_sec_y + asc, FG, r.x + r.w);
+                    draw_str(buf, w, h, g, &format!("  Language Servers ({lsp_scope_label})"), r.x, lsp_sec_y + asc, th().fg, r.x + r.w);
                 }
-                fc(buf, r.x + cw, lsp_sec_y + lh - 1, r.w - 2 * cw, 1, BORDER);
+                fc(buf, r.x + cw, lsp_sec_y + lh - 1, r.w - 2 * cw, 1, th().border);
                 let inst_btn_w = 9 * cw;
 
                 for (i, (_, name, status, accent, show_install)) in lsp_rows_snap.iter().enumerate() {
                     let ly = lsp_sec_y + lh + 4 + i as i32 * (lh + 4);
                     if !row_vis(ly) { continue; }
-                    draw_str(buf, w, h, g, &format!("  {}", name), r.x, ly + asc, FG, btn_x - cw);
+                    draw_str(buf, w, h, g, &format!("  {}", name), r.x, ly + asc, th().fg, btn_x - cw);
                     if *accent {
-                        fc(buf, btn_x, ly, 12 * cw, lh, ACCENT);
-                        draw_str(buf, w, h, g, &format!(" {:<10}", status), btn_x, ly + asc, BG, btn_x + 12 * cw);
+                        fc(buf, btn_x, ly, 12 * cw, lh, th().accent);
+                        draw_str(buf, w, h, g, &format!(" {:<10}", status), btn_x, ly + asc, th().bg, btn_x + 12 * cw);
                     } else {
-                        draw_str(buf, w, h, g, &format!(" {:<11}", status), btn_x, ly + asc, FG_DIM, btn_x + 13 * cw);
+                        draw_str(buf, w, h, g, &format!(" {:<11}", status), btn_x, ly + asc, th().fg_dim, btn_x + 13 * cw);
                     }
                     if *show_install {
-                        fc(buf, btn_x + 14 * cw, ly, inst_btn_w, lh, SEL_BG);
-                        draw_str(buf, w, h, g, "[Install]", btn_x + 14 * cw, ly + asc, FG, btn_x + 14 * cw + inst_btn_w);
+                        fc(buf, btn_x + 14 * cw, ly, inst_btn_w, lh, th().sel_bg);
+                        draw_str(buf, w, h, g, "[Install]", btn_x + 14 * cw, ly + asc, th().fg, btn_x + 14 * cw + inst_btn_w);
                     }
                 }
 
                 // ── Save Actions section ───────────────────────────────────────
                 let save_sec_y = lsp_sec_y + lh + 4 + 3 * (lh + 4) + 4;
                 if row_vis(save_sec_y) {
-                    draw_str(buf, w, h, g, "  Save Actions", r.x, save_sec_y + asc, FG, btn_x - cw);
+                    draw_str(buf, w, h, g, "  Save Actions", r.x, save_sec_y + asc, th().fg, btn_x - cw);
                 }
-                fc(buf, r.x + cw, save_sec_y + lh - 1, r.w - 2 * cw, 1, BORDER);
+                fc(buf, r.x + cw, save_sec_y + lh - 1, r.w - 2 * cw, 1, th().border);
 
                 let field_w = (r.w - 16 * cw - 4).max(cw);
                 let save_btn_x = r.x + 16 * cw;
@@ -14208,46 +14206,46 @@ fn render(s: &mut State) {
                 for (i, (label, fid, value)) in sa_fields.iter().enumerate() {
                     let fy = save_sec_y + lh + 4 + i as i32 * (lh + 4);
                     if !row_vis(fy) { continue; }
-                    draw_str(buf, w, h, g, label, r.x, fy + asc, FG, save_btn_x - cw);
+                    draw_str(buf, w, h, g, label, r.x, fy + asc, th().fg, save_btn_x - cw);
                     let is_focused = settings_edit_field == Some(*fid);
                     let display = if is_focused { settings_edit_text.as_str() } else { *value };
-                    let field_bg = if is_focused { SEL_BG } else { BG2 };
+                    let field_bg = if is_focused { th().sel_bg } else { th().bg2 };
                     fc(buf, save_btn_x, fy, field_w, lh, field_bg);
-                    draw_str(buf, w, h, g, display, save_btn_x + cw, fy + asc, FG, save_btn_x + field_w - cw);
+                    draw_str(buf, w, h, g, display, save_btn_x + cw, fy + asc, th().fg, save_btn_x + field_w - cw);
                     if is_focused {
                         let cur_x = save_btn_x + cw + settings_edit_cursor as i32 * cw;
-                        fc(buf, cur_x, fy + 1, 1, lh - 2, FG);
+                        fc(buf, cur_x, fy + 1, 1, lh - 2, th().fg);
                     }
                 }
 
                 // ── Collaboration section ─────────────────────────────────────
                 let collab_sec_y = save_sec_y + lh + 4 + 3 * (lh + 4) + 8;
                 if row_vis(collab_sec_y) {
-                    draw_str(buf, w, h, g, "  Collaboration", r.x, collab_sec_y + asc, FG, r.x + r.w);
+                    draw_str(buf, w, h, g, "  Collaboration", r.x, collab_sec_y + asc, th().fg, r.x + r.w);
                 }
-                fc(buf, r.x + cw, collab_sec_y + lh - 1, r.w - 2 * cw, 1, BORDER);
+                fc(buf, r.x + cw, collab_sec_y + lh - 1, r.w - 2 * cw, 1, th().border);
 
                 // Port
                 let cp_y = collab_sec_y + lh + 4;
                 if row_vis(cp_y) {
-                    draw_str(buf, w, h, g, "  Collab port", r.x, cp_y + asc, FG, save_btn_x - cw);
+                    draw_str(buf, w, h, g, "  Collab port", r.x, cp_y + asc, th().fg, save_btn_x - cw);
                     let is_focused = settings_edit_field == Some(SettingsFieldId::CollabPort);
                     let port_str_owned = collab_port.to_string();
                     let display = if is_focused { settings_edit_text.as_str() } else { &port_str_owned };
                     let port_w = 6 * cw;
-                    let field_bg = if is_focused { SEL_BG } else { BG2 };
+                    let field_bg = if is_focused { th().sel_bg } else { th().bg2 };
                     fc(buf, save_btn_x, cp_y, port_w, lh, field_bg);
-                    draw_str(buf, w, h, g, display, save_btn_x + cw, cp_y + asc, FG, save_btn_x + port_w - cw);
+                    draw_str(buf, w, h, g, display, save_btn_x + cw, cp_y + asc, th().fg, save_btn_x + port_w - cw);
                     if is_focused {
                         let cur_x = save_btn_x + cw + settings_edit_cursor as i32 * cw;
-                        fc(buf, cur_x, cp_y + 1, 1, lh - 2, FG);
+                        fc(buf, cur_x, cp_y + 1, 1, lh - 2, th().fg);
                     }
                 }
 
                 // Default role
                 let dr_y = cp_y + lh + 4;
                 if row_vis(dr_y) {
-                    draw_str(buf, w, h, g, "  Default role", r.x, dr_y + asc, FG, save_btn_x - cw);
+                    draw_str(buf, w, h, g, "  Default role", r.x, dr_y + asc, th().fg, save_btn_x - cw);
                     let role_labels = [
                         (collab::PeerRole::Viewer,       " Viewer "),
                         (collab::PeerRole::Contributor,  " Contributor "),
@@ -14258,7 +14256,7 @@ fn render(s: &mut State) {
                     for (role, label) in role_labels {
                         let rw2 = label.chars().count() as i32 * cw;
                         let active = collab_role_perms.default_role == role;
-                        let (rbg, rfg) = if active { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
+                        let (rbg, rfg) = if active { (th().accent, th().bg) } else { (th().sel_bg, th().fg_dim) };
                         fc(buf, rx2, dr_y, rw2, lh, rbg);
                         draw_str(buf, w, h, g, label, rx2, dr_y + asc, rfg, rx2 + rw2);
                         rx2 += rw2 + cw;
@@ -14268,30 +14266,30 @@ fn render(s: &mut State) {
                 // Include globs
                 let cig_y = dr_y + lh + 4;
                 if row_vis(cig_y) {
-                    draw_str(buf, w, h, g, "  Include globs", r.x, cig_y + asc, FG, save_btn_x - cw);
+                    draw_str(buf, w, h, g, "  Include globs", r.x, cig_y + asc, th().fg, save_btn_x - cw);
                     let is_focused = settings_edit_field == Some(SettingsFieldId::CollabIncludeGlobs);
                     let display = if is_focused { settings_edit_text.as_str() } else { &collab_include_globs };
-                    let field_bg = if is_focused { SEL_BG } else { BG2 };
+                    let field_bg = if is_focused { th().sel_bg } else { th().bg2 };
                     fc(buf, save_btn_x, cig_y, field_w, lh, field_bg);
-                    draw_str(buf, w, h, g, display, save_btn_x + cw, cig_y + asc, FG, save_btn_x + field_w - cw);
+                    draw_str(buf, w, h, g, display, save_btn_x + cw, cig_y + asc, th().fg, save_btn_x + field_w - cw);
                     if is_focused {
                         let cur_x = save_btn_x + cw + settings_edit_cursor as i32 * cw;
-                        fc(buf, cur_x, cig_y + 1, 1, lh - 2, FG);
+                        fc(buf, cur_x, cig_y + 1, 1, lh - 2, th().fg);
                     }
                 }
 
                 // Exclude globs
                 let ceg_y = cig_y + lh + 4;
                 if row_vis(ceg_y) {
-                    draw_str(buf, w, h, g, "  Exclude globs", r.x, ceg_y + asc, FG, save_btn_x - cw);
+                    draw_str(buf, w, h, g, "  Exclude globs", r.x, ceg_y + asc, th().fg, save_btn_x - cw);
                     let is_focused = settings_edit_field == Some(SettingsFieldId::CollabExcludeGlobs);
                     let display = if is_focused { settings_edit_text.as_str() } else { &collab_exclude_globs };
-                    let field_bg = if is_focused { SEL_BG } else { BG2 };
+                    let field_bg = if is_focused { th().sel_bg } else { th().bg2 };
                     fc(buf, save_btn_x, ceg_y, field_w, lh, field_bg);
-                    draw_str(buf, w, h, g, display, save_btn_x + cw, ceg_y + asc, FG, save_btn_x + field_w - cw);
+                    draw_str(buf, w, h, g, display, save_btn_x + cw, ceg_y + asc, th().fg, save_btn_x + field_w - cw);
                     if is_focused {
                         let cur_x = save_btn_x + cw + settings_edit_cursor as i32 * cw;
-                        fc(buf, cur_x, ceg_y + 1, 1, lh - 2, FG);
+                        fc(buf, cur_x, ceg_y + 1, 1, lh - 2, th().fg);
                     }
                 }
 
@@ -14300,10 +14298,10 @@ fn render(s: &mut State) {
                 let perm_col_labels = ["vw", "wt", "hv", "hw", "tv", "to", "ro"];
                 let perm_col_w = 4 * cw;
                 if row_vis(perm_hdr_y) {
-                    draw_str(buf, w, h, g, "  Permissions", r.x, perm_hdr_y + asc, FG_DIM, save_btn_x - cw);
+                    draw_str(buf, w, h, g, "  Permissions", r.x, perm_hdr_y + asc, th().fg_dim, save_btn_x - cw);
                     for (i, label) in perm_col_labels.iter().enumerate() {
                         let px2 = save_btn_x + i as i32 * perm_col_w;
-                        draw_str(buf, w, h, g, label, px2, perm_hdr_y + asc, FG_DIM, px2 + perm_col_w);
+                        draw_str(buf, w, h, g, label, px2, perm_hdr_y + asc, th().fg_dim, px2 + perm_col_w);
                     }
                 }
                 let perm_bits = [
@@ -14325,30 +14323,30 @@ fn render(s: &mut State) {
                 for (ri, (_role, label, bits)) in perm_rows.iter().enumerate() {
                     let pm_y = perm_hdr_y + lh + 4 + ri as i32 * (lh + 2);
                     if !row_vis(pm_y) { continue; }
-                    draw_str(buf, w, h, g, label, r.x, pm_y + asc, FG, save_btn_x - cw);
+                    draw_str(buf, w, h, g, label, r.x, pm_y + asc, th().fg, save_btn_x - cw);
                     for (ci, &bit) in perm_bits.iter().enumerate() {
                         let px2 = save_btn_x + ci as i32 * perm_col_w;
                         let has = bits & bit != 0;
-                        let (pbg, pfg) = if has { (ACCENT, BG) } else { (SEL_BG, FG_DIM) };
+                        let (pbg, pfg) = if has { (th().accent, th().bg) } else { (th().sel_bg, th().fg_dim) };
                         fc(buf, px2, pm_y, 3 * cw, lh, pbg);
                         draw_str(buf, w, h, g, if has { "[x]" } else { "[ ]" }, px2, pm_y + asc, pfg, px2 + 3 * cw);
                     }
                 }
 
                 // Re-paint tab bar on top to overwrite any content that bled upward when scrolled
-                fill(buf, w, h, r.x, r.y, r.w, tab_h, BG2);
-                fill(buf, w, h, r.x, r.y + tab_h - 1, r.w, 1, BORDER);
-                if snap.is_active { fill(buf, w, h, r.x, r.y, 2, tab_h - 1, ACCENT); }
+                fill(buf, w, h, r.x, r.y, r.w, tab_h, th().bg2);
+                fill(buf, w, h, r.x, r.y + tab_h - 1, r.w, 1, th().border);
+                if snap.is_active { fill(buf, w, h, r.x, r.y, 2, tab_h - 1, th().accent); }
                 let mut tx2 = r.x;
                 for (i, (name, dirty_tab)) in snap.tab_info.iter().enumerate() {
                     let label  = if *dirty_tab { format!(" {}• ", name) } else { format!(" {}  ", name) };
                     let tw     = label.chars().count() as i32 * cw;
                     let is_act = i == snap.active_tab;
-                    fill(buf, w, h, tx2, r.y, tw, tab_h - 1, if is_act { BG } else { BG2 });
-                    if is_act { fill(buf, w, h, tx2, r.y + tab_h - 2, tw, 2, ACCENT); }
-                    draw_str(buf, w, h, g, &label, tx2, r.y + tab_h * 3 / 4, FG, (tx2 + tw - cw).min(clip_r));
-                    draw_str(buf, w, h, g, "×", tx2 + tw - cw, r.y + tab_h * 3 / 4, if is_act { FG } else { FG_DIM }, (tx2 + tw).min(clip_r));
-                    fill(buf, w, h, tx2 + tw, r.y, 1, tab_h, BORDER);
+                    fill(buf, w, h, tx2, r.y, tw, tab_h - 1, if is_act { th().bg } else { th().bg2 });
+                    if is_act { fill(buf, w, h, tx2, r.y + tab_h - 2, tw, 2, th().accent); }
+                    draw_str(buf, w, h, g, &label, tx2, r.y + tab_h * 3 / 4, th().fg, (tx2 + tw - cw).min(clip_r));
+                    draw_str(buf, w, h, g, "×", tx2 + tw - cw, r.y + tab_h * 3 / 4, if is_act { th().fg } else { th().fg_dim }, (tx2 + tw).min(clip_r));
+                    fill(buf, w, h, tx2 + tw, r.y, 1, tab_h, th().border);
                     tx2 += tw + 1;
                 }
 
@@ -14359,7 +14357,7 @@ fn render(s: &mut State) {
             if snap.is_git_diff_tab {
                 let content_y = r.y + tab_h;
                 let content_h = r.y + r.h - content_y;
-                fill(buf, w, h, r.x, content_y, r.w, content_h, BG);
+                fill(buf, w, h, r.x, content_y, r.w, content_h, th().bg);
 
                 if let Some((ref lines, gd_scroll, gd_loading)) = snap.git_diff_snap {
                     const DIGITS: i32 = 4;
@@ -14370,13 +14368,13 @@ fn render(s: &mut State) {
                     // Vertical separator lines in gutter
                     let sep1_x = r.x + (DIGITS + 1) * cw;
                     let sep2_x = r.x + (DIGITS * 2 + 2) * cw;
-                    fill(buf, w, h, sep1_x, content_y, 1, content_h, BORDER);
-                    fill(buf, w, h, sep2_x, content_y, 1, content_h, BORDER);
+                    fill(buf, w, h, sep1_x, content_y, 1, content_h, th().border);
+                    fill(buf, w, h, sep2_x, content_y, 1, content_h, th().border);
 
                     if gd_loading {
-                        draw_str(buf, w, h, g, "  Loading...", ed_gx, content_y + asc, FG_DIM, clip_r_gd);
+                        draw_str(buf, w, h, g, "  Loading...", ed_gx, content_y + asc, th().fg_dim, clip_r_gd);
                     } else if lines.is_empty() {
-                        draw_str(buf, w, h, g, "  (no changes)", ed_gx, content_y + asc, FG_DIM, clip_r_gd);
+                        draw_str(buf, w, h, g, "  (no changes)", ed_gx, content_y + asc, th().fg_dim, clip_r_gd);
                     } else {
                         let (mut old_line, mut new_line) = compute_line_nums_at(lines, gd_scroll);
                         let mut ry = content_y;
@@ -14384,30 +14382,30 @@ fn render(s: &mut State) {
                             if ry + lh > r.y + r.h { break; }
                             match line {
                                 DiffLine::Hunk(s) => {
-                                    fill(buf, w, h, r.x, ry, r.w, lh, BG);
-                                    draw_str(buf, w, h, g, s, ed_gx, ry + asc, DIFF_HUNK, clip_r_gd);
+                                    fill(buf, w, h, r.x, ry, r.w, lh, th().bg);
+                                    draw_str(buf, w, h, g, s, ed_gx, ry + asc, th().diff_hunk, clip_r_gd);
                                     if let Some((o, n)) = parse_hunk_header(s) { old_line = o; new_line = n; }
                                 }
                                 DiffLine::Added(s) => {
-                                    fill(buf, w, h, r.x, ry, r.w, lh, DIFF_ADD_BG);
+                                    fill(buf, w, h, r.x, ry, r.w, lh, th().diff_add_bg);
                                     let ln_str = format!("{:>w$}", new_line, w = DIGITS as usize);
-                                    draw_str(buf, w, h, g, &ln_str, r.x + (DIGITS + 2) * cw, ry + asc, DIFF_ADD_FG, sep2_x);
-                                    draw_str(buf, w, h, g, s, ed_gx, ry + asc, DIFF_ADD_FG, clip_r_gd);
+                                    draw_str(buf, w, h, g, &ln_str, r.x + (DIGITS + 2) * cw, ry + asc, th().diff_add_fg, sep2_x);
+                                    draw_str(buf, w, h, g, s, ed_gx, ry + asc, th().diff_add_fg, clip_r_gd);
                                     new_line += 1;
                                 }
                                 DiffLine::Removed(s) => {
-                                    fill(buf, w, h, r.x, ry, r.w, lh, DIFF_DEL_BG);
+                                    fill(buf, w, h, r.x, ry, r.w, lh, th().diff_del_bg);
                                     let ln_str = format!("{:>w$}", old_line, w = DIGITS as usize);
-                                    draw_str(buf, w, h, g, &ln_str, r.x + cw, ry + asc, DIFF_DEL_FG, sep1_x);
-                                    draw_str(buf, w, h, g, s, ed_gx, ry + asc, DIFF_DEL_FG, clip_r_gd);
+                                    draw_str(buf, w, h, g, &ln_str, r.x + cw, ry + asc, th().diff_del_fg, sep1_x);
+                                    draw_str(buf, w, h, g, s, ed_gx, ry + asc, th().diff_del_fg, clip_r_gd);
                                     old_line += 1;
                                 }
                                 DiffLine::Context(s) => {
                                     let old_str = format!("{:>w$}", old_line, w = DIGITS as usize);
                                     let new_str = format!("{:>w$}", new_line, w = DIGITS as usize);
-                                    draw_str(buf, w, h, g, &old_str, r.x + cw, ry + asc, FG_DIM, sep1_x);
-                                    draw_str(buf, w, h, g, &new_str, r.x + (DIGITS + 2) * cw, ry + asc, FG_DIM, sep2_x);
-                                    draw_str(buf, w, h, g, s, ed_gx, ry + asc, FG_DIM, clip_r_gd);
+                                    draw_str(buf, w, h, g, &old_str, r.x + cw, ry + asc, th().fg_dim, sep1_x);
+                                    draw_str(buf, w, h, g, &new_str, r.x + (DIGITS + 2) * cw, ry + asc, th().fg_dim, sep2_x);
+                                    draw_str(buf, w, h, g, s, ed_gx, ry + asc, th().fg_dim, clip_r_gd);
                                     old_line += 1;
                                     new_line += 1;
                                 }
@@ -14432,16 +14430,16 @@ fn render(s: &mut State) {
                     let ln_x    = r.x + (snap.ln_digits as i32 - ln_str.len() as i32) * cw;
                     let is_cur  = snap.cursors_snap.iter().any(|&(l, _, _)| l == li);
                     let ln_color = if is_cur {
-                        FG
+                        th().fg
                     } else {
                         // Check if any diagnostic is on this line; use worst severity color
                         let has_error = snap.diagnostics.iter().any(|&(dl, _, _, ref s, _)| dl == li && *s == DiagSeverity::Error);
                         let has_warn  = snap.diagnostics.iter().any(|&(dl, _, _, ref s, _)| dl == li && *s == DiagSeverity::Warning);
-                        if has_error { 0xFF5555u32 } else if has_warn { 0xE0AF68 } else { FG_DIM }
+                        if has_error { th().error } else if has_warn { th().warning } else { th().fg_dim }
                     };
                     draw_str(buf, w, h, g, &ln_str, ln_x, baseline, ln_color, ed_x);
                 } else {
-                    draw_str(buf, w, h, g, "↪", ed_x - cw - 2, baseline, FG_DIM, ed_x);
+                    draw_str(buf, w, h, g, "↪", ed_x - cw - 2, baseline, th().fg_dim, ed_x);
                 }
 
                 // Find match highlights
@@ -14450,7 +14448,7 @@ fn render(s: &mut State) {
                     let is_act = snap.cursors_snap.iter().any(|(_, _, sel)| {
                         sel.map_or(false, |(lo, hi)| lo == mlo && hi == mhi)
                     });
-                    let color = if is_act { HL_MATCH_ACTIVE } else { HL_MATCH };
+                    let color = if is_act { th().hl_match_active } else { th().hl_match };
                     let sx = xc(a).max(ed_x);
                     let ex = xc(b).min(clip_r);
                     if ex > sx { fill(buf, w, h, sx, py, ex - sx, lh, color); }
@@ -14462,7 +14460,7 @@ fn render(s: &mut State) {
                     let Some((a, b)) = row.span_cells(sel_lo, sel_hi, true) else { continue };
                     let sx = xc(a).max(ed_x);
                     let ex = xc(b).min(clip_r);
-                    if ex > sx { fill(buf, w, h, sx, py, ex - sx, lh, SEL_BG); }
+                    if ex > sx { fill(buf, w, h, sx, py, ex - sx, lh, th().sel_bg); }
                 }
 
                 // Text (tabs advance to the next stop and draw nothing)
@@ -14470,7 +14468,7 @@ fn render(s: &mut State) {
                     let x = xc(row.vx[ci] as i32);
                     if x >= clip_r { break; }
                     if ch == '\t' || x + cw <= ed_x { continue; }
-                    let color = row.colors.get(ci).copied().unwrap_or(FG);
+                    let color = row.colors.get(ci).copied().unwrap_or(th().fg);
                     if let Some((m, bmap)) = g.get(ch) {
                         blit(buf, w, h, bmap, m, x, baseline, color);
                     }
@@ -14480,7 +14478,7 @@ fn render(s: &mut State) {
                 for &(c_line, c_col, _) in &snap.cursors_snap {
                     if c_line == li && cursor_visible && row.owns_col(c_col) {
                         let cx = xc(row.cell(c_col));
-                        if cx >= ed_x && cx < clip_r { fill(buf, w, h, cx, py, 2, lh, ACCENT); }
+                        if cx >= ed_x && cx < clip_r { fill(buf, w, h, cx, py, 2, lh, th().accent); }
                     }
                 }
 
@@ -14496,9 +14494,9 @@ fn render(s: &mut State) {
                 for &(dline, cs, ce, ref sev, _) in &snap.diagnostics {
                     if dline != li { continue; }
                     let color = match sev {
-                        DiagSeverity::Error   => 0xFF5555u32,
-                        DiagSeverity::Warning => 0xE0AF68,
-                        _                     => FG_DIM,
+                        DiagSeverity::Error   => th().error,
+                        DiagSeverity::Warning => th().warning,
+                        _                     => th().fg_dim,
                     };
                     let lo = row.line_start + cs;
                     let hi = row.line_start + ce.max(cs + 1);
@@ -14522,8 +14520,8 @@ fn render(s: &mut State) {
                 let track_h = snap.editor_h;
                 let thumb_h = ((track_h * vis as i32) / total as i32).max(SB_W);
                 let thumb_y = r.y + tab_h + ((scroll as i32 * (track_h - thumb_h)) / (total - vis) as i32);
-                fill(buf, w, h, r.x + r.w - SB_W, r.y + tab_h, SB_W, track_h, BG2);
-                fill(buf, w, h, r.x + r.w - SB_W, thumb_y, SB_W, thumb_h, SB_THUMB);
+                fill(buf, w, h, r.x + r.w - SB_W, r.y + tab_h, SB_W, track_h, th().bg2);
+                fill(buf, w, h, r.x + r.w - SB_W, thumb_y, SB_W, thumb_h, th().sb_thumb);
             }
 
             let text_area_w = editor_w - gutter_w;
@@ -14533,21 +14531,21 @@ fn render(s: &mut State) {
                 let thumb_w = ((track_w * vis_cols as i32) / snap.max_line_len as i32).max(SB_W);
                 let thumb_x = ed_x + ((hscroll as i32 * (track_w - thumb_w)) / (snap.max_line_len - vis_cols) as i32);
                 let sb_y    = r.y + r.h - fh - SB_W;
-                fill(buf, w, h, r.x, sb_y, track_w, SB_W, BG2);
-                fill(buf, w, h, thumb_x, sb_y, thumb_w, SB_W, SB_THUMB);
+                fill(buf, w, h, r.x, sb_y, track_w, SB_W, th().bg2);
+                fill(buf, w, h, thumb_x, sb_y, thumb_w, SB_W, th().sb_thumb);
             }
 
             // Find bar
             if snap.find_open {
                 let row_h  = lh + 4;
                 let find_y = r.y + r.h - fh;
-                fill(buf, w, h, r.x, find_y, r.w, fh, BG2);
-                fill(buf, w, h, r.x, find_y, r.w, 1, BORDER);
+                fill(buf, w, h, r.x, find_y, r.w, fh, th().bg2);
+                fill(buf, w, h, r.x, find_y, r.w, 1, th().border);
 
                 let row1_base = find_y + row_h * 3 / 4;
                 let label     = "Find: ";
                 let lw        = label.len() as i32 * cw;
-                draw_str(buf, w, h, g, label, r.x + 4, row1_base, FG_DIM, clip_r);
+                draw_str(buf, w, h, g, label, r.x + 4, row1_base, th().fg_dim, clip_r);
 
                 // Toggles, right-aligned: [.*] regex, [Aa] case, [w] whole word.
                 // Widths must match the click handler (FIND_TOGGLES).
@@ -14559,15 +14557,15 @@ fn render(s: &mut State) {
                 let aa_x     = rx_x + (rx_str.len() + 1) as i32 * cw;
                 let ww_x     = aa_x + (aa_str.len() + 1) as i32 * cw;
                 draw_str(buf, w, h, g, rx_str, rx_x, row1_base,
-                         if snap.find_regex { ACCENT } else { FG_DIM }, clip_r);
+                         if snap.find_regex { th().accent } else { th().fg_dim }, clip_r);
                 draw_str(buf, w, h, g, aa_str, aa_x, row1_base,
-                         if snap.case_sensitive { ACCENT } else { FG_DIM }, clip_r);
+                         if snap.case_sensitive { th().accent } else { th().fg_dim }, clip_r);
                 draw_str(buf, w, h, g, ww_str, ww_x, row1_base,
-                         if snap.whole_word     { ACCENT } else { FG_DIM }, clip_r);
+                         if snap.whole_word     { th().accent } else { th().fg_dim }, clip_r);
 
                 let (mc_str, mc_col) = match &snap.find_error {
-                    Some(_) => ("invalid regex".to_owned(), 0xFF5555u32),
-                    None => (format!("{} matches", snap.match_ranges.len()), FG_DIM),
+                    Some(_) => ("invalid regex".to_owned(), th().error),
+                    None => (format!("{} matches", snap.match_ranges.len()), th().fg_dim),
                 };
                 let mc_w   = mc_str.chars().count() as i32 * cw;
                 let mc_x   = rx_x - mc_w - cw;
@@ -14583,32 +14581,32 @@ fn render(s: &mut State) {
                     if mn < mx {
                         let x0 = (qx + (mn.saturating_sub(q_hscroll)) as i32 * cw).min(qclip);
                         let x1 = (qx + ((mx - q_hscroll).min(q_vis + 1)) as i32 * cw).min(qclip);
-                        fill(buf, w, h, x0, find_y + 2, (x1 - x0).max(0), lh, HL_MATCH);
+                        fill(buf, w, h, x0, find_y + 2, (x1 - x0).max(0), lh, th().hl_match);
                     }
                 }
                 let q_disp: String = snap.find_query.chars().skip(q_hscroll).take(q_vis + 1).collect();
-                draw_str(buf, w, h, g, &q_disp, qx, row1_base, FG, qclip);
+                draw_str(buf, w, h, g, &q_disp, qx, row1_base, th().fg, qclip);
                 if snap.find_input_focused && snap.find_focus == FindFocus::Query {
                     let cx = qx + (snap.find_cursor_q - q_hscroll) as i32 * cw;
-                    if cx < qclip { fill(buf, w, h, cx, find_y + 2, 2, lh, ACCENT); }
+                    if cx < qclip { fill(buf, w, h, cx, find_y + 2, 2, lh, th().accent); }
                 }
 
                 if snap.find_repl_open {
                     let row2_y    = find_y + row_h;
                     let row2_base = row2_y + row_h * 3 / 4;
-                    fill(buf, w, h, r.x, row2_y, r.w, 1, BORDER);
+                    fill(buf, w, h, r.x, row2_y, r.w, 1, th().border);
 
                     let rlabel = "Replace: ";
                     let rlw    = rlabel.len() as i32 * cw;
-                    draw_str(buf, w, h, g, rlabel, r.x + 4, row2_base, FG_DIM, clip_r);
+                    draw_str(buf, w, h, g, rlabel, r.x + 4, row2_base, th().fg_dim, clip_r);
 
                     let repl_str = "[Repl]";
                     let all_str  = "[All]";
                     let btn_w    = (repl_str.len() + 1 + all_str.len()) as i32 * cw + 8;
                     let btn_x    = clip_r - btn_w;
                     let all_x    = btn_x + (repl_str.len() + 1) as i32 * cw;
-                    draw_str(buf, w, h, g, repl_str, btn_x, row2_base, FG_DIM, clip_r);
-                    draw_str(buf, w, h, g, all_str,  all_x, row2_base, FG_DIM, clip_r);
+                    draw_str(buf, w, h, g, repl_str, btn_x, row2_base, th().fg_dim, clip_r);
+                    draw_str(buf, w, h, g, all_str,  all_x, row2_base, th().fg_dim, clip_r);
 
                     let rx    = r.x + 4 + rlw;
                     let rclip = btn_x - cw;
@@ -14620,14 +14618,14 @@ fn render(s: &mut State) {
                         if mn < mx {
                             let x0 = (rx + (mn.saturating_sub(r_hscroll)) as i32 * cw).min(rclip);
                             let x1 = (rx + ((mx - r_hscroll).min(r_vis + 1)) as i32 * cw).min(rclip);
-                            fill(buf, w, h, x0, row2_y + 2, (x1 - x0).max(0), lh, HL_MATCH);
+                            fill(buf, w, h, x0, row2_y + 2, (x1 - x0).max(0), lh, th().hl_match);
                         }
                     }
                     let r_disp: String = snap.find_repl.chars().skip(r_hscroll).take(r_vis + 1).collect();
-                    draw_str(buf, w, h, g, &r_disp, rx, row2_base, FG, rclip);
+                    draw_str(buf, w, h, g, &r_disp, rx, row2_base, th().fg, rclip);
                     if snap.find_input_focused && snap.find_focus == FindFocus::Replace {
                         let cx = rx + (snap.find_cursor_r - r_hscroll) as i32 * cw;
-                        if cx < rclip { fill(buf, w, h, cx, row2_y + 2, 2, lh, ACCENT); }
+                        if cx < rclip { fill(buf, w, h, cx, row2_y + 2, 2, lh, th().accent); }
                     }
                 }
             }
@@ -14637,21 +14635,21 @@ fn render(s: &mut State) {
         for snap in &term_snaps {
             let r = snap.rect;
             // Tab bar
-            fill(buf, w, h, r.x, r.y, r.w, tab_h, BG2);
-            fill(buf, w, h, r.x, r.y + tab_h - 1, r.w, 1, BORDER);
-            if snap.is_active { fill(buf, w, h, r.x, r.y, 2, tab_h - 1, ACCENT); }
+            fill(buf, w, h, r.x, r.y, r.w, tab_h, th().bg2);
+            fill(buf, w, h, r.x, r.y + tab_h - 1, r.w, 1, th().border);
+            if snap.is_active { fill(buf, w, h, r.x, r.y, 2, tab_h - 1, th().accent); }
             let mut tx = r.x;
             for (i, title) in snap.tabs.iter().enumerate() {
                 let label  = format!(" {}  ", title);
                 let tw     = label.chars().count() as i32 * cw;
                 let is_act = i == snap.active_tab;
-                fill(buf, w, h, tx, r.y, tw, tab_h - 1, if is_act { BG } else { BG2 });
-                if is_act { fill(buf, w, h, tx, r.y + tab_h - 2, tw, 2, ACCENT); }
-                draw_str(buf, w, h, g, &label, tx, r.y + tab_h * 3 / 4, FG,
+                fill(buf, w, h, tx, r.y, tw, tab_h - 1, if is_act { th().bg } else { th().bg2 });
+                if is_act { fill(buf, w, h, tx, r.y + tab_h - 2, tw, 2, th().accent); }
+                draw_str(buf, w, h, g, &label, tx, r.y + tab_h * 3 / 4, th().fg,
                     (tx + tw - cw).min(r.x + r.w));
                 draw_str(buf, w, h, g, "×", tx + tw - cw, r.y + tab_h * 3 / 4,
-                    if is_act { FG } else { FG_DIM }, (tx + tw).min(r.x + r.w));
-                fill(buf, w, h, tx + tw, r.y, 1, tab_h, BORDER);
+                    if is_act { th().fg } else { th().fg_dim }, (tx + tw).min(r.x + r.w));
+                fill(buf, w, h, tx + tw, r.y, 1, tab_h, th().border);
                 tx += tw + 1;
             }
             // Grid rows
@@ -14663,11 +14661,11 @@ fn render(s: &mut State) {
                     let cx = r.x + ci as i32 * cw;
                     if cx >= r.x + r.w { break; }
                     let in_sel = snap.sel.as_ref().map_or(false, |s| s.contains(vi, ci));
-                    let bg = if in_sel { SEL_BG } else { cell.bg };
-                    if bg != BG { fill(buf, w, h, cx, py, cw, lh, bg); }
+                    let bg = if in_sel { th().sel_bg } else { theme::term_color(cell.bg) };
+                    if bg != th().bg { fill(buf, w, h, cx, py, cw, lh, bg); }
                     if cell.ch != ' ' {
                         if let Some((m, bmap)) = g.get(cell.ch) {
-                            blit(buf, w, h, bmap, m, cx, baseline, cell.fg);
+                            blit(buf, w, h, bmap, m, cx, baseline, theme::term_color(cell.fg));
                         }
                     }
                 }
@@ -14677,7 +14675,7 @@ fn render(s: &mut State) {
                 let cx = r.x + snap.cursor_col as i32 * cw;
                 let cy = r.y + tab_h + snap.cursor_row as i32 * lh;
                 if cy + lh <= r.y + r.h {  // clip cursor to pane bottom
-                    fill(buf, w, h, cx, cy, 2, lh, ACCENT);
+                    fill(buf, w, h, cx, cy, 2, lh, th().accent);
                 }
             }
         }
@@ -14685,16 +14683,16 @@ fn render(s: &mut State) {
         // ── Markdown preview panes ────────────────────────────────────────
         for snap in &md_snaps {
             let r = snap.rect;
-            fill(buf, w, h, r.x, r.y, r.w, tab_h, BG2);
-            fill(buf, w, h, r.x, r.y + tab_h - 1, r.w, 1, BORDER);
-            if snap.is_active { fill(buf, w, h, r.x, r.y, 2, tab_h - 1, ACCENT); }
-            draw_str(buf, w, h, g, &format!(" {}", snap.title), r.x + 4, r.y + tab_h * 3 / 4, FG_DIM, r.x + r.w);
+            fill(buf, w, h, r.x, r.y, r.w, tab_h, th().bg2);
+            fill(buf, w, h, r.x, r.y + tab_h - 1, r.w, 1, th().border);
+            if snap.is_active { fill(buf, w, h, r.x, r.y, 2, tab_h - 1, th().accent); }
+            draw_str(buf, w, h, g, &format!(" {}", snap.title), r.x + 4, r.y + tab_h * 3 / 4, th().fg_dim, r.x + r.w);
             for (vi, (text, colors)) in snap.lines.iter().enumerate() {
                 let baseline = r.y + tab_h + vi as i32 * lh + asc;
                 let mut x = r.x + 4;
                 for (ci, ch) in text.chars().enumerate() {
                     if x >= r.x + r.w { break; }
-                    let color = colors.get(ci).copied().unwrap_or(FG);
+                    let color = colors.get(ci).copied().unwrap_or(th().fg);
                     if let Some((m, bmap)) = g.get(ch) { blit(buf, w, h, bmap, m, x, baseline, color); }
                     x += cw;
                 }
@@ -14707,26 +14705,26 @@ fn render(s: &mut State) {
                 let thumb_y = r.y + tab_h + if scroll_max > 0 {
                     (snap.scroll as i32 * (content_h - thumb_h)) / scroll_max as i32
                 } else { 0 };
-                fill(buf, w, h, r.x + r.w - SB_W, r.y + tab_h, SB_W, content_h, BG2);
-                fill(buf, w, h, r.x + r.w - SB_W, thumb_y, SB_W, thumb_h, SB_THUMB);
+                fill(buf, w, h, r.x + r.w - SB_W, r.y + tab_h, SB_W, content_h, th().bg2);
+                fill(buf, w, h, r.x + r.w - SB_W, thumb_y, SB_W, thumb_h, th().sb_thumb);
             }
         }
 
         // ── Pane border dividers ──────────────────────────────────────────
         for snap in &pane_snaps {
             // 1px right border (between H-split panes)
-            fill(buf, w, h, snap.rect.x + snap.rect.w, snap.rect.y, 1, snap.rect.h, BORDER);
+            fill(buf, w, h, snap.rect.x + snap.rect.w, snap.rect.y, 1, snap.rect.h, th().border);
             // 1px bottom border (between V-split panes)
-            fill(buf, w, h, snap.rect.x, snap.rect.y + snap.rect.h, snap.rect.w, 1, BORDER);
+            fill(buf, w, h, snap.rect.x, snap.rect.y + snap.rect.h, snap.rect.w, 1, th().border);
         }
         // Also draw borders for terminal and output panes
         for snap in &term_snaps {
-            fill(buf, w, h, snap.rect.x + snap.rect.w, snap.rect.y, 1, snap.rect.h, BORDER);
-            fill(buf, w, h, snap.rect.x, snap.rect.y + snap.rect.h, snap.rect.w, 1, BORDER);
+            fill(buf, w, h, snap.rect.x + snap.rect.w, snap.rect.y, 1, snap.rect.h, th().border);
+            fill(buf, w, h, snap.rect.x, snap.rect.y + snap.rect.h, snap.rect.w, 1, th().border);
         }
         for snap in &md_snaps {
-            fill(buf, w, h, snap.rect.x + snap.rect.w, snap.rect.y, 1, snap.rect.h, BORDER);
-            fill(buf, w, h, snap.rect.x, snap.rect.y + snap.rect.h, snap.rect.w, 1, BORDER);
+            fill(buf, w, h, snap.rect.x + snap.rect.w, snap.rect.y, 1, snap.rect.h, th().border);
+            fill(buf, w, h, snap.rect.x, snap.rect.y + snap.rect.h, snap.rect.w, 1, th().border);
         }
 
         // ── Drag drop zone overlay ────────────────────────────────────────
@@ -14739,46 +14737,46 @@ fn render(s: &mut State) {
                     .or_else(|| term_snaps.iter().find(|t| t.id == over_id).map(|t| t.rect))
             };
             if let Some(r) = target_rect {
-                let th = tab_h;
+                let tbh = tab_h;
                 let zone_rect = match zone {
-                    DropZone::Center => Rect { x: r.x + r.w/4,       y: r.y + th + (r.h-th)/4,       w: r.w/2,     h: (r.h-th)/2 },
-                    DropZone::Left   => Rect { x: r.x,               y: r.y + th,                     w: r.w/4,     h: r.h - th },
-                    DropZone::Right  => Rect { x: r.x + r.w*3/4,     y: r.y + th,                     w: r.w/4,     h: r.h - th },
-                    DropZone::Top    => Rect { x: r.x,               y: r.y + th,                     w: r.w,       h: (r.h-th)/4 },
-                    DropZone::Bottom => Rect { x: r.x,               y: r.y + th + (r.h-th)*3/4,      w: r.w,       h: (r.h-th)/4 },
+                    DropZone::Center => Rect { x: r.x + r.w/4,       y: r.y + tbh + (r.h-tbh)/4,       w: r.w/2,     h: (r.h-tbh)/2 },
+                    DropZone::Left   => Rect { x: r.x,               y: r.y + tbh,                     w: r.w/4,     h: r.h - tbh },
+                    DropZone::Right  => Rect { x: r.x + r.w*3/4,     y: r.y + tbh,                     w: r.w/4,     h: r.h - tbh },
+                    DropZone::Top    => Rect { x: r.x,               y: r.y + tbh,                     w: r.w,       h: (r.h-tbh)/4 },
+                    DropZone::Bottom => Rect { x: r.x,               y: r.y + tbh + (r.h-tbh)*3/4,      w: r.w,       h: (r.h-tbh)/4 },
                 };
-                fill(buf, w, h, zone_rect.x, zone_rect.y, zone_rect.w, zone_rect.h, DRAG_ZONE);
-                fill(buf, w, h, zone_rect.x,               zone_rect.y,                zone_rect.w, 1,            ACCENT);
-                fill(buf, w, h, zone_rect.x,               zone_rect.y + zone_rect.h-1, zone_rect.w, 1,           ACCENT);
-                fill(buf, w, h, zone_rect.x,               zone_rect.y,                1, zone_rect.h,            ACCENT);
-                fill(buf, w, h, zone_rect.x + zone_rect.w-1, zone_rect.y,              1, zone_rect.h,            ACCENT);
+                fill(buf, w, h, zone_rect.x, zone_rect.y, zone_rect.w, zone_rect.h, th().drag_zone);
+                fill(buf, w, h, zone_rect.x,               zone_rect.y,                zone_rect.w, 1,            th().accent);
+                fill(buf, w, h, zone_rect.x,               zone_rect.y + zone_rect.h-1, zone_rect.w, 1,           th().accent);
+                fill(buf, w, h, zone_rect.x,               zone_rect.y,                1, zone_rect.h,            th().accent);
+                fill(buf, w, h, zone_rect.x + zone_rect.w-1, zone_rect.y,              1, zone_rect.h,            th().accent);
             }
         }
 
         // ── Status bar ────────────────────────────────────────────────────
         let sy = h as i32 - status_h;
-        fill(buf, w, h, 0, sy, w as i32, status_h, BG2);
-        fill(buf, w, h, 0, sy, w as i32, 1, BORDER);
+        fill(buf, w, h, 0, sy, w as i32, status_h, th().bg2);
+        fill(buf, w, h, 0, sy, w as i32, 1, th().border);
 
         let sbase = sy + status_h * 3 / 4;
         // Show collab indicator on the right of the status bar (if active)
         if let Some(ref cs) = collab_status {
             let cs_w = cs.chars().count() as i32 * cw;
-            draw_str(buf, w, h, g, cs, w as i32 - cs_w, sbase, 0x6BCB77, w as i32);
+            draw_str(buf, w, h, g, cs, w as i32 - cs_w, sbase, th().ok, w as i32);
         }
         let right_margin = collab_status.as_ref().map_or(0, |cs| cs.chars().count() as i32 * cw);
         if let Some(msg) = &status_msg {
-            draw_str(buf, w, h, g, &format!("  {msg}"), 0, sbase, 0xFFB86C, w as i32 - right_margin);
+            draw_str(buf, w, h, g, &format!("  {msg}"), 0, sbase, th().notice, w as i32 - right_margin);
         } else if let Some(snap) = pane_snaps.iter().find(|p| p.is_active) {
             let dirty_mark = if snap.dirty { " *" } else { "" };
-            draw_str(buf, w, h, g, &format!("  {}{dirty_mark}", snap.path_name), 0, sbase, FG, w as i32 - right_margin);
+            draw_str(buf, w, h, g, &format!("  {}{dirty_mark}", snap.path_name), 0, sbase, th().fg, w as i32 - right_margin);
             if collab_status.is_none() {
                 let lc_str = format!("{}Ln {}, Col {}  ", snap.status_info, snap.cur_line + 1, snap.cur_col + 1);
                 let lc_w   = lc_str.chars().count() as i32 * cw;
-                draw_str(buf, w, h, g, &lc_str, w as i32 - lc_w, sbase, FG_DIM, w as i32);
+                draw_str(buf, w, h, g, &lc_str, w as i32 - lc_w, sbase, th().fg_dim, w as i32);
             }
         } else if let Some(snap) = md_snaps.iter().find(|p| p.is_active) {
-            draw_str(buf, w, h, g, &format!("  {}", snap.title), 0, sbase, FG_DIM, w as i32 - right_margin);
+            draw_str(buf, w, h, g, &format!("  {}", snap.title), 0, sbase, th().fg_dim, w as i32 - right_margin);
         }
 
         // ── Context menu ──────────────────────────────────────────────────
@@ -14791,27 +14789,27 @@ fn render(s: &mut State) {
             let total_h: i32 = items.iter().map(|i| if i.action == CtxAction::Separator { sep_h } else { item_h }).sum::<i32>() + 4;
             let menu_x  = (*cmx).min(w as i32 - menu_w).max(0);
             let menu_y  = (*cmy).min(h as i32 - total_h).max(0);
-            fill(buf, w, h, menu_x, menu_y, menu_w, total_h, BG2);
-            fill(buf, w, h, menu_x, menu_y, menu_w, 1, BORDER);
-            fill(buf, w, h, menu_x, menu_y + total_h - 1, menu_w, 1, BORDER);
-            fill(buf, w, h, menu_x, menu_y, 1, total_h, BORDER);
-            fill(buf, w, h, menu_x + menu_w - 1, menu_y, 1, total_h, BORDER);
+            fill(buf, w, h, menu_x, menu_y, menu_w, total_h, th().bg2);
+            fill(buf, w, h, menu_x, menu_y, menu_w, 1, th().border);
+            fill(buf, w, h, menu_x, menu_y + total_h - 1, menu_w, 1, th().border);
+            fill(buf, w, h, menu_x, menu_y, 1, total_h, th().border);
+            fill(buf, w, h, menu_x + menu_w - 1, menu_y, 1, total_h, th().border);
             let mut iy = menu_y + 2;
             for (i, item) in items.iter().enumerate() {
                 if item.action == CtxAction::Separator {
-                    fill(buf, w, h, menu_x + 1, iy + 2, menu_w - 2, 1, BORDER);
+                    fill(buf, w, h, menu_x + 1, iy + 2, menu_w - 2, 1, th().border);
                     iy += sep_h;
                     continue;
                 }
                 if i == *hovered && item.enabled {
-                    fill(buf, w, h, menu_x + 1, iy, menu_w - 2, item_h, SEL_BG);
+                    fill(buf, w, h, menu_x + 1, iy, menu_w - 2, item_h, th().sel_bg);
                 }
-                let label_color = if item.enabled { FG } else { FG_DIM };
+                let label_color = if item.enabled { th().fg } else { th().fg_dim };
                 draw_str(buf, w, h, g, item.label, menu_x + cw, iy + asc, label_color, menu_x + menu_w - sc_w * cw - cw - 4);
                 if !item.shortcut.is_empty() {
                     let shortcut = key_label(item.shortcut);
                     let sc_x = menu_x + menu_w - shortcut.chars().count() as i32 * cw - cw;
-                    draw_str(buf, w, h, g, &shortcut, sc_x, iy + asc, FG_DIM, menu_x + menu_w - 1);
+                    draw_str(buf, w, h, g, &shortcut, sc_x, iy + asc, th().fg_dim, menu_x + menu_w - 1);
                 }
                 iy += item_h;
             }
@@ -14831,11 +14829,11 @@ fn render(s: &mut State) {
             let oh = lh * (item_count as i32 + 2) + 8;
             let ox = (w as i32 - ow) / 2;
             let oy = h as i32 / 4;
-            fill(buf, w, h, ox, oy, ow, oh, BG2);
-            fill(buf, w, h, ox, oy, ow, 1, BORDER);
-            fill(buf, w, h, ox, oy + oh - 1, ow, 1, BORDER);
-            fill(buf, w, h, ox, oy, 1, oh, BORDER);
-            fill(buf, w, h, ox + ow - 1, oy, 1, oh, BORDER);
+            fill(buf, w, h, ox, oy, ow, oh, th().bg2);
+            fill(buf, w, h, ox, oy, ow, 1, th().border);
+            fill(buf, w, h, ox, oy + oh - 1, ow, 1, th().border);
+            fill(buf, w, h, ox, oy, 1, oh, th().border);
+            fill(buf, w, h, ox + ow - 1, oy, 1, oh, th().border);
             // Query row
             if qf_is_cmd_mode {
                 // Selection highlight
@@ -14845,16 +14843,16 @@ fn render(s: &mut State) {
                     if mn < mx {
                         let x0 = ox + 4 + mn as i32 * cw;
                         let x1 = (ox + 4 + mx as i32 * cw).min(ox + ow - 4);
-                        fill(buf, w, h, x0, oy + 4, (x1 - x0).max(0), lh, HL_MATCH);
+                        fill(buf, w, h, x0, oy + 4, (x1 - x0).max(0), lh, th().hl_match);
                     }
                 }
-                // Leading '>' in accent, rest of query in FG
-                draw_str(buf, w, h, g, ">", ox + 4, oy + 4 + asc, ACCENT, ox + 4 + cw);
+                // Leading '>' in accent, rest of query in th().fg
+                draw_str(buf, w, h, g, ">", ox + 4, oy + 4 + asc, th().accent, ox + 4 + cw);
                 if qf_query.len() > 1 {
-                    draw_str(buf, w, h, g, &qf_query[1..], ox + 4 + cw, oy + 4 + asc, FG, ox + ow - 4);
+                    draw_str(buf, w, h, g, &qf_query[1..], ox + 4 + cw, oy + 4 + asc, th().fg, ox + ow - 4);
                 }
                 let cur_x = ox + 4 + qf_cursor_chars as i32 * cw;
-                fill(buf, w, h, cur_x.min(ox + ow - 4), oy + 4, 1, lh, ACCENT);
+                fill(buf, w, h, cur_x.min(ox + ow - 4), oy + 4, 1, lh, th().accent);
             } else if qf_is_goto_mode {
                 // Selection highlight
                 if let Some(anc) = qf_sel_anchor_chars {
@@ -14863,16 +14861,16 @@ fn render(s: &mut State) {
                     if mn < mx {
                         let x0 = ox + 4 + mn as i32 * cw;
                         let x1 = (ox + 4 + mx as i32 * cw).min(ox + ow - 4);
-                        fill(buf, w, h, x0, oy + 4, (x1 - x0).max(0), lh, HL_MATCH);
+                        fill(buf, w, h, x0, oy + 4, (x1 - x0).max(0), lh, th().hl_match);
                     }
                 }
-                // Leading ':' in accent, rest of query in FG
-                draw_str(buf, w, h, g, ":", ox + 4, oy + 4 + asc, ACCENT, ox + 4 + cw);
+                // Leading ':' in accent, rest of query in th().fg
+                draw_str(buf, w, h, g, ":", ox + 4, oy + 4 + asc, th().accent, ox + 4 + cw);
                 if qf_query.len() > 1 {
-                    draw_str(buf, w, h, g, &qf_query[1..], ox + 4 + cw, oy + 4 + asc, FG, ox + ow - 4);
+                    draw_str(buf, w, h, g, &qf_query[1..], ox + 4 + cw, oy + 4 + asc, th().fg, ox + ow - 4);
                 }
                 let cur_x = ox + 4 + qf_cursor_chars as i32 * cw;
-                fill(buf, w, h, cur_x.min(ox + ow - 4), oy + 4, 1, lh, ACCENT);
+                fill(buf, w, h, cur_x.min(ox + ow - 4), oy + 4, 1, lh, th().accent);
             } else {
                 // Selection highlight
                 if let Some(anc) = qf_sel_anchor_chars {
@@ -14881,55 +14879,55 @@ fn render(s: &mut State) {
                     if mn < mx {
                         let x0 = ox + 4 + 2 * cw + mn as i32 * cw;
                         let x1 = (ox + 4 + 2 * cw + mx as i32 * cw).min(ox + ow - 4);
-                        fill(buf, w, h, x0, oy + 4, (x1 - x0).max(0), lh, HL_MATCH);
+                        fill(buf, w, h, x0, oy + 4, (x1 - x0).max(0), lh, th().hl_match);
                     }
                 }
-                draw_str(buf, w, h, g, "> ", ox + 4, oy + 4 + asc, FG_DIM, ox + ow - 4);
-                draw_str(buf, w, h, g, &qf_query, ox + 4 + 2 * cw, oy + 4 + asc, FG, ox + ow - 4);
+                draw_str(buf, w, h, g, "> ", ox + 4, oy + 4 + asc, th().fg_dim, ox + ow - 4);
+                draw_str(buf, w, h, g, &qf_query, ox + 4 + 2 * cw, oy + 4 + asc, th().fg, ox + ow - 4);
                 let cur_x = ox + 4 + 2 * cw + qf_cursor_chars as i32 * cw;
-                fill(buf, w, h, cur_x.min(ox + ow - 4), oy + 4, 1, lh, ACCENT);
+                fill(buf, w, h, cur_x.min(ox + ow - 4), oy + 4, 1, lh, th().accent);
             }
             // Result rows
             if qf_is_cmd_mode {
                 for (i, (name, shortcut)) in qf_cmd_items.iter().enumerate() {
                     let ry = oy + 4 + lh + 4 + i as i32 * lh;
-                    if i == qf_cmd_sel_in_view { fill(buf, w, h, ox + 1, ry, ow - 2, lh, SEL_BG); }
-                    draw_str(buf, w, h, g, name, ox + 6, ry + asc, FG, ox + ow - 4);
+                    if i == qf_cmd_sel_in_view { fill(buf, w, h, ox + 1, ry, ow - 2, lh, th().sel_bg); }
+                    draw_str(buf, w, h, g, name, ox + 6, ry + asc, th().fg, ox + ow - 4);
                     if !shortcut.is_empty() {
                         let sw = shortcut.chars().count() as i32 * cw;
-                        draw_str(buf, w, h, g, shortcut, ox + ow - 4 - sw, ry + asc, FG_DIM, ox + ow - 2);
+                        draw_str(buf, w, h, g, shortcut, ox + ow - 4 - sw, ry + asc, th().fg_dim, ox + ow - 2);
                     }
                 }
             } else if qf_is_goto_mode {
                 let ry = oy + 4 + lh + 4;
-                draw_str(buf, w, h, g, "Go to line number [:col number]", ox + 6, ry + asc, FG_DIM, ox + ow - 4);
+                draw_str(buf, w, h, g, "Go to line number [:col number]", ox + 6, ry + asc, th().fg_dim, ox + ow - 4);
             } else if qf_loading {
                 let ry = oy + 4 + lh + 4;
-                draw_str(buf, w, h, g, "Searching files...", ox + 6, ry + asc, FG_DIM, ox + ow - 4);
+                draw_str(buf, w, h, g, "Searching files...", ox + 6, ry + asc, th().fg_dim, ox + ow - 4);
             } else {
                 let avail_chars = ((ow - 10) / cw).max(4) as usize;
                 if let Some((ref name, ref dir)) = qf_direct_item {
                     // Show direct absolute/~ path match when no fuzzy results
                     let ry = oy + 4 + lh + 4;
-                    fill(buf, w, h, ox + 1, ry, ow - 2, lh, SEL_BG);
+                    fill(buf, w, h, ox + 1, ry, ow - 2, lh, th().sel_bg);
                     let dir_max = (avail_chars / 3).max(1);
                     let dir_disp = fit_str(dir, dir_max);
                     let name_max = avail_chars.saturating_sub(dir_disp.chars().count() + 2);
                     let name_disp = fit_str(name, name_max);
                     let dir_w = dir_disp.chars().count() as i32 * cw;
-                    draw_str(buf, w, h, g, &name_disp, ox + 6, ry + asc, FG, ox + ow - 4 - dir_w - cw);
-                    draw_str(buf, w, h, g, &dir_disp, ox + ow - 4 - dir_w, ry + asc, FG_DIM, ox + ow - 2);
+                    draw_str(buf, w, h, g, &name_disp, ox + 6, ry + asc, th().fg, ox + ow - 4 - dir_w - cw);
+                    draw_str(buf, w, h, g, &dir_disp, ox + ow - 4 - dir_w, ry + asc, th().fg_dim, ox + ow - 2);
                 } else {
                     for (i, (name, dir)) in qf_items.iter().enumerate() {
                         let ry = oy + 4 + lh + 4 + i as i32 * lh;
-                        if i == qf_sel_in_view { fill(buf, w, h, ox + 1, ry, ow - 2, lh, SEL_BG); }
+                        if i == qf_sel_in_view { fill(buf, w, h, ox + 1, ry, ow - 2, lh, th().sel_bg); }
                         let dir_max = (avail_chars / 3).max(1);
                         let dir_disp = fit_str(dir, dir_max);
                         let name_max = avail_chars.saturating_sub(dir_disp.chars().count() + 2);
                         let name_disp = fit_str(name, name_max);
                         let dir_w = dir_disp.chars().count() as i32 * cw;
-                        draw_str(buf, w, h, g, &name_disp, ox + 6, ry + asc, FG, ox + ow - 4 - dir_w - cw);
-                        draw_str(buf, w, h, g, &dir_disp, ox + ow - 4 - dir_w, ry + asc, FG_DIM, ox + ow - 2);
+                        draw_str(buf, w, h, g, &name_disp, ox + 6, ry + asc, th().fg, ox + ow - 4 - dir_w - cw);
+                        draw_str(buf, w, h, g, &dir_disp, ox + ow - 4 - dir_w, ry + asc, th().fg_dim, ox + ow - 2);
                     }
                 }
             }
@@ -14944,22 +14942,22 @@ fn render(s: &mut State) {
             let oh = lh * (item_count + 2) + 8;
             let ox = (w as i32 - ow) / 2;
             let oy = h as i32 / 4;
-            fill(buf, w, h, ox, oy, ow, oh, BG2);
-            fill(buf, w, h, ox, oy, ow, 1, BORDER);
-            fill(buf, w, h, ox, oy + oh - 1, ow, 1, BORDER);
-            fill(buf, w, h, ox, oy, 1, oh, BORDER);
-            fill(buf, w, h, ox + ow - 1, oy, 1, oh, BORDER);
-            draw_str(buf, w, h, g, header, ox + 6, oy + 4 + asc, FG_DIM, ox + ow - 4);
+            fill(buf, w, h, ox, oy, ow, oh, th().bg2);
+            fill(buf, w, h, ox, oy, ow, 1, th().border);
+            fill(buf, w, h, ox, oy + oh - 1, ow, 1, th().border);
+            fill(buf, w, h, ox, oy, 1, oh, th().border);
+            fill(buf, w, h, ox + ow - 1, oy, 1, oh, th().border);
+            draw_str(buf, w, h, g, header, ox + 6, oy + 4 + asc, th().fg_dim, ox + ow - 4);
             if rows.is_empty() {
                 let ry = oy + 4 + lh + 4;
-                draw_str(buf, w, h, g, "No language servers running.", ox + 6, ry + asc, FG_DIM, ox + ow - 4);
+                draw_str(buf, w, h, g, "No language servers running.", ox + 6, ry + asc, th().fg_dim, ox + ow - 4);
             } else {
                 let avail = ((ow - 12) / cw).max(8) as usize;
                 for (i, row) in rows.iter().enumerate() {
                     let ry = oy + 4 + lh + 4 + i as i32 * lh;
-                    if i == *sel { fill(buf, w, h, ox + 1, ry, ow - 2, lh, SEL_BG); }
+                    if i == *sel { fill(buf, w, h, ox + 1, ry, ow - 2, lh, th().sel_bg); }
                     let disp = fit_str(row, avail);
-                    draw_str(buf, w, h, g, &disp, ox + 6, ry + asc, FG, ox + ow - 4);
+                    draw_str(buf, w, h, g, &disp, ox + 6, ry + asc, th().fg, ox + ow - 4);
                 }
             }
         }
@@ -14967,7 +14965,7 @@ fn render(s: &mut State) {
         // ── Cmd+hover underline ──────────────────────────────────────────
         if let Some((x1, py_top, x2, _py_bot)) = cmd_hover_underline {
             // Underline at 1px above bottom of line (between baseline and descenders)
-            fill(buf, w, h, x1, py_top + lh - 2, x2 - x1, 1, ACCENT);
+            fill(buf, w, h, x1, py_top + lh - 2, x2 - x1, 1, th().accent);
         }
 
         // ── Hover tooltip (diagnostic message) ───────────────────────────
@@ -14978,12 +14976,12 @@ fn render(s: &mut State) {
             let tip_h  = lh + 4;
             let tip_x  = tx.min(w as i32 - tip_w - 4).max(0);
             let tip_y  = (ty - tip_h).max(0);
-            fill(buf, w, h, tip_x, tip_y, tip_w, tip_h, BG2);
-            fill(buf, w, h, tip_x, tip_y, tip_w, 1, BORDER);
-            fill(buf, w, h, tip_x, tip_y + tip_h - 1, tip_w, 1, BORDER);
-            fill(buf, w, h, tip_x, tip_y, 1, tip_h, BORDER);
-            fill(buf, w, h, tip_x + tip_w - 1, tip_y, 1, tip_h, BORDER);
-            draw_str(buf, w, h, g, &disp, tip_x + 4, tip_y + 2 + asc, FG, tip_x + tip_w - 1);
+            fill(buf, w, h, tip_x, tip_y, tip_w, tip_h, th().bg2);
+            fill(buf, w, h, tip_x, tip_y, tip_w, 1, th().border);
+            fill(buf, w, h, tip_x, tip_y + tip_h - 1, tip_w, 1, th().border);
+            fill(buf, w, h, tip_x, tip_y, 1, tip_h, th().border);
+            fill(buf, w, h, tip_x + tip_w - 1, tip_y, 1, tip_h, th().border);
+            draw_str(buf, w, h, g, &disp, tip_x + 4, tip_y + 2 + asc, th().fg, tip_x + tip_w - 1);
         }
     });
 }
